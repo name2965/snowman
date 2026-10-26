@@ -24,6 +24,15 @@
 
 #include "X86MasterAnalyzer.h"
 
+#include <algorithm>
+#include <climits>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <map>
+#include <vector>
+
 #include <nc/common/Foreach.h>
 #include <nc/common/StringToInt.h>
 #include <nc/common/make_unique.h>
@@ -31,13 +40,19 @@
 #include <nc/core/Context.h>
 #include <nc/core/arch/Capstone.h>
 #include <nc/core/image/Image.h>
+#include <nc/core/image/Relocation.h>
+#include <nc/core/image/Symbol.h>
 #include <nc/core/ir/Function.h>
 #include <nc/core/ir/Functions.h>
+#include <nc/core/ir/Jump.h>
 #include <nc/core/ir/Program.h>
 #include <nc/core/ir/Statements.h>
 #include <nc/core/ir/Terms.h>
+#include <nc/core/ir/calling/CallSignature.h>
 #include <nc/core/ir/calling/Conventions.h>
+#include <nc/core/ir/calling/FunctionSignature.h>
 #include <nc/core/ir/calling/Hooks.h>
+#include <nc/core/ir/calling/Signatures.h>
 #include <nc/core/ir/dflow/Dataflows.h>
 
 #include "X86Architecture.h"
@@ -50,8 +65,407 @@ namespace nc {
 namespace arch {
 namespace x86 {
 
+namespace {
+
+enum ApiResultKind {
+    API_RESULT_VOID,
+    API_RESULT_INT32,
+    API_RESULT_POINTER_SIZED
+};
+
+struct KnownWin32Api {
+    const char *name;
+    std::size_t argumentCount;
+    unsigned int int32ArgumentMask;
+    ApiResultKind resultKind;
+    bool doesNotReturn;
+};
+
+/*
+ * PE import names normally do not carry the @N suffix which the generic
+ * stdcall detector below relies on. Keep the small amount of API knowledge
+ * needed by the analyzer in one table, so adding another prototype does not
+ * require changing the calling-convention logic.
+ */
+const KnownWin32Api KNOWN_WIN32_APIS[] = {
+    /* name,                 argc, 32-bit argument mask, result,                   noreturn */
+    {"DialogBoxParamA",        5, 0x00, API_RESULT_POINTER_SIZED, false},
+    {"DialogBoxParamW",        5, 0x00, API_RESULT_POINTER_SIZED, false},
+    {"EndDialog",              2, 0x00, API_RESULT_INT32,         false},
+    {"ExitProcess",            1, 0x01, API_RESULT_VOID,          true},
+    {"GetDlgItem",             2, 0x02, API_RESULT_POINTER_SIZED, false},
+    {"GetDlgItemTextA",        4, 0x0a, API_RESULT_INT32,         false},
+    {"GetDlgItemTextW",        4, 0x0a, API_RESULT_INT32,         false},
+    {"GetModuleHandleA",       1, 0x00, API_RESULT_POINTER_SIZED, false},
+    {"GetModuleHandleW",       1, 0x00, API_RESULT_POINTER_SIZED, false},
+    {"LoadIconA",              2, 0x00, API_RESULT_POINTER_SIZED, false},
+    {"LoadIconW",              2, 0x00, API_RESULT_POINTER_SIZED, false},
+    {"MessageBoxA",            4, 0x08, API_RESULT_INT32,         false},
+    {"MessageBoxW",            4, 0x08, API_RESULT_INT32,         false},
+    {"SendMessageA",           4, 0x02, API_RESULT_POINTER_SIZED, false},
+    {"SendMessageW",           4, 0x02, API_RESULT_POINTER_SIZED, false},
+    {"SetFocus",               1, 0x00, API_RESULT_POINTER_SIZED, false},
+    {"lstrlenA",               1, 0x00, API_RESULT_INT32,         false},
+    {"lstrlenW",               1, 0x00, API_RESULT_INT32,         false}
+};
+
+QString canonicalImportName(QString name) {
+    name = name.trimmed();
+
+    if (name.size() >= 2 && name.startsWith(QLatin1Char('<')) && name.endsWith(QLatin1Char('>'))) {
+        name = name.mid(1, name.size() - 2);
+    }
+
+    const int separator = std::max(
+        std::max(name.lastIndexOf(QLatin1Char('!')), name.lastIndexOf(QLatin1Char(':'))),
+        name.lastIndexOf(QLatin1Char('.')));
+    if (separator >= 0) {
+        name = name.mid(separator + 1);
+    }
+
+    if (name.startsWith(QLatin1String("JMP."), Qt::CaseInsensitive)) {
+        name.remove(0, 4);
+    }
+    if (name.startsWith(QLatin1Char('&'))) {
+        name.remove(0, 1);
+    }
+    if (name.startsWith(QLatin1String("__imp_"))) {
+        name.remove(0, 6);
+    }
+    if (name.startsWith(QLatin1Char('_'))) {
+        name.remove(0, 1);
+    }
+
+    const int suffix = name.lastIndexOf(QLatin1Char('@'));
+    if (suffix >= 0) {
+        bool isNumber = false;
+        name.mid(suffix + 1).toULongLong(&isNumber);
+        if (isNumber) {
+            name.truncate(suffix);
+        }
+    }
+
+    return name;
+}
+
+const KnownWin32Api *getKnownWin32Api(const QString &symbolName) {
+    const QString name = canonicalImportName(symbolName);
+
+    for (const auto &api : KNOWN_WIN32_APIS) {
+        if (name == QLatin1String(api.name)) {
+            return &api;
+        }
+    }
+
+    return nullptr;
+}
+
+const core::image::Symbol *getImportSymbolAtSlot(const core::image::Image &image, ByteAddr slot) {
+    const auto relocation = image.getRelocation(slot);
+    if (relocation && relocation->symbol()->type() == core::image::SymbolType::FUNCTION) {
+        return relocation->symbol();
+    }
+    return nullptr;
+}
+
+/* Resolve the standard six-byte FF /2 import call or FF /4 import jump form. */
+const core::image::Symbol *getIndirectImport(const core::image::Image &image,
+                                             ByteAddr instructionAddress,
+                                             unsigned char modrm,
+                                             SmallBitSize bitness) {
+    unsigned char instruction[6];
+    if (image.readBytes(instructionAddress, instruction, sizeof(instruction)) != sizeof(instruction) ||
+        instruction[0] != 0xff || instruction[1] != modrm)
+    {
+        return nullptr;
+    }
+
+    std::uint32_t encodedAddress = 0;
+    std::memcpy(&encodedAddress, instruction + 2, sizeof(encodedAddress));
+
+    ByteAddr slot = encodedAddress;
+    if (bitness == 64) {
+        std::int32_t displacement = 0;
+        std::memcpy(&displacement, instruction + 2, sizeof(displacement));
+
+        const ByteSize instructionSize = sizeof(instruction);
+        const ByteAddr maxAddress = (std::numeric_limits<ByteAddr>::max)();
+        if (instructionAddress > maxAddress - instructionSize) {
+            return nullptr;
+        }
+        const ByteAddr nextInstruction = instructionAddress + instructionSize;
+
+        if (displacement < 0) {
+            const ByteSize distance = -static_cast<ByteSize>(displacement);
+            if (distance > nextInstruction) {
+                return nullptr;
+            }
+            slot = nextInstruction - distance;
+        } else {
+            const ByteSize distance = displacement;
+            if (nextInstruction > maxAddress - distance) {
+                return nullptr;
+            }
+            slot = nextInstruction + distance;
+        }
+    }
+
+    return getImportSymbolAtSlot(image, slot);
+}
+
+const core::image::Symbol *getImportedFunctionSymbol(const core::image::Image &image,
+                                                     const core::ir::calling::CalleeId &calleeId,
+                                                     SmallBitSize bitness) {
+    if (calleeId.entryAddress()) {
+        /* A direct call usually targets a six-byte "jmp [IAT]" linker thunk. */
+        if (auto symbol = getIndirectImport(image, *calleeId.entryAddress(), 0x25, bitness)) {
+            return symbol;
+        }
+
+        /* x64dbg can also provide a symbol for an already resolved target. */
+        const auto symbol = image.getSymbol(*calleeId.entryAddress());
+        if (symbol && symbol->type() == core::image::SymbolType::FUNCTION) {
+            return symbol;
+        }
+    } else if (calleeId.callAddress()) {
+        /* An unresolved "call [IAT]" is identified by its instruction address. */
+        return getIndirectImport(image, *calleeId.callAddress(), 0x15, bitness);
+    }
+
+    return nullptr;
+}
+
+const core::image::Symbol *getImportedFunctionSymbol(const core::image::Image &image,
+                                                     const core::ir::Call *call,
+                                                     SmallBitSize bitness) {
+    assert(call != nullptr);
+
+    if (const auto target = call->target()->asConstant()) {
+        const core::ir::calling::CalleeId calleeId(
+            core::ir::calling::EntryAddress(target->value().value()));
+        if (const auto symbol = getImportedFunctionSymbol(image, calleeId, bitness)) {
+            return symbol;
+        }
+    }
+
+    if (call->instruction()) {
+        const core::ir::calling::CalleeId calleeId(
+            core::ir::calling::CallAddress(call->instruction()->addr()));
+        return getImportedFunctionSymbol(image, calleeId, bitness);
+    }
+
+    return nullptr;
+}
+
+bool setKnownWin32CallingConvention(core::Context &context,
+                                    const core::ir::calling::CalleeId &calleeId,
+                                    const QString &symbolName) {
+    const auto api = getKnownWin32Api(symbolName);
+    if (!api) {
+        return false;
+    }
+
+    auto architecture = context.image()->platform().architecture();
+    context.conventions()->setConvention(
+        calleeId, architecture->getCallingConvention(QLatin1String("stdcall32")));
+    context.conventions()->setStackArgumentsSize(
+        calleeId, static_cast<ByteSize>(api->argumentCount) * 4);
+    return true;
+}
+
+bool isInt32Argument(const KnownWin32Api &api, std::size_t index) {
+    return (api.int32ArgumentMask & (1U << index)) != 0;
+}
+
+std::shared_ptr<core::ir::Term> makeKnownArgument(const KnownWin32Api &api,
+                                                  std::size_t index,
+                                                  SmallBitSize bitness) {
+    assert(index < api.argumentCount);
+    assert(bitness == 32 || bitness == 64);
+
+    if (bitness == 64 && index < 4) {
+        const core::arch::Register *pointerRegisters[] = {
+            X86Registers::rcx(), X86Registers::rdx(), X86Registers::r8(), X86Registers::r9()
+        };
+        const core::arch::Register *int32Registers[] = {
+            X86Registers::ecx(), X86Registers::edx(), X86Registers::r8d(), X86Registers::r9d()
+        };
+        const auto reg = isInt32Argument(api, index) ? int32Registers[index] : pointerRegisters[index];
+        return std::make_shared<core::ir::MemoryLocationAccess>(reg->memoryLocation());
+    }
+
+    const auto stackPointer = bitness == 64 ? X86Registers::rsp() : X86Registers::esp();
+    const ByteSize slotSize = bitness / CHAR_BIT;
+    const ByteSize offset = bitness == 64 ?
+        5 * slotSize + static_cast<ByteSize>(index - 4) * slotSize :
+        static_cast<ByteSize>(index + 1) * slotSize;
+    const SmallBitSize valueSize = bitness == 64 && isInt32Argument(api, index) ? 32 : bitness;
+
+    return std::make_shared<core::ir::Dereference>(
+        std::make_unique<core::ir::BinaryOperator>(
+            core::ir::BinaryOperator::ADD,
+            std::make_unique<core::ir::MemoryLocationAccess>(stackPointer->memoryLocation()),
+            std::make_unique<core::ir::Constant>(SizedValue(bitness, offset)),
+            bitness),
+        core::ir::MemoryDomain::MEMORY,
+        valueSize);
+}
+
+std::shared_ptr<core::ir::calling::FunctionSignature> makeKnownFunctionSignature(const KnownWin32Api &api,
+                                                                                 SmallBitSize bitness) {
+    auto signature = std::make_shared<core::ir::calling::FunctionSignature>();
+
+    for (std::size_t index = 0; index < api.argumentCount; ++index) {
+        signature->arguments().push_back(makeKnownArgument(api, index, bitness));
+    }
+
+    if (api.resultKind != API_RESULT_VOID) {
+        const auto resultRegister = bitness == 32 || api.resultKind == API_RESULT_INT32 ?
+            X86Registers::eax() : X86Registers::rax();
+        signature->setReturnValue(
+            std::make_shared<core::ir::MemoryLocationAccess>(resultRegister->memoryLocation()));
+    }
+
+    return signature;
+}
+
+void setKnownFunctionSignature(core::Context &context,
+                               const core::ir::calling::CalleeId &calleeId,
+                               const std::shared_ptr<core::ir::calling::FunctionSignature> &signature,
+                               const core::ir::Function *function = nullptr) {
+    if (calleeId.entryAddress()) {
+        context.signatures()->setSignature(*calleeId.entryAddress(), signature);
+    }
+    if (function) {
+        context.signatures()->setSignature(function, signature);
+    }
+}
+
+void setKnownCallSignature(core::Context &context,
+                           const core::ir::calling::CalleeId &calleeId,
+                           const std::shared_ptr<core::ir::calling::FunctionSignature> &functionSignature,
+                           const core::ir::Call *call) {
+    auto callSignature = std::make_shared<core::ir::calling::CallSignature>();
+
+    callSignature->arguments() = functionSignature->arguments();
+    callSignature->setReturnValue(functionSignature->returnValue());
+    context.signatures()->setSignature(call, callSignature);
+
+    if (calleeId.entryAddress()) {
+        context.signatures()->setSignature(*calleeId.entryAddress(), functionSignature);
+    }
+}
+
+void applyKnownWin32Signatures(core::Context &context) {
+    const auto bitness = context.image()->platform().architecture()->bitness();
+    const auto &dataflows = *context.dataflows();
+    std::map<const KnownWin32Api *, std::shared_ptr<core::ir::calling::FunctionSignature>> signatures;
+
+    auto getSignature = [&](const KnownWin32Api *api) {
+        auto &signature = signatures[api];
+        if (!signature) {
+            signature = makeKnownFunctionSignature(*api, bitness);
+        }
+        return signature;
+    };
+
+    for (const auto &functionAndDataflow : dataflows) {
+        const auto function = functionAndDataflow.first;
+        const auto &dataflow = *functionAndDataflow.second;
+        const auto functionId = core::ir::calling::getCalleeId(function);
+
+        if (const auto symbol = getImportedFunctionSymbol(*context.image(), functionId, bitness)) {
+            if (const auto api = getKnownWin32Api(symbol->name())) {
+                setKnownFunctionSignature(context, functionId, getSignature(api), function);
+            }
+        }
+
+        foreach (const auto basicBlock, function->basicBlocks()) {
+            foreach (const auto statement, basicBlock->statements()) {
+                const auto call = statement->asCall();
+                if (!call) {
+                    continue;
+                }
+
+                const auto calleeId = core::ir::calling::getCalleeId(call, dataflow);
+                auto symbol = getImportedFunctionSymbol(*context.image(), calleeId, bitness);
+                if (!symbol) {
+                    /* Keep the IAT relocation usable even if dataflow resolved its pointee. */
+                    symbol = getImportedFunctionSymbol(*context.image(), call, bitness);
+                }
+                if (!symbol) {
+                    continue;
+                }
+
+                if (const auto api = getKnownWin32Api(symbol->name())) {
+                    setKnownCallSignature(context, calleeId, getSignature(api), call);
+                }
+            }
+        }
+    }
+}
+
+void terminateKnownNoReturnCalls(core::Context &context) {
+    auto program = const_cast<core::ir::Program *>(context.program());
+    const auto bitness = context.image()->platform().architecture()->bitness();
+    std::vector<core::ir::Call *> noReturnCalls;
+
+    foreach (const auto basicBlock, program->basicBlocks()) {
+        foreach (const auto statement, basicBlock->statements()) {
+            const auto call = statement->as<core::ir::Call>();
+            if (!call) {
+                continue;
+            }
+
+            const auto symbol = getImportedFunctionSymbol(*context.image(), call, bitness);
+            const auto api = symbol ? getKnownWin32Api(symbol->name()) : nullptr;
+            if (api && api->doesNotReturn) {
+                noReturnCalls.push_back(call);
+            }
+        }
+    }
+
+    foreach (const auto call, noReturnCalls) {
+        const auto instruction = call->instruction();
+        auto basicBlock = call->basicBlock();
+        if (!instruction || !basicBlock) {
+            continue;
+        }
+
+        /* Move instructions after the call into a disconnected block. */
+        const ByteAddr continuationAddress = instruction->endAddr();
+        auto continuation = program->getBasicBlockStartingAt(continuationAddress);
+        if (program->getBasicBlockCovering(continuationAddress) == basicBlock) {
+            continuation = program->createBasicBlock(continuationAddress);
+        }
+
+        basicBlock = call->basicBlock();
+        if (auto jump = basicBlock->getJump()) {
+            /* Only remove the fallthrough edge emitted by IRGenerator. */
+            if (!continuation || !jump->isUnconditional() ||
+                jump->thenTarget().basicBlock() != continuation)
+            {
+                continue;
+            }
+            basicBlock->erase(jump);
+        }
+        if (!basicBlock->getTerminator()) {
+            basicBlock->pushBack(std::make_unique<core::ir::Halt>());
+        }
+    }
+}
+
+} // anonymous namespace
+
 void X86MasterAnalyzer::createProgram(core::Context &context) const {
     MasterAnalyzer::createProgram(context);
+
+    const auto &platform = context.image()->platform();
+    if (platform.operatingSystem() == core::image::Platform::Windows &&
+        (platform.architecture()->bitness() == 32 || platform.architecture()->bitness() == 64))
+    {
+        terminateKnownNoReturnCalls(context);
+    }
 
     /*
      * Patch the IR to implement x86-64 implicit zero extend.
@@ -97,9 +511,14 @@ void X86MasterAnalyzer::detectCallingConventions(core::Context &context) const {
         using core::ir::calling::EntryAddress;
 
         auto stdcall32 = architecture->getCallingConvention(QLatin1String("stdcall32"));
+        const bool isWindows = context.image()->platform().operatingSystem() == core::image::Platform::Windows;
 
         foreach (auto symbol, context.image()->symbols()) {
             if (!symbol->value()) {
+                continue;
+            }
+            CalleeId calleeId(EntryAddress(*symbol->value()));
+            if (isWindows && setKnownWin32CallingConvention(context, calleeId, symbol->name())) {
                 continue;
             }
             auto index = symbol->name().lastIndexOf(QChar('@'));
@@ -110,7 +529,6 @@ void X86MasterAnalyzer::detectCallingConventions(core::Context &context) const {
             if (!argumentsSize) {
                 continue;
             }
-            CalleeId calleeId(EntryAddress(*symbol->value()));
             context.conventions()->setConvention(calleeId, stdcall32);
             context.conventions()->setStackArgumentsSize(calleeId, *argumentsSize);
         }
@@ -161,6 +579,14 @@ void X86MasterAnalyzer::detectCallingConvention(core::Context &context, const co
     const auto &platform = context.image()->platform();
     auto architecture = platform.architecture();
 
+    if (architecture->bitness() == 32 && platform.operatingSystem() == core::image::Platform::Windows) {
+        if (auto symbol = getImportedFunctionSymbol(*context.image(), calleeId, architecture->bitness())) {
+            if (setKnownWin32CallingConvention(context, calleeId, symbol->name())) {
+                return;
+            }
+        }
+    }
+
     auto setConvention = [&](const char *name) {
         context.conventions()->setConvention(calleeId, architecture->getCallingConvention(QLatin1String(name)));
     };
@@ -179,6 +605,18 @@ void X86MasterAnalyzer::detectCallingConvention(core::Context &context, const co
                 setConvention("amd64");
             }
             break;
+    }
+}
+
+void X86MasterAnalyzer::reconstructSignatures(core::Context &context) const {
+    MasterAnalyzer::reconstructSignatures(context);
+
+    const auto &platform = context.image()->platform();
+    const auto bitness = platform.architecture()->bitness();
+    if (platform.operatingSystem() == core::image::Platform::Windows &&
+        (bitness == 32 || bitness == 64))
+    {
+        applyKnownWin32Signatures(context);
     }
 }
 

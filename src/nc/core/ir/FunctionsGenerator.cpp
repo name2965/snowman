@@ -48,7 +48,9 @@ namespace {
 
 void dfs(
     const CFG &cfg,
+    const Program &program,
     const BasicBlock *basicBlock,
+    const BasicBlock *entry,
     boost::unordered_set<const BasicBlock *> &visited,
     std::vector<const BasicBlock *> &trace)
 {
@@ -56,8 +58,14 @@ void dfs(
     trace.push_back(basicBlock);
 
     foreach (const BasicBlock *successor, cfg.getSuccessors(basicBlock)) {
+        /* A control-flow edge must not merge another known function. */
+        if (successor != entry && successor->address() &&
+            program.isFunctionEntry(*successor->address()))
+        {
+            continue;
+        }
         if (visited.find(successor) == visited.end()) {
-            dfs(cfg, successor, visited, trace);
+            dfs(cfg, program, successor, entry, visited, trace);
         }
     }
 }
@@ -86,7 +94,7 @@ void FunctionsGenerator::makeFunctions(const Program &program, Functions &functi
             *function->entry()->address() != function->entry()->statements().front()->instruction()->addr())
         {
             assert(*function->entry()->address() < function->entry()->statements().front()->instruction()->addr());
-            if (!program.isCalledAddress(*function->entry()->address())) {
+            if (!program.isFunctionEntry(*function->entry()->address())) {
                 function->entry()->setAddress(function->entry()->statements().front()->instruction()->addr());
             }
         }
@@ -94,13 +102,13 @@ void FunctionsGenerator::makeFunctions(const Program &program, Functions &functi
         functions.addFunction(std::move(function));
     };
 
-    /* Generate all functions being called. */
+    /* Generate all functions whose entry address is known. */
     foreach (const BasicBlock *basicBlock, program.basicBlocks()) {
-        if (basicBlock->address() && program.isCalledAddress(*basicBlock->address())) {
+        if (basicBlock->address() && program.isFunctionEntry(*basicBlock->address())) {
             boost::unordered_set<const BasicBlock *> visited;
             std::vector<const BasicBlock *> trace;
 
-            dfs(cfg, basicBlock, visited, trace);
+            dfs(cfg, program, basicBlock, basicBlock, visited, trace);
             addFunction(trace, basicBlock);
             processed.insert(trace.begin(), trace.end());
         }
@@ -111,7 +119,7 @@ void FunctionsGenerator::makeFunctions(const Program &program, Functions &functi
         if (basicBlock->address() && cfg.getPredecessors(basicBlock).empty() && !contains(processed, basicBlock)) {
             std::vector<const BasicBlock *> trace;
 
-            dfs(cfg, basicBlock, processed, trace);
+            dfs(cfg, program, basicBlock, basicBlock, processed, trace);
             addFunction(trace, basicBlock);
         }
     }
@@ -121,7 +129,7 @@ void FunctionsGenerator::makeFunctions(const Program &program, Functions &functi
         if (basicBlock->address() && !contains(processed, basicBlock)) {
             std::vector<const BasicBlock *> trace;
 
-            dfs(cfg, basicBlock, processed, trace);
+            dfs(cfg, program, basicBlock, basicBlock, processed, trace);
             addFunction(trace, basicBlock);
         }
     }

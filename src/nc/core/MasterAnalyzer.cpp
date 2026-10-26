@@ -29,6 +29,7 @@
 
 #include <nc/core/Context.h>
 #include <nc/core/arch/Architecture.h>
+#include <nc/core/arch/Instructions.h>
 #include <nc/core/image/Image.h>
 #include <nc/core/ir/BasicBlock.h>
 #include <nc/core/ir/CFG.h>
@@ -66,6 +67,26 @@ void MasterAnalyzer::createProgram(Context &context) const {
     context.logToken().info(tr("Creating intermediate representation of the program."));
 
     std::unique_ptr<ir::Program> program(new ir::Program());
+
+    /*
+     * Create known entries before IR generation. This makes the instruction
+     * analyzer start a basic block at each boundary instead of discovering
+     * and splitting it only after fall-through edges have been constructed.
+     */
+    auto addFunctionEntry = [&](ByteAddr address) {
+        if (context.instructions()->get(address)) {
+            program->addFunctionEntry(address);
+            program->createBasicBlock(address);
+        }
+    };
+
+    if (context.image()->entrypoint()) {
+        addFunctionEntry(*context.image()->entrypoint());
+    }
+
+    foreach (ByteAddr address, context.image()->functionEntries()) {
+        addFunctionEntry(address);
+    }
 
     core::irgen::IRGenerator(context.image().get(), context.instructions().get(), program.get(),
         context.cancellationToken(), context.logToken())

@@ -65,6 +65,7 @@ private:
     std::map<AddrRange, BasicBlock *, ToTheLeft> range2basicBlock_; ///< Mapping of a range of addresses to the basic block covering the range.
     boost::unordered_map<ByteAddr, BasicBlock *> start2basicBlock_; ///< Mapping of an address to the basic block at this address.
     boost::unordered_set<ByteAddr> calledAddresses_; ///< Addresses having calls to them.
+    boost::unordered_set<ByteAddr> functionEntries_; ///< Known function entry addresses.
 
 public:
     /**
@@ -140,7 +141,10 @@ public:
      *
      * \param[in] addr Entry of a function (i.e. an address having calls to himself).
      */
-    void addCalledAddress(ByteAddr addr) { calledAddresses_.insert(addr); }
+    void addCalledAddress(ByteAddr addr) {
+        calledAddresses_.insert(addr);
+        addFunctionEntry(addr);
+    }
 
     /**
      * \param[in] addr An address.
@@ -148,6 +152,21 @@ public:
      * \return True if the address has a call to it.
      */
     bool isCalledAddress(ByteAddr addr) const { return nc::contains(calledAddresses_, addr); }
+
+    /**
+     * Adds an address known to be a function entry.
+     *
+     * Unlike addCalledAddress(), this can be used for entries learned from
+     * symbols or executable metadata even when no direct call was observed.
+     */
+    void addFunctionEntry(ByteAddr addr) { functionEntries_.insert(addr); }
+
+    /**
+     * \param[in] addr An address.
+     *
+     * \return True if the address is known to be a function entry.
+     */
+    bool isFunctionEntry(ByteAddr addr) const { return nc::contains(functionEntries_, addr); }
 
     /**
      * Prints the graph into a stream in DOT format.

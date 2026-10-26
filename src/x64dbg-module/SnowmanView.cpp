@@ -27,6 +27,7 @@
 #include <vector>
 #include <_scriptapi_module.h>
 #include <_scriptapi_memory.h>
+#include <_scriptapi_function.h>
 #include <_scriptapi_symbol.h>
 
 using namespace Script;
@@ -559,6 +560,64 @@ void addImportThunkSymbols(nc::core::image::Image* image, duint moduleBase, duin
     }
 }
 
+/* FunctionInfo changed from an absolute start VA to module + RVA in newer SDKs. */
+template<typename FunctionInfo>
+auto getX64DbgFunctionAddress(const FunctionInfo& function, duint& address, int)
+    -> decltype(Module::BaseFromName(function.mod),
+                static_cast<duint>(function.rvaStart), bool())
+{
+    const duint functionModuleBase = Module::BaseFromName(function.mod);
+    const duint rva = static_cast<duint>(function.rvaStart);
+    const duint maxAddress = (std::numeric_limits<duint>::max)();
+    if (!functionModuleBase || rva > maxAddress - functionModuleBase)
+        return false;
+
+    address = functionModuleBase + rva;
+    return true;
+}
+
+template<typename FunctionInfo>
+auto getX64DbgFunctionAddress(const FunctionInfo& function, duint& address, long)
+    -> decltype(static_cast<duint>(function.start), bool())
+{
+    address = static_cast<duint>(function.start);
+    return true;
+}
+
+void addX64DbgFunctionSymbols(nc::core::image::Image* image, duint moduleBase,
+                              duint moduleSize)
+{
+    const duint maxAddress = (std::numeric_limits<duint>::max)();
+    if (!moduleSize || moduleBase > maxAddress - moduleSize)
+        return;
+    const duint moduleEnd = moduleBase + moduleSize;
+
+    BridgeList<Script::Function::FunctionInfo> functions;
+    (void)Script::Function::GetList(&functions);
+
+    for (int i = 0; i < functions.Count(); ++i)
+    {
+        duint address = 0;
+        if (!getX64DbgFunctionAddress(functions[i], address, 0) ||
+            address < moduleBase || address >= moduleEnd)
+            continue;
+
+        image->addFunctionEntry(static_cast<nc::ByteAddr>(address));
+
+        const auto existing = image->getSymbol(address);
+        if (existing && existing->type() == nc::core::image::SymbolType::FUNCTION)
+            continue;
+
+        /*
+         * An empty name deliberately preserves Snowman's fun_<address>
+         * fallback while still carrying the stronger FUNCTION type.
+         */
+        image->addSymbol(std::make_unique<nc::core::image::Symbol>(
+            nc::core::image::SymbolType::FUNCTION,
+            existing ? existing->name() : QString(), address));
+    }
+}
+
 } // anonymous namespace
 
 class DbgByteSource : public nc::core::image::ByteSource
@@ -682,6 +741,9 @@ static std::unique_ptr<nc::gui::Project> MakeProject(duint base, duint size)
                 image->addSymbol(std::make_unique<nc::core::image::Symbol>(nc::core::image::SymbolType::FUNCTION, name, va));
         }
     }
+
+    /* Preserve boundaries recovered by x64dbg even when no symbol exists. */
+    addX64DbgFunctionSymbols(image, base, size);
 
     /* Fill gaps left by Symbol::GetList from the mapped module's PE imports. */
     addPeImportRelocations(image, base, size);

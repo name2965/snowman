@@ -26,6 +26,7 @@
 #include <nc/config.h>
 
 #include <memory>
+#include <set>
 #include <vector>
 
 #include <boost/unordered_map.hpp>
@@ -63,6 +64,7 @@ class Image: public ByteSource {
     boost::unordered_map<ByteAddr, Relocation *> address2relocation_; ///< Mapping from an address to the relocation with this address.
     std::unique_ptr<mangling::Demangler> demangler_; ///< Demangler.
     boost::optional<ByteAddr> entrypoint_; ///< Entrypoint of image.
+    std::set<ByteAddr> functionEntries_; ///< Explicitly known function entry addresses.
 
 public:
     /**
@@ -192,6 +194,16 @@ public:
      * \return Address of the entry point.
      */
     const boost::optional<ByteAddr> &entrypoint() const { return entrypoint_; }
+
+    /**
+     * Adds an explicitly known function entry address.
+     */
+    void addFunctionEntry(ByteAddr address) { functionEntries_.insert(address); }
+
+    /**
+     * \return Explicitly known function entry addresses.
+     */
+    const std::set<ByteAddr> &functionEntries() const { return functionEntries_; }
 };
 
 }}} // namespace nc::core::image
