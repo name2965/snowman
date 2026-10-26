@@ -22,6 +22,9 @@
 #include <QApplication>
 #include <climits>
 #include <cstdint>
+#include <cstring>
+#include <limits>
+#include <vector>
 #include <_scriptapi_module.h>
 #include <_scriptapi_memory.h>
 #include <_scriptapi_symbol.h>
@@ -327,6 +330,131 @@ void addPeImportRelocations(nc::core::image::Image* image, duint moduleBase, dui
     }
 }
 
+bool getImportThunkSlot(const unsigned char* instruction, duint instructionAddress,
+                        duint& slotAddress)
+{
+    /*
+     * Linkers commonly emit one of these six-byte import jump thunks:
+     *
+     *   x86:    ff 25 <absolute IAT address>
+     *   x86-64: ff 25 <RIP-relative displacement>
+     */
+    if (instruction[0] != 0xff || instruction[1] != 0x25)
+        return false;
+
+#ifdef _WIN64
+    std::int32_t displacement = 0;
+    std::memcpy(&displacement, instruction + 2, sizeof(displacement));
+
+    const duint instructionSize = 6;
+    const duint maxAddress = (std::numeric_limits<duint>::max)();
+    if (instructionAddress > maxAddress - instructionSize)
+        return false;
+    const duint nextInstruction = instructionAddress + instructionSize;
+
+    if (displacement < 0)
+    {
+        const duint distance = static_cast<duint>(-
+            static_cast<std::int64_t>(displacement));
+        if (distance > nextInstruction)
+            return false;
+        slotAddress = nextInstruction - distance;
+    }
+    else
+    {
+        const duint distance = static_cast<duint>(displacement);
+        if (nextInstruction > maxAddress - distance)
+            return false;
+        slotAddress = nextInstruction + distance;
+    }
+#else
+    std::uint32_t absoluteAddress = 0;
+    std::memcpy(&absoluteAddress, instruction + 2, sizeof(absoluteAddress));
+    slotAddress = static_cast<duint>(absoluteAddress);
+#endif
+
+    return true;
+}
+
+void addImportThunkSymbols(nc::core::image::Image* image, duint moduleBase, duint moduleSize)
+{
+    const duint instructionSize = 6;
+    const duint chunkSize = 64 * 1024;
+    const duint maxThunkSymbols = 65536;
+    const duint maxAddress = (std::numeric_limits<duint>::max)();
+    if (!moduleSize || moduleBase > maxAddress - moduleSize)
+        return;
+    const duint moduleEnd = moduleBase + moduleSize;
+    std::vector<unsigned char> bytes(chunkSize + instructionSize - 1);
+    duint thunkSymbols = 0;
+
+    for (const auto section : image->sections())
+    {
+        if (!section->isExecutable() || section->addr() < 0 || section->size() <= 0)
+            continue;
+
+        const auto sectionAddress64 = static_cast<std::uint64_t>(section->addr());
+        const auto sectionSize64 = static_cast<std::uint64_t>(section->size());
+        if (sectionAddress64 > maxAddress)
+            continue;
+        const duint sectionAddress = static_cast<duint>(sectionAddress64);
+        if (sectionAddress >= moduleEnd || sectionSize64 >
+            static_cast<std::uint64_t>(maxAddress - sectionAddress))
+            continue;
+
+        const duint sectionEnd = sectionAddress + static_cast<duint>(sectionSize64);
+        duint current = sectionAddress > moduleBase ? sectionAddress : moduleBase;
+        const duint end = sectionEnd < moduleEnd ? sectionEnd : moduleEnd;
+
+        while (current < end)
+        {
+            const duint remaining = end - current;
+            const duint candidates = chunkSize < remaining ? chunkSize : remaining;
+            const duint requestedSize = candidates + instructionSize - 1;
+            const duint bytesToRead = remaining < requestedSize ? remaining : requestedSize;
+            duint sizeRead = 0;
+            Memory::Read(current, bytes.data(), bytesToRead, &sizeRead);
+            if (sizeRead > bytesToRead)
+                sizeRead = bytesToRead;
+
+            const duint readableCandidates = sizeRead >= instructionSize ?
+                sizeRead - instructionSize + 1 : 0;
+            const duint candidateCount = candidates < readableCandidates ?
+                candidates : readableCandidates;
+            for (duint offset = 0; offset < candidateCount; ++offset)
+            {
+                duint slotAddress = 0;
+                if (!getImportThunkSlot(bytes.data() + offset, current + offset, slotAddress) ||
+                    slotAddress < moduleBase || slotAddress >= moduleEnd)
+                    continue;
+
+                const auto relocation = image->getRelocation(slotAddress);
+                const nc::core::image::Symbol* importSymbol = nullptr;
+                if (relocation &&
+                    relocation->symbol()->type() == nc::core::image::SymbolType::FUNCTION &&
+                    !relocation->symbol()->name().isEmpty())
+                    importSymbol = relocation->symbol();
+                else
+                    importSymbol = getFunctionSymbol(image, slotAddress);
+                if (!importSymbol)
+                    continue;
+
+                const duint thunkAddress = current + offset;
+                if (hasNameAtAddress(image, thunkAddress))
+                    continue;
+
+                image->addSymbol(std::make_unique<nc::core::image::Symbol>(
+                    nc::core::image::SymbolType::FUNCTION,
+                    importSymbol->name(), thunkAddress));
+                if (++thunkSymbols >= maxThunkSymbols)
+                    return;
+            }
+
+            current += candidates;
+        }
+    }
+}
+
 } // anonymous namespace
 
 class DbgByteSource : public nc::core::image::ByteSource
@@ -441,6 +569,9 @@ static std::unique_ptr<nc::gui::Project> MakeProject(duint base, duint size)
 
     /* Fill gaps left by Symbol::GetList from the mapped module's PE imports. */
     addPeImportRelocations(image, base, size);
+
+    /* Give direct calls to linker-generated import jump thunks the IAT name. */
+    addImportThunkSymbols(image, base, size);
 
     return project;
 }
