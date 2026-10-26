@@ -50,6 +50,28 @@ struct PeImportDescriptor
 
 static_assert(sizeof(PeImportDescriptor) == 20, "Unexpected PE import descriptor size");
 
+struct PeSectionHeader
+{
+    char name[8];
+    std::uint32_t virtualSize;
+    std::uint32_t virtualAddress;
+    std::uint32_t sizeOfRawData;
+    std::uint32_t pointerToRawData;
+    std::uint32_t pointerToRelocations;
+    std::uint32_t pointerToLineNumbers;
+    std::uint16_t numberOfRelocations;
+    std::uint16_t numberOfLineNumbers;
+    std::uint32_t characteristics;
+};
+
+static_assert(sizeof(PeSectionHeader) == 40, "Unexpected PE section header size");
+
+struct PeSectionAttributes
+{
+    duint address;
+    std::uint32_t characteristics;
+};
+
 bool isRangeInsideModule(duint offset, duint length, duint moduleSize)
 {
     return offset <= moduleSize && length <= moduleSize - offset;
@@ -68,6 +90,88 @@ template<typename T>
 bool readModuleValue(duint moduleBase, duint moduleSize, duint offset, T& value)
 {
     return readModuleBytes(moduleBase, moduleSize, offset, &value, sizeof(value));
+}
+
+std::vector<PeSectionAttributes> readPeSectionAttributes(duint moduleBase, duint moduleSize)
+{
+    const duint dosNtHeaderOffset = 0x3c;
+    const std::uint16_t dosSignature = 0x5a4d;       // MZ
+    const std::uint32_t ntSignature = 0x00004550;    // PE\0\0
+    const duint fileHeaderSize = 20;
+    const duint numberOfSectionsOffsetFromNt = sizeof(std::uint32_t) + sizeof(std::uint16_t);
+    const duint optionalHeaderSizeOffsetFromNt = sizeof(std::uint32_t) + 16;
+    const duint optionalHeaderOffsetFromNt = sizeof(std::uint32_t) + fileHeaderSize;
+
+    std::vector<PeSectionAttributes> result;
+    std::uint16_t mz = 0;
+    std::uint32_t ntOffset32 = 0;
+    if (!readModuleValue(moduleBase, moduleSize, 0, mz) || mz != dosSignature ||
+        !readModuleValue(moduleBase, moduleSize, dosNtHeaderOffset, ntOffset32))
+        return result;
+
+    const duint ntOffset = ntOffset32;
+    std::uint32_t pe = 0;
+    std::uint16_t numberOfSections = 0;
+    std::uint16_t optionalHeaderSize = 0;
+    if (!isRangeInsideModule(ntOffset, optionalHeaderOffsetFromNt, moduleSize) ||
+        !readModuleValue(moduleBase, moduleSize, ntOffset, pe) || pe != ntSignature ||
+        !readModuleValue(moduleBase, moduleSize, ntOffset + numberOfSectionsOffsetFromNt,
+                         numberOfSections) ||
+        !readModuleValue(moduleBase, moduleSize, ntOffset + optionalHeaderSizeOffsetFromNt,
+                         optionalHeaderSize))
+        return result;
+
+    if (!isRangeInsideModule(ntOffset,
+                             optionalHeaderOffsetFromNt + optionalHeaderSize, moduleSize))
+        return result;
+    const duint sectionTableOffset = ntOffset + optionalHeaderOffsetFromNt + optionalHeaderSize;
+    const duint sectionCount = numberOfSections;
+    if (sectionCount > 4096 ||
+        !isRangeInsideModule(sectionTableOffset,
+                             sectionCount * sizeof(PeSectionHeader), moduleSize))
+        return result;
+
+    const duint maxAddress = (std::numeric_limits<duint>::max)();
+    result.reserve(static_cast<std::size_t>(sectionCount));
+    for (duint index = 0; index < sectionCount; ++index)
+    {
+        PeSectionHeader header = {};
+        if (!readModuleValue(moduleBase, moduleSize,
+                             sectionTableOffset + index * sizeof(header), header))
+            break;
+        if (moduleBase > maxAddress - header.virtualAddress)
+            continue;
+        result.push_back({moduleBase + header.virtualAddress, header.characteristics});
+    }
+    return result;
+}
+
+bool applyPeSectionAttributes(nc::core::image::Section* section,
+                              const std::vector<PeSectionAttributes>& attributes)
+{
+    const std::uint32_t containsCode = 0x00000020;
+    const std::uint32_t containsInitializedData = 0x00000040;
+    const std::uint32_t containsUninitializedData = 0x00000080;
+    const std::uint32_t executable = 0x20000000;
+    const std::uint32_t readable = 0x40000000;
+    const std::uint32_t writable = 0x80000000;
+
+    for (const auto& item : attributes)
+    {
+        if (item.address != static_cast<duint>(section->addr()))
+            continue;
+
+        /* SectionListFromAddr only reports sections mapped in the debuggee. */
+        section->setAllocated(true);
+        section->setReadable(item.characteristics & readable);
+        section->setWritable(item.characteristics & writable);
+        section->setExecutable(item.characteristics & executable);
+        section->setCode(item.characteristics & containsCode);
+        section->setData(item.characteristics & containsInitializedData);
+        section->setBss(item.characteristics & containsUninitializedData);
+        return true;
+    }
+    return false;
 }
 
 QString readModuleString(duint moduleBase, duint moduleSize, duint offset)
@@ -468,11 +572,18 @@ public:
 
     nc::ByteSize readBytes(nc::ByteAddr addr, void *buf, nc::ByteSize size) const override
     {
-        if (addr < mLowerBound || addr + size >= mUpperBound)
+        if (size <= 0 || addr < mLowerBound || addr >= mUpperBound)
             return 0;
+
+        const nc::ByteSize available = mUpperBound - addr;
+        if (size > available)
+            size = available;
+
         duint sizeRead = 0;
-        Memory::Read(addr, buf, size, &sizeRead);
-        return sizeRead;
+        Memory::Read(static_cast<duint>(addr), buf, static_cast<duint>(size), &sizeRead);
+        if (sizeRead > static_cast<duint>(size))
+            sizeRead = static_cast<duint>(size);
+        return static_cast<nc::ByteSize>(sizeRead);
     }
 
 private:
@@ -505,6 +616,7 @@ static std::unique_ptr<nc::gui::Project> MakeProject(duint base, duint size)
     auto moduleBase = Module::BaseFromAddr(base);
     if (moduleBase)
     {
+        const auto peSectionAttributes = readPeSectionAttributes(moduleBase, size);
         BridgeList<Module::ModuleSectionInfo> sections;
         if (Module::SectionListFromAddr(moduleBase, &sections))
         {
@@ -514,12 +626,16 @@ static std::unique_ptr<nc::gui::Project> MakeProject(duint base, duint size)
                 auto sectionAddr = sections[i].addr;
                 auto sectionSize = sections[i].size;
                 auto section = std::make_unique<nc::core::image::Section>(sections[i].name, sectionAddr, sectionSize);
-                section->setReadable(true);
-                section->setWritable(true);
-                section->setExecutable(true);
-                section->setCode(true);
-                section->setData(true);
-                section->setAllocated(true);
+                if (!applyPeSectionAttributes(section.get(), peSectionAttributes))
+                {
+                    /* Keep permissive behavior for malformed or headerless modules. */
+                    section->setReadable(true);
+                    section->setWritable(true);
+                    section->setExecutable(true);
+                    section->setCode(true);
+                    section->setData(true);
+                    section->setAllocated(true);
+                }
                 section->setExternalByteSource(std::make_unique<DbgByteSource>(sectionAddr, sectionAddr + sectionSize));
                 image->addSection(std::move(section));
             }

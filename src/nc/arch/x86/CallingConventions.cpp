@@ -63,7 +63,8 @@ Microsoft64CallingConvention::Microsoft64CallingConvention(const X86Architecture
 {
     setStackPointer(architecture->stackPointer()->memoryLocation());
 
-    setFirstArgumentOffset(architecture->bitness());
+    /* Skip the return address and the four-register home space. */
+    setFirstArgumentOffset(architecture->bitness() * 5);
     setArgumentAlignment(architecture->bitness());
 
     /* Used for integer and pointer arguments. */

@@ -114,7 +114,7 @@ void QtPlugin::MenuEntry(int hEntry)
         GuiSelectionGet(GUI_DISASSEMBLY, &sel);
 
         ShowTab();
-        SnowmanRange range{ sel.start, sel.end + 1 };
+        SnowmanRange range{ sel.start, sel.end };
         snowman->decompileAt(&range, 1);
     }
     break;

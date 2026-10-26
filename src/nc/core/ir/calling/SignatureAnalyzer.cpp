@@ -206,7 +206,7 @@ bool SignatureAnalyzer::computeArguments(const CalleeId &calleeId) {
         callArguments.erase(
             std::remove_if(callArguments.begin(), callArguments.end(),
                 [&](const MemoryLocation &location) {
-                    return !nc::contains(arguments, location);
+                    return nc::contains(arguments, location);
                 }),
             callArguments.end());
     }
@@ -393,7 +393,12 @@ std::vector<MemoryLocation> SignatureAnalyzer::getUnusedDefines(const Call *call
 
     foreach (const auto &chunk, dataflow.getDefinitions(callHook->snapshotStatement()).chunks()) {
         foreach (const Term *term, chunk.definitions()) {
-            if (intersect(term, chunk.location())) {
+            /* Do not mistake the caller's own return-address slot for a trailing argument. */
+            const bool isEntryReturnAddress =
+                chunk.location().domain() == MemoryDomain::STACK &&
+                chunk.location().addr() == 0 &&
+                dflow::isReturnAddress(term, dataflow);
+            if (!isEntryReturnAddress && intersect(term, chunk.location())) {
                 bool used = false;
                 foreach (const auto &use, uses.getUses(term)) {
                     if (intersect(use.term(), use.location())) {

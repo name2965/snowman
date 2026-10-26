@@ -670,15 +670,15 @@ public:
                 break;
             }
             case UD_Ijcxz: {
-                _[jump(~(cx == constant(0)), operand(0), directSuccessor())];
+                _[jump(cx == constant(0), operand(0), directSuccessor())];
                 break;
             }
             case UD_Ijecxz: {
-                _[jump(~(ecx == constant(0)), operand(0), directSuccessor())];
+                _[jump(ecx == constant(0), operand(0), directSuccessor())];
                 break;
             }
             case UD_Ijrcxz: {
-                _[jump(~(rcx == constant(0)), operand(0), directSuccessor())];
+                _[jump(rcx == constant(0), operand(0), directSuccessor())];
                 break;
             }
             case UD_Ijz: {
