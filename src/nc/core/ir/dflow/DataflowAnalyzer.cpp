@@ -86,6 +86,9 @@ void DataflowAnalyzer::analyze(const CFG &cfg) {
     int nfixpoints = 0;
 
     while (nfixpoints++ < 3) {
+        const std::size_t memoryLocationRevision =
+            dataflow().memoryLocationRevision();
+
         /*
          * Run abstract interpretation on all basic blocks.
          */
@@ -121,6 +124,16 @@ void DataflowAnalyzer::analyze(const CFG &cfg) {
         }
 
         /*
+         * Reaching definitions are not the only monotonic state in this
+         * analysis.  In particular, a loop access can become ambiguous late
+         * in a nominally stable pass.  Require another set of stable passes so
+         * the resulting top value reaches blocks visited earlier in CFG order.
+         */
+        if (memoryLocationRevision != dataflow().memoryLocationRevision()) {
+            nfixpoints = 0;
+        }
+
+        /*
          * Do we loop infinitely?
          */
         if (++niterations >= 30) {
@@ -138,12 +151,19 @@ void DataflowAnalyzer::analyze(const CFG &cfg) {
     auto disappeared = [](const Term *term){ return term->statement()->basicBlock() == nullptr; };
 
     std::vector<const Term *> disappearedTerms;
+    foreach (const auto &termAndLocation, dataflow().term2location()) {
+        if (disappeared(termAndLocation.first)) {
+            disappearedTerms.push_back(termAndLocation.first);
+        }
+    }
     foreach (auto &termAndDefinitions, dataflow().term2definitions()) {
         termAndDefinitions.second.filterOut([disappeared](const MemoryLocation &, const Term *term) { return disappeared(term); } );
     }
 
     remove_if(dataflow().term2value(), disappeared);
-    remove_if(dataflow().term2location(), disappeared);
+    foreach (const Term *term, disappearedTerms) {
+        dataflow().eraseMemoryLocation(term);
+    }
     remove_if(dataflow().term2definitions(), disappeared);
 }
 
@@ -409,6 +429,17 @@ Value *DataflowAnalyzer::computeValue(const Term *term, const MemoryLocation &me
     auto value = dataflow().getValue(term);
 
     if (definitions.empty()) {
+        /*
+         * A loop-indexed dereference can resolve to one concrete stack byte
+         * during an early iteration and become ambiguous once the back edge
+         * is considered.  Do not retain the earlier byte's constant value.
+         */
+        if (dataflow().hasAmbiguousMemoryLocation(term)) {
+            value->setAbstractValue(AbstractValue(term->size(), -1, -1));
+            value->makeNotStackOffset();
+            value->makeNotProduct();
+            value->makeNotReturnAddress();
+        }
         return value;
     }
 

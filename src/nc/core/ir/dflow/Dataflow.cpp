@@ -31,7 +31,7 @@ namespace core {
 namespace ir {
 namespace dflow {
 
-Dataflow::Dataflow() {}
+Dataflow::Dataflow(): memoryLocationRevision_(0) {}
 
 Dataflow::~Dataflow() {}
 

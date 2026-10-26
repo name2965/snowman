@@ -1050,19 +1050,33 @@ public:
                 break;
             }
             case UD_Isbb: {
+                auto result = temporary(operand(0).size());
                 _[
-                    less             ^= signed_(operand(0))   <  operand(1) + zero_extend(cf),
-                    less_or_equal    ^= signed_(operand(0))   <= operand(1) + zero_extend(cf),
-                    cf               ^= unsigned_(operand(0)) <  operand(1) + zero_extend(cf),
-                    below_or_equal   ^= unsigned_(operand(0)) <= operand(1) + zero_extend(cf),
+                    /*
+                     * Materialize the result while CF still contains the
+                     * incoming borrow.  Flag assignments below are separate
+                     * IR statements, so using CF after assigning to it would
+                     * accidentally feed the newly computed borrow back into
+                     * the subtraction.
+                     */
+                    result ^= operand(0) - (operand(1) + zero_extend(cf)),
 
-                    operand(0) ^= operand(0) - (operand(1) + zero_extend(cf)),
+                    /* Signed comparison without overflowing operand(1) + CF. */
+                    less ^= (signed_(operand(0)) < operand(1)) |
+                            ((operand(0) == operand(1)) & cf),
+                    less_or_equal ^= less | (result == constant(0)),
+                    /* Borrow without overflowing operand(1) + CF. */
+                    cf ^= (unsigned_(operand(0)) < operand(1)) |
+                          ((operand(0) == operand(1)) & cf),
+
+                    operand(0) ^= result,
 
                     pf ^= intrinsic(),
-                    zf ^= operand(0) == constant(0) + zero_extend(cf),
-                    sf ^= signed_(operand(0)) < constant(0) + zero_extend(cf),
+                    zf ^= operand(0) == constant(0),
+                    sf ^= signed_(operand(0)) < constant(0),
                     of ^= intrinsic(),
-                    af ^= intrinsic()
+                    af ^= intrinsic(),
+                    below_or_equal ^= cf | zf
                 ];
                 break;
             }

@@ -25,9 +25,11 @@
 
 #include <nc/config.h>
 
+#include <cstddef>
 #include <memory>
 
 #include <boost/unordered_map.hpp>
+#include <boost/unordered_set.hpp>
 
 #include <nc/common/Range.h>
 
@@ -52,6 +54,17 @@ class Dataflow {
 
     /** Mapping from a term to its memory location. */
     boost::unordered_map<const Term *, MemoryLocation> term2location_;
+
+    /**
+     * Terms whose effective address resolved to more than one location while
+     * iterating to a dataflow fixpoint.  Such a term is typically an indexed
+     * loop access (for example, buffer[i]) and must not be treated as a read
+     * from whichever concrete element happened to be visited last.
+     */
+    boost::unordered_set<const Term *> ambiguousLocations_;
+
+    /** Monotonic counter for changes to the memory-location lattice. */
+    std::size_t memoryLocationRevision_;
 
     /** Mapping from a term to the reaching definitions. */
     boost::unordered_map<const Term *, ReachingDefinitions> term2definitions_;
@@ -119,7 +132,57 @@ public:
      */
     const MemoryLocation &setMemoryLocation(const Term *term, const MemoryLocation &memoryLocation) {
         assert(term != nullptr);
-        return (term2location_[term] = memoryLocation);
+
+        auto &stored = term2location_[term];
+        if (ambiguousLocations_.find(term) != ambiguousLocations_.end()) {
+            stored = MemoryLocation();
+            return stored;
+        }
+
+        /*
+         * An unresolved location may become known as predecessor information
+         * arrives.  Once a concrete location has been observed, however, a
+         * different location (or an unresolved one) proves that this single
+         * syntactic access denotes multiple runtime addresses.
+         */
+        if (stored && stored != memoryLocation) {
+            ambiguousLocations_.insert(term);
+            stored = MemoryLocation();
+            ++memoryLocationRevision_;
+        } else if (memoryLocation) {
+            if (stored != memoryLocation) {
+                stored = memoryLocation;
+                ++memoryLocationRevision_;
+            }
+        }
+        return stored;
+    }
+
+    /**
+     * \return True if the term resolved to multiple effective addresses
+     *         during fixpoint iteration.
+     */
+    bool hasAmbiguousMemoryLocation(const Term *term) const {
+        assert(term != nullptr);
+        return ambiguousLocations_.find(term) != ambiguousLocations_.end();
+    }
+
+    /**
+     * Removes all location state for a term which is no longer in the IR.
+     */
+    void eraseMemoryLocation(const Term *term) {
+        assert(term != nullptr);
+        term2location_.erase(term);
+        ambiguousLocations_.erase(term);
+    }
+
+    /**
+     * A revision changes on UNKNOWN -> UNIQUE and UNIQUE -> AMBIGUOUS.
+     * DataflowAnalyzer includes it in its fixpoint criterion so that a late
+     * loss of address precision is propagated through earlier CFG blocks.
+     */
+    std::size_t memoryLocationRevision() const {
+        return memoryLocationRevision_;
     }
 
     /**

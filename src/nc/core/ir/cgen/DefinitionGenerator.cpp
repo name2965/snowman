@@ -858,6 +858,23 @@ std::unique_ptr<likec::Statement> DefinitionGenerator::makeRepStos(const cflow::
 
     const arch::Instruction *instruction = nullptr;
     foreach (const Statement *statement, statements) {
+        /*
+         * Hooks temporarily put a Callback in front of every jump while
+         * dataflow is running.  Those callbacks are still present when the
+         * structured tree is generated, including in the synthetic blocks of
+         * a REP instruction.  They do not represent machine semantics and
+         * doMakeStatement() deliberately emits no source statement for them,
+         * so they must not make an otherwise exact REP match fail.
+         *
+         * Keep this whitelist narrow: an instruction-less assignment, touch,
+         * call, or memory invalidation could carry observable semantics and
+         * replacing a region containing one of those would be unsound.
+         */
+        if (statement->kind() == Statement::CALLBACK ||
+            statement->kind() == Statement::REMEMBER_REACHING_DEFINITIONS)
+        {
+            continue;
+        }
         if (!statement->instruction()) {
             /* Replacing the region must not silently discard hook semantics. */
             return nullptr;
@@ -1897,6 +1914,12 @@ std::unique_ptr<likec::Statement> DefinitionGenerator::makeRepneScasLength(
 
     const arch::Instruction *instruction = nullptr;
     foreach (const Statement *statement, statements) {
+        /* See makeRepStos(): these are non-emitting analysis bookkeeping. */
+        if (statement->kind() == Statement::CALLBACK ||
+            statement->kind() == Statement::REMEMBER_REACHING_DEFINITIONS)
+        {
+            continue;
+        }
         if (!statement->instruction()) {
             /* Replacing the region must not silently discard hook semantics. */
             return nullptr;

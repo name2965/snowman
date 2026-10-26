@@ -140,22 +140,40 @@ If *getNestedIf(Statement *statement, bool &invalidWrapper) {
     return nullptr;
 }
 
-bool hasSwitchControlStatement(const TreeNode *node) {
+bool hasSwitchControlStatement(const TreeNode *node,
+                               bool breakHasNestedTarget = false) {
     if (!node) {
         return false;
     }
+    bool childBreakHasNestedTarget = breakHasNestedTarget;
     if (auto statement = node->as<Statement>()) {
-        if (statement->statementKind() == Statement::BREAK ||
-            statement->statementKind() == Statement::CONTINUE ||
-            statement->statementKind() == Statement::CASE_LABEL ||
+        /*
+         * A nested switch owns every break/case/default below it. A loop only
+         * owns breaks: case/default labels inside a loop still belong to the
+         * nearest surrounding switch, so keep looking for those. Continue is
+         * never captured by a newly inserted switch.
+         */
+        if (statement->statementKind() == Statement::SWITCH) {
+            return false;
+        }
+        if (statement->statementKind() == Statement::BREAK) {
+            return !breakHasNestedTarget;
+        }
+        if (statement->statementKind() == Statement::CASE_LABEL ||
             statement->statementKind() == Statement::DEFAULT_LABEL) {
             return true;
+        }
+        if (statement->statementKind() == Statement::DO_WHILE ||
+            statement->statementKind() == Statement::FOR ||
+            statement->statementKind() == Statement::WHILE) {
+            childBreakHasNestedTarget = true;
         }
     }
 
     bool result = false;
-    node->callOnChildren([&result](const TreeNode *child) {
-        if (!result && hasSwitchControlStatement(child)) {
+    node->callOnChildren([&](const TreeNode *child) {
+        if (!result && hasSwitchControlStatement(
+                           child, childBreakHasNestedTarget)) {
             result = true;
         }
     });
@@ -371,6 +389,8 @@ bool isStableAroundVariable(const Expression *expression,
         case Expression::BINARY_OPERATOR: {
             auto binary = expression->as<BinaryOperator>();
             return binary->operatorKind() != BinaryOperator::ASSIGN &&
+                   binary->operatorKind() != BinaryOperator::LOGICAL_AND &&
+                   binary->operatorKind() != BinaryOperator::LOGICAL_OR &&
                    isStableAroundVariable(binary->left(), declaration) &&
                    isStableAroundVariable(binary->right(), declaration);
         }
@@ -395,9 +415,15 @@ bool isStableAroundVariable(const Expression *expression,
     unreachable();
 }
 
-std::unique_ptr<Expression> *statementExpression(Statement *statement) {
+std::unique_ptr<Expression> *statementExpression(Statement *statement,
+                                                 bool allowConditional) {
     if (auto expressionStatement = statement->as<ExpressionStatement>()) {
         return &expressionStatement->expression();
+    }
+    if (allowConditional) {
+        if (auto conditional = statement->as<If>()) {
+            return &conditional->condition();
+        }
     }
     if (auto returnStatement = statement->as<Return>()) {
         if (returnStatement->returnValue()) {
@@ -530,7 +556,9 @@ void findReplacementSite(std::unique_ptr<Expression> &expression,
     }
 }
 
-bool inlineSingleUseTemporary(Block *block, TypeCalculator &typeCalculator) {
+bool inlineSingleUseTemporary(Block *block, const Block *outerDeclarationScope,
+                              bool allowConditional,
+                              TypeCalculator &typeCalculator) {
     auto &statements = block->statements();
 
     for (std::size_t i = 0; i + 1 < statements.size(); ++i) {
@@ -548,7 +576,14 @@ bool inlineSingleUseTemporary(Block *block, TypeCalculator &typeCalculator) {
         }
 
         VariableDeclaration *declaration = identifier->declaration();
-        if (!ownsDeclaration(block, declaration) || declaration->initialValue()) {
+        const Block *referenceScope = nullptr;
+        if (ownsDeclaration(block, declaration)) {
+            referenceScope = block;
+        } else if (outerDeclarationScope &&
+                   ownsDeclaration(outerDeclarationScope, declaration)) {
+            referenceScope = outerDeclarationScope;
+        }
+        if (!referenceScope || declaration->initialValue()) {
             continue;
         }
 
@@ -564,13 +599,14 @@ bool inlineSingleUseTemporary(Block *block, TypeCalculator &typeCalculator) {
             continue;
         }
 
-        if (countBlockVariableReferences(block, declaration) != 2 ||
+        if (countBlockVariableReferences(referenceScope, declaration) != 2 ||
             countVariableReferences(assignment->right().get(), declaration) != 0 ||
             countVariableReferences(statements[i + 1].get(), declaration) != 1) {
             continue;
         }
 
-        auto destination = statementExpression(statements[i + 1].get());
+        auto destination = statementExpression(statements[i + 1].get(),
+                                                allowConditional);
         if (!destination ||
             !isSafeInliningDestination(destination->get(), declaration,
                                        hasSideEffects(assignment->right().get()))) {
@@ -590,6 +626,31 @@ bool inlineSingleUseTemporary(Block *block, TypeCalculator &typeCalculator) {
     }
 
     return false;
+}
+
+bool inlineFunctionScopeTemporary(TreeNode *node, Block *functionBlock,
+                                  TypeCalculator &typeCalculator) {
+    if (!node) {
+        return false;
+    }
+
+    if (auto statement = node->as<Statement>()) {
+        if (auto block = statement->as<Block>()) {
+            if (inlineSingleUseTemporary(block, functionBlock, true,
+                                         typeCalculator)) {
+                return true;
+            }
+        }
+    }
+
+    bool result = false;
+    node->callOnChildren([&](TreeNode *child) {
+        if (!result) {
+            result = inlineFunctionScopeTemporary(
+                child, functionBlock, typeCalculator);
+        }
+    });
+    return result;
 }
 
 bool removeDeadLocalAssignment(Block *block) {
@@ -1257,6 +1318,28 @@ std::unique_ptr<Declaration> Simplifier::simplify(std::unique_ptr<Declaration> n
 
 std::unique_ptr<FunctionDefinition> Simplifier::simplify(std::unique_ptr<FunctionDefinition> node) {
     node->block() = simplify(std::move(node->block()));
+
+    /*
+     * DefinitionGenerator declares all recovered locals in the function's
+     * outer block, even when an assignment and its sole use live together in
+     * a nested branch.  Run this only after the complete function block is
+     * back in place, so the reference count covers every branch.  Each
+     * successful iteration removes an assignment, making the fixed point
+     * finite; re-simplifying also prunes its now-unused declaration and can
+     * expose structured control flow.
+     */
+    bool changed;
+    do {
+        changed = false;
+        while (inlineFunctionScopeTemporary(
+                   node->block().get(), node->block().get(), typeCalculator_)) {
+            changed = true;
+        }
+        if (changed) {
+            node->block() = simplify(std::move(node->block()));
+        }
+    } while (changed);
+
     node->labels() = simplify(std::move(node->labels()));
     return node;
 }
@@ -1815,16 +1898,30 @@ std::unique_ptr<Block> Simplifier::simplify(std::unique_ptr<Block> node) {
     node->declarations() = simplify(std::move(node->declarations()));
     node->statements() = simplify(std::move(node->statements()));
 
+    bool statementsChanged = false;
     bool changed;
     do {
         changed = false;
-        while (inlineSingleUseTemporary(node.get(), typeCalculator_)) {
+        while (inlineSingleUseTemporary(node.get(), node.get(), false,
+                                        typeCalculator_)) {
             changed = true;
+            statementsChanged = true;
         }
         while (removeDeadLocalAssignment(node.get())) {
             changed = true;
+            statementsChanged = true;
         }
     } while (changed);
+
+    /*
+     * Temporary propagation and dead-assignment removal can leave an If
+     * ladder in the exact form expected by the structured-control passes.
+     * Give statements one more pass rather than making the printed output
+     * depend on the form they had before block cleanup.
+     */
+    if (statementsChanged) {
+        node->statements() = simplify(std::move(node->statements()));
+    }
 
     recoverGuardedDoWhileForLoops(node.get(), typeCalculator_);
     recoverForLoops(node.get());
@@ -1909,6 +2006,18 @@ std::unique_ptr<Statement> Simplifier::simplify(std::unique_ptr<If> node) {
                 }
             }
         }
+    }
+
+    /*
+     * Simplifying a branch can expose the rest of a comparison ladder.  For
+     * example, pruning an unused statement or declaration can turn a block
+     * with several children into the one-If wrapper accepted by
+     * getNestedIf().  The first (outermost-first) attempt above deliberately
+     * runs before child simplification, so retry here before boolean
+     * normalization changes comparisons against zero into !expressions.
+     */
+    if (auto switchStatement = makeSwitchFromIfLadder(node)) {
+        return simplify(std::move(switchStatement));
     }
 
     node->condition() = simplifyBooleanExpression(simplify(std::move(node->condition())));
