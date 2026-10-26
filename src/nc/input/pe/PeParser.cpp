@@ -24,6 +24,8 @@
 
 #include "PeParser.h"
 
+#include <algorithm>
+
 #include <QCoreApplication> /* For Q_DECLARE_TR_FUNCTIONS. */
 #include <QIODevice>
 
@@ -311,67 +313,141 @@ private:
     }
 
     void parseImports() {
-        if (optionalHeader_.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress == 0) {
+        const auto &directory = optionalHeader_.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        if (directory.VirtualAddress == 0) {
             return;
         }
 
         auto reader = core::image::Reader(image_);
 
         IMAGE_IMPORT_DESCRIPTOR descriptor;
-        for (auto descriptorAddress = optionalHeader_.ImageBase + optionalHeader_.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
-             image_->readBytes(descriptorAddress, reinterpret_cast<char *>(&descriptor), sizeof(descriptor)) == sizeof(descriptor);
-             descriptorAddress += sizeof(descriptor))
-        {
-            if (descriptor.Characteristics == 0) {
+        auto descriptorAddress = optionalHeader_.ImageBase + directory.VirtualAddress;
+        const auto *descriptorSection = image_->getSectionContainingAddress(descriptorAddress);
+        if (!descriptorSection) {
+            log_.warning(tr("Image import directory is outside of the image sections."));
+            return;
+        }
+
+        ByteSize descriptorCount = (descriptorSection->endAddr() - descriptorAddress) / sizeof(descriptor);
+        if (directory.Size >= sizeof(descriptor)) {
+            descriptorCount = std::min(descriptorCount, static_cast<ByteSize>(directory.Size / sizeof(descriptor)));
+        } else {
+            log_.warning(tr("Image import directory has an invalid size; using its section boundary."));
+        }
+        descriptorCount = std::min<ByteSize>(descriptorCount, 4096);
+        ByteSize remainingImportEntries = 65536;
+        bool foundTerminator = false;
+
+        for (ByteSize i = 0; i < descriptorCount; ++i, descriptorAddress += sizeof(descriptor)) {
+            if (image_->readBytes(descriptorAddress, reinterpret_cast<char *>(&descriptor), sizeof(descriptor)) !=
+                sizeof(descriptor)) {
+                log_.warning(tr("Cannot read the image import descriptor number %1.").arg(i));
+                return;
+            }
+
+            peByteOrder.convertFrom(descriptor.OriginalFirstThunk);
+            peByteOrder.convertFrom(descriptor.TimeDateStamp);
+            peByteOrder.convertFrom(descriptor.ForwarderChain);
+            peByteOrder.convertFrom(descriptor.Name);
+            peByteOrder.convertFrom(descriptor.FirstThunk);
+
+            if (descriptor.OriginalFirstThunk == 0 && descriptor.TimeDateStamp == 0 && descriptor.ForwarderChain == 0 &&
+                descriptor.Name == 0 && descriptor.FirstThunk == 0) {
+                foundTerminator = true;
                 break;
             }
 
-            peByteOrder.convertFrom(descriptor.Characteristics);
-            peByteOrder.convertFrom(descriptor.Name);
-            peByteOrder.convertFrom(descriptor.FirstThunk);
+            if (descriptor.Name == 0 || descriptor.FirstThunk == 0) {
+                log_.warning(tr("Image import descriptor number %1 is malformed.").arg(i));
+                continue;
+            }
 
             auto dllName = reader.readAsciizString(descriptor.Name + optionalHeader_.ImageBase, 1024);
             log_.debug(tr("Found imports from DLL: %1").arg(dllName));
 
-            parseImportAddressTable(dllName, descriptor.FirstThunk + optionalHeader_.ImageBase);
+            auto lookupTable = descriptor.OriginalFirstThunk ? descriptor.OriginalFirstThunk : descriptor.FirstThunk;
+            parseImportAddressTable(dllName, optionalHeader_.ImageBase + lookupTable,
+                                    optionalHeader_.ImageBase + descriptor.FirstThunk, remainingImportEntries);
+            if (remainingImportEntries == 0) {
+                log_.warning(tr("Image has too many import table entries."));
+                return;
+            }
+        }
+
+        if (!foundTerminator) {
+            log_.warning(tr("Image import descriptor table is not null-terminated within its directory."));
         }
     }
 
-    void parseImportAddressTable(const QString &dllName, ByteAddr virtualAddress) {
+    void parseImportAddressTable(const QString &dllName, ByteAddr lookupTableAddress,
+                                 ByteAddr importAddressTableAddress, ByteSize &remainingImportEntries) {
         auto reader = core::image::Reader(image_);
 
+        const auto *lookupSection = image_->getSectionContainingAddress(lookupTableAddress);
+        const auto *importSection = image_->getSectionContainingAddress(importAddressTableAddress);
+        if (!lookupSection || !importSection) {
+            log_.warning(tr("Import lookup or address table is outside of the image sections."));
+            return;
+        }
+
+        const ByteSize entrySize = sizeof(IMPORT_LOOKUP_TABLE_ENTRY);
+        auto lookupEntryCount = (lookupSection->endAddr() - lookupTableAddress) / entrySize;
+        auto importEntryCount = (importSection->endAddr() - importAddressTableAddress) / entrySize;
+        auto entryCount = std::min(std::min(lookupEntryCount, importEntryCount), remainingImportEntries);
+
         IMPORT_LOOKUP_TABLE_ENTRY entry;
-        for (auto entryAddress = virtualAddress;
-             image_->readBytes(entryAddress, reinterpret_cast<char *>(&entry), sizeof(entry)) == sizeof(entry);
-             entryAddress += sizeof(entry))
-        {
-            if (entry.RawValue == 0) {
-                break;
+        bool foundTerminator = false;
+        for (ByteSize i = 0; i < entryCount; ++i) {
+            --remainingImportEntries;
+            auto lookupEntryAddress = lookupTableAddress + i * entrySize;
+            auto importEntryAddress = importAddressTableAddress + i * entrySize;
+
+            if (image_->readBytes(lookupEntryAddress, reinterpret_cast<char *>(&entry), sizeof(entry)) !=
+                sizeof(entry)) {
+                log_.warning(tr("Cannot read an import lookup table entry."));
+                return;
             }
 
             peByteOrder.convertFrom(entry);
 
+            if (entry.RawValue == 0) {
+                foundTerminator = true;
+                break;
+            }
+
             if (entry.IsOrdinal) {
-                log_.debug(tr("Found an import by ordinal value: %1").arg(entry.Name));
+                const auto ordinal = entry.Name & 0xffff;
+                log_.debug(tr("Found an import by ordinal value: %1").arg(ordinal));
 
                 image_->addRelocation(std::make_unique<core::image::Relocation>(
-                    entryAddress,
+                    importEntryAddress,
                     image_->addSymbol(std::make_unique<core::image::Symbol>(
-                        core::image::SymbolType::FUNCTION, tr("%1:%2").arg(dllName).arg(entry.Name), boost::none)),
-                    sizeof(IMPORT_LOOKUP_TABLE_ENTRY)));
+                        core::image::SymbolType::FUNCTION, tr("%1:%2").arg(dllName).arg(ordinal), boost::none)),
+                    entrySize));
             } else {
                 auto name = reader.readAsciizString(
                     optionalHeader_.ImageBase + entry.Name + sizeof(IMAGE_IMPORT_BY_NAME().Hint), 1024);
 
+                if (name.isEmpty()) {
+                    log_.warning(tr("Cannot read the name of an imported function."));
+                    continue;
+                }
+
                 log_.debug(tr("Found an import by name: %1").arg(name));
 
                 image_->addRelocation(std::make_unique<core::image::Relocation>(
-                    entryAddress, image_->addSymbol(std::make_unique<core::image::Symbol>(
-                                      core::image::SymbolType::FUNCTION, std::move(name), boost::none)),
-                    sizeof(IMPORT_LOOKUP_TABLE_ENTRY)));
+                    importEntryAddress,
+                    image_->addSymbol(std::make_unique<core::image::Symbol>(core::image::SymbolType::FUNCTION,
+                                                                            std::move(name), boost::none)),
+                    entrySize));
             }
         }
+
+        if (!foundTerminator) {
+            log_.warning(tr("Import lookup table is not null-terminated within its section."));
+        }
     }
+
     void parseExports() {
         if (optionalHeader_.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress == 0) {
             return;
