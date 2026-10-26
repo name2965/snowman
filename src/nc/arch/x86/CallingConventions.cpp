@@ -104,9 +104,6 @@ Cdecl32CallingConvention::Cdecl32CallingConvention(const X86Architecture *archit
     setFirstArgumentOffset(architecture->bitness());
     setArgumentAlignment(architecture->bitness());
 
-    addArgumentGroup(std::vector<core::ir::MemoryLocation>(1, X86Registers::ecx()->memoryLocation()));
-    addArgumentGroup(std::vector<core::ir::MemoryLocation>());
-
     addReturnValueLocation(X86Registers::eax()->memoryLocation());
     addReturnValueLocation(X86Registers::st0()->memoryLocation());
 
@@ -150,7 +147,30 @@ Stdcall32CallingConvention::Stdcall32CallingConvention(const X86Architecture *ar
     setArgumentAlignment(architecture->bitness());
     setCalleeCleanup(true);
 
+    addReturnValueLocation(X86Registers::eax()->memoryLocation());
+    addReturnValueLocation(X86Registers::st0()->memoryLocation());
+
+    addEnterStatement(std::make_unique<core::ir::Assignment>(
+        std::make_unique<core::ir::MemoryLocationAccess>(core::ir::MemoryLocation(core::ir::MemoryDomain::STACK, 0, architecture->bitness())),
+        std::make_unique<core::ir::Intrinsic>(core::ir::Intrinsic::RETURN_ADDRESS, architecture->bitness())
+    ));
+    addEnterStatement(std::make_unique<core::ir::Assignment>(
+        std::make_unique<core::ir::MemoryLocationAccess>(X86Registers::df()->memoryLocation()),
+        std::make_unique<core::ir::Constant>(SizedValue(X86Registers::df()->size(), 0))
+    ));
+}
+
+Thiscall32CallingConvention::Thiscall32CallingConvention(const X86Architecture *architecture):
+    Convention(QLatin1String("thiscall32"))
+{
+    setStackPointer(architecture->stackPointer()->memoryLocation());
+
+    setFirstArgumentOffset(architecture->bitness());
+    setArgumentAlignment(architecture->bitness());
+    setCalleeCleanup(true);
+
     addArgumentGroup(std::vector<core::ir::MemoryLocation>(1, X86Registers::ecx()->memoryLocation()));
+    /* Stack arguments remain recoverable even when an unused 'this' is not read. */
     addArgumentGroup(std::vector<core::ir::MemoryLocation>());
 
     addReturnValueLocation(X86Registers::eax()->memoryLocation());

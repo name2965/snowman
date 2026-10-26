@@ -27,6 +27,7 @@
 
 #include <vector>
 #include <memory>
+#include <utility>
 
 #include "ArgumentDeclaration.h"
 #include "Commentable.h"
@@ -45,6 +46,7 @@ class FunctionDeclaration: public Declaration, public Commentable {
     std::unique_ptr<FunctionPointerType> type_; ///< Type of pointer to this function.
     std::vector<std::unique_ptr<ArgumentDeclaration> > arguments_; ///< Function arguments.
     std::unique_ptr<FunctionIdentifier> functionIdentifier_;
+    QString callingConvention_; ///< Optional source-level calling convention spelling.
 
 public:
     /**
@@ -101,6 +103,14 @@ public:
      * \return Valid pointer to the first declaration of the function.
      */
     FunctionDeclaration *getFirstDeclaration() const { return functionIdentifier_->declaration(); }
+
+    /** \return Optional source-level calling convention spelling. */
+    const QString &callingConvention() const { return callingConvention_; }
+
+    /** Sets the source-level calling convention spelling. */
+    void setCallingConvention(QString callingConvention) {
+        callingConvention_ = std::move(callingConvention);
+    }
 
 protected:
     void doCallOnChildren(const std::function<void(TreeNode *)> &fun) override;

@@ -31,10 +31,14 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <set>
 #include <vector>
+
+#include <boost/optional.hpp>
 
 #include <nc/common/Foreach.h>
 #include <nc/common/StringToInt.h>
+#include <nc/common/Unreachable.h>
 #include <nc/common/make_unique.h>
 
 #include <nc/core/Context.h>
@@ -42,6 +46,7 @@
 #include <nc/core/image/Image.h>
 #include <nc/core/image/Relocation.h>
 #include <nc/core/image/Symbol.h>
+#include <nc/core/mangling/Demangler.h>
 #include <nc/core/ir/Function.h>
 #include <nc/core/ir/Functions.h>
 #include <nc/core/ir/Jump.h>
@@ -49,11 +54,14 @@
 #include <nc/core/ir/Statements.h>
 #include <nc/core/ir/Terms.h>
 #include <nc/core/ir/calling/CallSignature.h>
+#include <nc/core/ir/calling/CallHook.h>
 #include <nc/core/ir/calling/Conventions.h>
+#include <nc/core/ir/calling/FunctionPrototype.h>
 #include <nc/core/ir/calling/FunctionSignature.h>
 #include <nc/core/ir/calling/Hooks.h>
 #include <nc/core/ir/calling/Signatures.h>
 #include <nc/core/ir/dflow/Dataflows.h>
+#include <nc/core/ir/dflow/Value.h>
 
 #include "X86Architecture.h"
 #include "X86Instruction.h"
@@ -73,12 +81,136 @@ enum ApiResultKind {
     API_RESULT_POINTER_SIZED
 };
 
+enum ApiTypeKind {
+    API_TYPE_VOID,
+    API_TYPE_INT32,
+    API_TYPE_UINT32,
+    API_TYPE_INTPTR,
+    API_TYPE_UINTPTR,
+    API_TYPE_POINTER
+};
+
+struct KnownApiType {
+    ApiTypeKind kind;
+    const char *name;
+};
+
+struct KnownApiParameter {
+    KnownApiType type;
+    const char *name;
+    bool mayWriteMemory;
+};
+
 struct KnownWin32Api {
     const char *name;
     std::size_t argumentCount;
     unsigned int int32ArgumentMask;
     ApiResultKind resultKind;
     bool doesNotReturn;
+    KnownApiType returnType;
+    const KnownApiParameter *parameters;
+};
+
+const KnownApiParameter DIALOG_BOX_PARAM_A_PARAMETERS[] = {
+    {{API_TYPE_POINTER, "HINSTANCE"}, "hInstance", false},
+    {{API_TYPE_POINTER, "LPCSTR"}, "lpTemplateName", false},
+    {{API_TYPE_POINTER, "HWND"}, "hWndParent", false},
+    {{API_TYPE_POINTER, "DLGPROC"}, "lpDialogFunc", false},
+    {{API_TYPE_INTPTR, "LPARAM"}, "dwInitParam", true}
+};
+
+const KnownApiParameter DIALOG_BOX_PARAM_W_PARAMETERS[] = {
+    {{API_TYPE_POINTER, "HINSTANCE"}, "hInstance", false},
+    {{API_TYPE_POINTER, "LPCWSTR"}, "lpTemplateName", false},
+    {{API_TYPE_POINTER, "HWND"}, "hWndParent", false},
+    {{API_TYPE_POINTER, "DLGPROC"}, "lpDialogFunc", false},
+    {{API_TYPE_INTPTR, "LPARAM"}, "dwInitParam", true}
+};
+
+const KnownApiParameter END_DIALOG_PARAMETERS[] = {
+    {{API_TYPE_POINTER, "HWND"}, "hDlg", false},
+    {{API_TYPE_INTPTR, "INT_PTR"}, "nResult", false}
+};
+
+const KnownApiParameter EXIT_PROCESS_PARAMETERS[] = {
+    {{API_TYPE_UINT32, "UINT"}, "uExitCode", false}
+};
+
+const KnownApiParameter GET_DLG_ITEM_PARAMETERS[] = {
+    {{API_TYPE_POINTER, "HWND"}, "hDlg", false},
+    {{API_TYPE_INT32, "int"}, "nIDDlgItem", false}
+};
+
+const KnownApiParameter GET_DLG_ITEM_TEXT_A_PARAMETERS[] = {
+    {{API_TYPE_POINTER, "HWND"}, "hDlg", false},
+    {{API_TYPE_INT32, "int"}, "nIDDlgItem", false},
+    {{API_TYPE_POINTER, "LPSTR"}, "lpString", true},
+    {{API_TYPE_INT32, "int"}, "cchMax", false}
+};
+
+const KnownApiParameter GET_DLG_ITEM_TEXT_W_PARAMETERS[] = {
+    {{API_TYPE_POINTER, "HWND"}, "hDlg", false},
+    {{API_TYPE_INT32, "int"}, "nIDDlgItem", false},
+    {{API_TYPE_POINTER, "LPWSTR"}, "lpString", true},
+    {{API_TYPE_INT32, "int"}, "cchMax", false}
+};
+
+const KnownApiParameter GET_MODULE_HANDLE_A_PARAMETERS[] = {
+    {{API_TYPE_POINTER, "LPCSTR"}, "lpModuleName", false}
+};
+
+const KnownApiParameter GET_MODULE_HANDLE_W_PARAMETERS[] = {
+    {{API_TYPE_POINTER, "LPCWSTR"}, "lpModuleName", false}
+};
+
+const KnownApiParameter LOAD_ICON_A_PARAMETERS[] = {
+    {{API_TYPE_POINTER, "HINSTANCE"}, "hInstance", false},
+    {{API_TYPE_POINTER, "LPCSTR"}, "lpIconName", false}
+};
+
+const KnownApiParameter LOAD_ICON_W_PARAMETERS[] = {
+    {{API_TYPE_POINTER, "HINSTANCE"}, "hInstance", false},
+    {{API_TYPE_POINTER, "LPCWSTR"}, "lpIconName", false}
+};
+
+const KnownApiParameter MESSAGE_BOX_A_PARAMETERS[] = {
+    {{API_TYPE_POINTER, "HWND"}, "hWnd", false},
+    {{API_TYPE_POINTER, "LPCSTR"}, "lpText", false},
+    {{API_TYPE_POINTER, "LPCSTR"}, "lpCaption", false},
+    {{API_TYPE_UINT32, "UINT"}, "uType", false}
+};
+
+const KnownApiParameter MESSAGE_BOX_W_PARAMETERS[] = {
+    {{API_TYPE_POINTER, "HWND"}, "hWnd", false},
+    {{API_TYPE_POINTER, "LPCWSTR"}, "lpText", false},
+    {{API_TYPE_POINTER, "LPCWSTR"}, "lpCaption", false},
+    {{API_TYPE_UINT32, "UINT"}, "uType", false}
+};
+
+const KnownApiParameter SEND_MESSAGE_PARAMETERS[] = {
+    {{API_TYPE_POINTER, "HWND"}, "hWnd", false},
+    {{API_TYPE_UINT32, "UINT"}, "Msg", false},
+    {{API_TYPE_UINTPTR, "WPARAM"}, "wParam", true},
+    {{API_TYPE_INTPTR, "LPARAM"}, "lParam", true}
+};
+
+const KnownApiParameter SET_FOCUS_PARAMETERS[] = {
+    {{API_TYPE_POINTER, "HWND"}, "hWnd", false}
+};
+
+const KnownApiParameter LSTRLEN_A_PARAMETERS[] = {
+    {{API_TYPE_POINTER, "LPCSTR"}, "lpString", false}
+};
+
+const KnownApiParameter LSTRLEN_W_PARAMETERS[] = {
+    {{API_TYPE_POINTER, "LPCWSTR"}, "lpString", false}
+};
+
+const KnownApiParameter DIALOG_PROCEDURE_PARAMETERS[] = {
+    {{API_TYPE_POINTER, "HWND"}, "hWnd", false},
+    {{API_TYPE_UINT32, "UINT"}, "uMsg", false},
+    {{API_TYPE_UINTPTR, "WPARAM"}, "wParam", true},
+    {{API_TYPE_INTPTR, "LPARAM"}, "lParam", true}
 };
 
 /*
@@ -88,26 +220,49 @@ struct KnownWin32Api {
  * require changing the calling-convention logic.
  */
 const KnownWin32Api KNOWN_WIN32_APIS[] = {
-    /* name,                 argc, 32-bit argument mask, result,                   noreturn */
-    {"DialogBoxParamA",        5, 0x00, API_RESULT_POINTER_SIZED, false},
-    {"DialogBoxParamW",        5, 0x00, API_RESULT_POINTER_SIZED, false},
-    {"EndDialog",              2, 0x00, API_RESULT_INT32,         false},
-    {"ExitProcess",            1, 0x01, API_RESULT_VOID,          true},
-    {"GetDlgItem",             2, 0x02, API_RESULT_POINTER_SIZED, false},
-    {"GetDlgItemTextA",        4, 0x0a, API_RESULT_INT32,         false},
-    {"GetDlgItemTextW",        4, 0x0a, API_RESULT_INT32,         false},
-    {"GetModuleHandleA",       1, 0x00, API_RESULT_POINTER_SIZED, false},
-    {"GetModuleHandleW",       1, 0x00, API_RESULT_POINTER_SIZED, false},
-    {"LoadIconA",              2, 0x00, API_RESULT_POINTER_SIZED, false},
-    {"LoadIconW",              2, 0x00, API_RESULT_POINTER_SIZED, false},
-    {"MessageBoxA",            4, 0x08, API_RESULT_INT32,         false},
-    {"MessageBoxW",            4, 0x08, API_RESULT_INT32,         false},
-    {"SendMessageA",           4, 0x02, API_RESULT_POINTER_SIZED, false},
-    {"SendMessageW",           4, 0x02, API_RESULT_POINTER_SIZED, false},
-    {"SetFocus",               1, 0x00, API_RESULT_POINTER_SIZED, false},
-    {"lstrlenA",               1, 0x00, API_RESULT_INT32,         false},
-    {"lstrlenW",               1, 0x00, API_RESULT_INT32,         false}
+    /* name, argc, 32-bit argument mask, result, noreturn, source return type, parameters */
+    {"DialogBoxParamA",  5, 0x00, API_RESULT_POINTER_SIZED, false,
+        {API_TYPE_INTPTR, "INT_PTR"}, DIALOG_BOX_PARAM_A_PARAMETERS},
+    {"DialogBoxParamW",  5, 0x00, API_RESULT_POINTER_SIZED, false,
+        {API_TYPE_INTPTR, "INT_PTR"}, DIALOG_BOX_PARAM_W_PARAMETERS},
+    {"EndDialog",        2, 0x00, API_RESULT_INT32, false,
+        {API_TYPE_INT32, "BOOL"}, END_DIALOG_PARAMETERS},
+    {"ExitProcess",      1, 0x01, API_RESULT_VOID, true,
+        {API_TYPE_VOID, "void"}, EXIT_PROCESS_PARAMETERS},
+    {"GetDlgItem",       2, 0x02, API_RESULT_POINTER_SIZED, false,
+        {API_TYPE_POINTER, "HWND"}, GET_DLG_ITEM_PARAMETERS},
+    {"GetDlgItemTextA",  4, 0x0a, API_RESULT_INT32, false,
+        {API_TYPE_UINT32, "UINT"}, GET_DLG_ITEM_TEXT_A_PARAMETERS},
+    {"GetDlgItemTextW",  4, 0x0a, API_RESULT_INT32, false,
+        {API_TYPE_UINT32, "UINT"}, GET_DLG_ITEM_TEXT_W_PARAMETERS},
+    {"GetModuleHandleA", 1, 0x00, API_RESULT_POINTER_SIZED, false,
+        {API_TYPE_POINTER, "HMODULE"}, GET_MODULE_HANDLE_A_PARAMETERS},
+    {"GetModuleHandleW", 1, 0x00, API_RESULT_POINTER_SIZED, false,
+        {API_TYPE_POINTER, "HMODULE"}, GET_MODULE_HANDLE_W_PARAMETERS},
+    {"LoadIconA",        2, 0x00, API_RESULT_POINTER_SIZED, false,
+        {API_TYPE_POINTER, "HICON"}, LOAD_ICON_A_PARAMETERS},
+    {"LoadIconW",        2, 0x00, API_RESULT_POINTER_SIZED, false,
+        {API_TYPE_POINTER, "HICON"}, LOAD_ICON_W_PARAMETERS},
+    {"MessageBoxA",      4, 0x08, API_RESULT_INT32, false,
+        {API_TYPE_INT32, "int"}, MESSAGE_BOX_A_PARAMETERS},
+    {"MessageBoxW",      4, 0x08, API_RESULT_INT32, false,
+        {API_TYPE_INT32, "int"}, MESSAGE_BOX_W_PARAMETERS},
+    {"SendMessageA",     4, 0x02, API_RESULT_POINTER_SIZED, false,
+        {API_TYPE_INTPTR, "LRESULT"}, SEND_MESSAGE_PARAMETERS},
+    {"SendMessageW",     4, 0x02, API_RESULT_POINTER_SIZED, false,
+        {API_TYPE_INTPTR, "LRESULT"}, SEND_MESSAGE_PARAMETERS},
+    {"SetFocus",         1, 0x00, API_RESULT_POINTER_SIZED, false,
+        {API_TYPE_POINTER, "HWND"}, SET_FOCUS_PARAMETERS},
+    {"lstrlenA",         1, 0x00, API_RESULT_INT32, false,
+        {API_TYPE_INT32, "int"}, LSTRLEN_A_PARAMETERS},
+    {"lstrlenW",         1, 0x00, API_RESULT_INT32, false,
+        {API_TYPE_INT32, "int"}, LSTRLEN_W_PARAMETERS}
 };
+
+bool hasDialogProcedureCallback(const KnownWin32Api &api) {
+    return std::strcmp(api.name, "DialogBoxParamA") == 0 ||
+           std::strcmp(api.name, "DialogBoxParamW") == 0;
+}
 
 QString canonicalImportName(QString name) {
     name = name.trimmed();
@@ -273,6 +428,27 @@ bool setKnownWin32CallingConvention(core::Context &context,
     return true;
 }
 
+bool setExplicitThiscallConvention(core::Context &context,
+                                   const core::ir::calling::CalleeId &calleeId,
+                                   const QString &symbolName) {
+    const QString demangledName = context.image()->demangler()->demangle(symbolName);
+
+    /*
+     * Do not guess from ECX usage: ordinary C functions commonly use ECX as a
+     * temporary.  Microsoft's decorated names, on the other hand, carry the
+     * calling convention and the demangler emits it as a separate keyword.
+     */
+    if (!demangledName.contains(QLatin1String(" __thiscall "))) {
+        return false;
+    }
+
+    context.conventions()->setConvention(
+        calleeId,
+        context.image()->platform().architecture()->getCallingConvention(
+            QLatin1String("thiscall32")));
+    return true;
+}
+
 bool isInt32Argument(const KnownWin32Api &api, std::size_t index) {
     return (api.int32ArgumentMask & (1U << index)) != 0;
 }
@@ -311,9 +487,59 @@ std::shared_ptr<core::ir::Term> makeKnownArgument(const KnownWin32Api &api,
         valueSize);
 }
 
+core::ir::calling::TypeDescription makeTypeDescription(const KnownApiType &type,
+                                                        SmallBitSize bitness) {
+    using core::ir::calling::TypeDescription;
+
+    const QString displayName = QLatin1String(type.name);
+    switch (type.kind) {
+        case API_TYPE_VOID:
+            return TypeDescription(TypeDescription::VOID, 0, false, displayName);
+        case API_TYPE_INT32:
+            return TypeDescription(TypeDescription::INTEGER, 32, false, displayName);
+        case API_TYPE_UINT32:
+            return TypeDescription(TypeDescription::INTEGER, 32, true, displayName);
+        case API_TYPE_INTPTR:
+            return TypeDescription(TypeDescription::INTEGER, bitness, false, displayName);
+        case API_TYPE_UINTPTR:
+            return TypeDescription(TypeDescription::INTEGER, bitness, true, displayName);
+        case API_TYPE_POINTER:
+            return TypeDescription(TypeDescription::POINTER, bitness, true, displayName);
+    }
+
+    unreachable();
+    return TypeDescription(TypeDescription::VOID, 0, false);
+}
+
+std::shared_ptr<const core::ir::calling::FunctionPrototype> makeFunctionPrototype(
+        const KnownApiType &returnType,
+        const KnownApiParameter *parameters,
+        std::size_t parameterCount,
+        SmallBitSize bitness,
+        const QString &preferredName = QString()) {
+    std::vector<core::ir::calling::ParameterDescription> parameterDescriptions;
+    parameterDescriptions.reserve(parameterCount);
+
+    for (std::size_t index = 0; index < parameterCount; ++index) {
+        parameterDescriptions.emplace_back(
+            QLatin1String(parameters[index].name),
+            makeTypeDescription(parameters[index].type, bitness),
+            parameters[index].mayWriteMemory);
+    }
+
+    return std::make_shared<core::ir::calling::FunctionPrototype>(
+        makeTypeDescription(returnType, bitness),
+        std::move(parameterDescriptions),
+        bitness == 32 ? QLatin1String("__stdcall") : QString(),
+        preferredName);
+}
+
 std::shared_ptr<core::ir::calling::FunctionSignature> makeKnownFunctionSignature(const KnownWin32Api &api,
                                                                                  SmallBitSize bitness) {
     auto signature = std::make_shared<core::ir::calling::FunctionSignature>();
+
+    signature->setPrototype(makeFunctionPrototype(
+        api.returnType, api.parameters, api.argumentCount, bitness));
 
     for (std::size_t index = 0; index < api.argumentCount; ++index) {
         signature->arguments().push_back(makeKnownArgument(api, index, bitness));
@@ -327,6 +553,113 @@ std::shared_ptr<core::ir::calling::FunctionSignature> makeKnownFunctionSignature
     }
 
     return signature;
+}
+
+std::shared_ptr<core::ir::calling::FunctionSignature> makeDialogProcedureSignature(
+        const QString &preferredName) {
+    auto signature = std::make_shared<core::ir::calling::FunctionSignature>();
+
+    signature->setPrototype(makeFunctionPrototype(
+        KnownApiType{API_TYPE_INTPTR, "INT_PTR"},
+        DIALOG_PROCEDURE_PARAMETERS,
+        sizeof(DIALOG_PROCEDURE_PARAMETERS) / sizeof(DIALOG_PROCEDURE_PARAMETERS[0]),
+        32,
+        preferredName));
+
+    for (std::size_t index = 0; index < 4; ++index) {
+        signature->arguments().push_back(
+            std::make_shared<core::ir::Dereference>(
+                std::make_unique<core::ir::BinaryOperator>(
+                    core::ir::BinaryOperator::ADD,
+                    std::make_unique<core::ir::MemoryLocationAccess>(X86Registers::esp()->memoryLocation()),
+                    std::make_unique<core::ir::Constant>(SizedValue(32, (index + 1) * 4)),
+                    32),
+                core::ir::MemoryDomain::MEMORY,
+                32));
+    }
+
+    signature->setReturnValue(
+        std::make_shared<core::ir::MemoryLocationAccess>(X86Registers::eax()->memoryLocation()));
+    return signature;
+}
+
+boost::optional<ByteAddr> getConcreteStackArgument(const core::ir::Call *call,
+                                                   const core::ir::dflow::Dataflow &dataflow,
+                                                   const core::ir::calling::Hooks &hooks,
+                                                   std::size_t index) {
+    const auto callHook = hooks.getCallHook(call);
+    if (!callHook || !callHook->stackPointer() || !callHook->snapshotStatement()) {
+        return boost::none;
+    }
+
+    const auto stackPointerValue = dataflow.getValue(callHook->stackPointer());
+    if (!stackPointerValue->isStackOffset()) {
+        return boost::none;
+    }
+
+    const BitAddr argumentAddress =
+        (stackPointerValue->stackOffset() + static_cast<SignedConstantValue>((index + 1) * 4)) * CHAR_BIT;
+    const core::ir::MemoryLocation argumentLocation(
+        core::ir::MemoryDomain::STACK, argumentAddress, 32);
+    const auto definitions = dataflow.getDefinitions(callHook->snapshotStatement()).projected(argumentLocation);
+
+    if (definitions.chunks().size() != 1 ||
+        definitions.chunks().front().location() != argumentLocation ||
+        definitions.chunks().front().hasUnknownDefinition() ||
+        definitions.chunks().front().definitions().empty())
+    {
+        return boost::none;
+    }
+
+    boost::optional<ConstantValue> result;
+    foreach (const auto definition, definitions.chunks().front().definitions()) {
+        const auto value = dataflow.getValue(definition);
+        if (!value->abstractValue().isConcrete()) {
+            return boost::none;
+        }
+
+        const ConstantValue concrete = value->abstractValue().asConcrete().value();
+        if (result && *result != concrete) {
+            return boost::none;
+        }
+        result = concrete;
+    }
+
+    if (!result) {
+        return boost::none;
+    }
+    return static_cast<ByteAddr>(*result);
+}
+
+core::ir::Function *getFunctionAtAddress(core::Context &context, ByteAddr address) {
+    foreach (auto function, context.functions()->list()) {
+        if (function->entry() && function->entry()->address() &&
+            *function->entry()->address() == address)
+        {
+            return function;
+        }
+    }
+    return nullptr;
+}
+
+bool canUseDialogProcedureName(const core::Context &context,
+                               ByteAddr address,
+                               std::size_t procedureCount) {
+    const auto addressSymbol = context.image()->getSymbol(address);
+    if (procedureCount != 1 ||
+        (addressSymbol && !addressSymbol->name().trimmed().isEmpty())) {
+        return false;
+    }
+
+    foreach (const auto symbol, context.image()->symbols()) {
+        if (canonicalImportName(symbol->name()).compare(
+                QLatin1String("DialogFunc"), Qt::CaseInsensitive) == 0)
+        {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 void setKnownFunctionSignature(core::Context &context,
@@ -349,6 +682,7 @@ void setKnownCallSignature(core::Context &context,
 
     callSignature->arguments() = functionSignature->arguments();
     callSignature->setReturnValue(functionSignature->returnValue());
+    callSignature->setPrototype(functionSignature->prototype());
     context.signatures()->setSignature(call, callSignature);
 
     if (calleeId.entryAddress()) {
@@ -360,6 +694,7 @@ void applyKnownWin32Signatures(core::Context &context) {
     const auto bitness = context.image()->platform().architecture()->bitness();
     const auto &dataflows = *context.dataflows();
     std::map<const KnownWin32Api *, std::shared_ptr<core::ir::calling::FunctionSignature>> signatures;
+    std::set<ByteAddr> dialogProcedures;
 
     auto getSignature = [&](const KnownWin32Api *api) {
         auto &signature = signatures[api];
@@ -398,9 +733,40 @@ void applyKnownWin32Signatures(core::Context &context) {
                 }
 
                 if (const auto api = getKnownWin32Api(symbol->name())) {
+                    if (bitness == 32 && hasDialogProcedureCallback(*api)) {
+                        if (const auto address = getConcreteStackArgument(
+                                call, dataflow, *context.hooks(), 3))
+                        {
+                            dialogProcedures.insert(*address);
+                        }
+                    }
                     setKnownCallSignature(context, calleeId, getSignature(api), call);
                 }
             }
+        }
+    }
+
+    if (bitness == 32) {
+        const auto stdcall32 = context.image()->platform().architecture()->getCallingConvention(
+            QLatin1String("stdcall32"));
+
+        foreach (const ByteAddr address, dialogProcedures) {
+            auto function = getFunctionAtAddress(context, address);
+            if (!function) {
+                continue;
+            }
+
+            const core::ir::calling::CalleeId calleeId{
+                core::ir::calling::EntryAddress(address)};
+            context.conventions()->setConvention(calleeId, stdcall32);
+            context.conventions()->setStackArgumentsSize(calleeId, static_cast<ByteSize>(16));
+            setKnownFunctionSignature(
+                context,
+                calleeId,
+                makeDialogProcedureSignature(
+                    canUseDialogProcedureName(context, address, dialogProcedures.size()) ?
+                        QLatin1String("DialogFunc") : QString()),
+                function);
         }
     }
 }
@@ -521,6 +887,11 @@ void X86MasterAnalyzer::detectCallingConventions(core::Context &context) const {
             if (isWindows && setKnownWin32CallingConvention(context, calleeId, symbol->name())) {
                 continue;
             }
+            if (isWindows && symbol->type() == core::image::SymbolType::FUNCTION &&
+                setExplicitThiscallConvention(context, calleeId, symbol->name()))
+            {
+                continue;
+            }
             auto index = symbol->name().lastIndexOf(QChar('@'));
             if (index == -1) {
                 continue;
@@ -568,7 +939,10 @@ void X86MasterAnalyzer::detectCallingConventions(core::Context &context) const {
                 assert(ud_obj_.operand[0].type == UD_OP_IMM && ud_obj_.operand[0].size == 16);
 
                 CalleeId calleeId(EntryAddress(*function->entry()->address()));
-                context.conventions()->setConvention(calleeId, stdcall32);
+                /* Preserve a stronger symbol-derived result such as __thiscall. */
+                if (!context.conventions()->getConvention(calleeId)) {
+                    context.conventions()->setConvention(calleeId, stdcall32);
+                }
                 context.conventions()->setStackArgumentsSize(calleeId, ud_obj_.operand[0].lval.uword);
             }
         }
@@ -582,6 +956,9 @@ void X86MasterAnalyzer::detectCallingConvention(core::Context &context, const co
     if (architecture->bitness() == 32 && platform.operatingSystem() == core::image::Platform::Windows) {
         if (auto symbol = getImportedFunctionSymbol(*context.image(), calleeId, architecture->bitness())) {
             if (setKnownWin32CallingConvention(context, calleeId, symbol->name())) {
+                return;
+            }
+            if (setExplicitThiscallConvention(context, calleeId, symbol->name())) {
                 return;
             }
         }

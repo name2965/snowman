@@ -48,14 +48,16 @@ const VoidType *Tree::makeVoidType() {
     return &voidType_;
 }
 
-const IntegerType *Tree::makeIntegerType(SmallBitSize size, bool isUnsigned) {
+const IntegerType *Tree::makeIntegerType(SmallBitSize size, bool isUnsigned, const QString &displayName) {
     foreach (const auto &type, integerTypes_) {
-        if (type->size() == size && type->isUnsigned() == isUnsigned) {
+        if (type->size() == size && type->isUnsigned() == isUnsigned &&
+            type->displayName() == displayName)
+        {
             return type.get();
         }
     }
 
-    IntegerType *type = new IntegerType(size, isUnsigned);
+    IntegerType *type = new IntegerType(size, isUnsigned, displayName);
     integerTypes_.push_back(std::unique_ptr<IntegerType>(type));
 
     return type;
@@ -74,15 +76,16 @@ const FloatType *Tree::makeFloatType(SmallBitSize size) {
     return type;
 }
 
-const PointerType *Tree::makePointerType(SmallBitSize size, const Type *pointee) {
+const PointerType *Tree::makePointerType(SmallBitSize size, const Type *pointee,
+                                         const QString &displayName) {
     auto range = pointerTypes_.equal_range(pointee);
     for (auto i = range.first; i != range.second; ++i) {
-        if (i->second->size() == size) {
+        if (i->second->size() == size && i->second->displayName() == displayName) {
             return i->second.get();
         }
     }
 
-    PointerType *type = new PointerType(size, pointee);
+    PointerType *type = new PointerType(size, pointee, displayName);
     pointerTypes_.insert(std::make_pair(pointee, std::unique_ptr<PointerType>(type)));
     return type;
 }

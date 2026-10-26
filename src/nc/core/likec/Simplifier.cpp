@@ -1,16 +1,22 @@
 #include "Simplifier.h"
 
+#include <algorithm>
+
 #include <nc/common/Foreach.h>
 #include <nc/common/Unreachable.h>
 #include <nc/common/make_unique.h>
 
 #include "BinaryOperator.h"
+#include "Break.h"
 #include "CallOperator.h"
+#include "CaseLabel.h"
 #include "CompilationUnit.h"
 #include "Declaration.h"
+#include "DefaultLabel.h"
 #include "DoWhile.h"
 #include "Expression.h"
 #include "ExpressionStatement.h"
+#include "For.h"
 #include "FunctionDefinition.h"
 #include "Goto.h"
 #include "If.h"
@@ -25,7 +31,10 @@
 #include "Typecast.h"
 #include "Types.h"
 #include "UnaryOperator.h"
+#include "UndeclaredIdentifier.h"
 #include "Utils.h"
+#include "VariableDeclaration.h"
+#include "VariableIdentifier.h"
 #include "While.h"
 
 namespace nc {
@@ -47,6 +56,1175 @@ std::unique_ptr<T> as(std::unique_ptr<U> ptr) {
     auto result = std::unique_ptr<T>(ptr.release()->template as<T>());
     assert(result);
     return result;
+}
+
+struct SwitchCase {
+    If *conditional;
+    bool variableIsLeftOperand;
+    std::unique_ptr<Statement> *statement;
+    SizedValue value;
+};
+
+struct SwitchComparison {
+    const VariableDeclaration *variable;
+    bool isEquality;
+    bool variableIsLeftOperand;
+    IntegerConstant *constant;
+};
+
+VariableIdentifier *getSwitchVariable(Expression *expression) {
+    const Type *castType = nullptr;
+    while (auto typecast = expression->as<Typecast>()) {
+        if (!typecast->type()->isInteger() ||
+            (castType && castType->size() != typecast->type()->size())) {
+            return nullptr;
+        }
+        castType = typecast->type();
+        expression = typecast->operand().get();
+    }
+
+    auto variable = expression->as<VariableIdentifier>();
+    if (!variable || !variable->declaration()->type()->isInteger() ||
+        (castType && castType->size() != variable->declaration()->type()->size())) {
+        return nullptr;
+    }
+    return variable;
+}
+
+bool getSwitchComparison(If *conditional, SwitchComparison &result) {
+    auto binary = conditional->condition()->as<BinaryOperator>();
+    if (!binary || (binary->operatorKind() != BinaryOperator::EQ &&
+                    binary->operatorKind() != BinaryOperator::NEQ)) {
+        return false;
+    }
+
+    auto leftVariable = getSwitchVariable(binary->left().get());
+    auto rightVariable = getSwitchVariable(binary->right().get());
+    auto leftConstant = binary->left()->as<IntegerConstant>();
+    auto rightConstant = binary->right()->as<IntegerConstant>();
+
+    if (leftVariable && rightConstant) {
+        result.variable = leftVariable->declaration();
+        result.variableIsLeftOperand = true;
+        result.constant = rightConstant;
+    } else if (rightVariable && leftConstant) {
+        result.variable = rightVariable->declaration();
+        result.variableIsLeftOperand = false;
+        result.constant = leftConstant;
+    } else {
+        return false;
+    }
+
+    result.isEquality = binary->operatorKind() == BinaryOperator::EQ;
+    return true;
+}
+
+If *getNestedIf(Statement *statement, bool &invalidWrapper) {
+    invalidWrapper = false;
+
+    if (!statement) {
+        return nullptr;
+    }
+    if (auto conditional = statement->as<If>()) {
+        return conditional;
+    }
+    if (auto block = statement->as<Block>()) {
+        if (block->statements().size() == 1 && block->statements().front()->is<If>()) {
+            if (!block->declarations().empty()) {
+                invalidWrapper = true;
+                return nullptr;
+            }
+            return block->statements().front()->as<If>();
+        }
+    }
+    return nullptr;
+}
+
+bool hasSwitchControlStatement(const TreeNode *node) {
+    if (!node) {
+        return false;
+    }
+    if (auto statement = node->as<Statement>()) {
+        if (statement->statementKind() == Statement::BREAK ||
+            statement->statementKind() == Statement::CONTINUE ||
+            statement->statementKind() == Statement::CASE_LABEL ||
+            statement->statementKind() == Statement::DEFAULT_LABEL) {
+            return true;
+        }
+    }
+
+    bool result = false;
+    node->callOnChildren([&result](const TreeNode *child) {
+        if (!result && hasSwitchControlStatement(child)) {
+            result = true;
+        }
+    });
+    return result;
+}
+
+void appendSwitchStatement(Block *body, std::unique_ptr<Statement> statement) {
+    if (!statement) {
+        return;
+    }
+
+    if (auto block = statement->as<Block>()) {
+        if (block->declarations().empty()) {
+            foreach (auto &nestedStatement, block->statements()) {
+                body->addStatement(std::move(nestedStatement));
+            }
+            return;
+        }
+    }
+    body->addStatement(std::move(statement));
+}
+
+std::unique_ptr<Expression> takeComparisonOperand(If *conditional, bool takeVariable,
+                                                   bool variableIsLeftOperand) {
+    auto binary = conditional->condition()->as<BinaryOperator>();
+    assert(binary);
+
+    if (takeVariable == variableIsLeftOperand) {
+        return std::move(binary->left());
+    }
+    return std::move(binary->right());
+}
+
+std::unique_ptr<Switch> makeSwitchFromIfLadder(std::unique_ptr<If> &root) {
+    std::vector<SwitchCase> cases;
+    std::unique_ptr<Statement> *defaultStatement = nullptr;
+    const VariableDeclaration *switchVariable = nullptr;
+    If *conditional = root.get();
+
+    while (conditional) {
+        SwitchComparison comparison;
+        if (!getSwitchComparison(conditional, comparison)) {
+            break;
+        }
+        if (!switchVariable) {
+            switchVariable = comparison.variable;
+            /* C and C++ require an integral (or enum) switch expression. */
+            if (!switchVariable->type()->isInteger()) {
+                return nullptr;
+            }
+        } else if (switchVariable != comparison.variable) {
+            break;
+        }
+
+        /*
+         * A comparison against a differently sized integer can apply usual
+         * arithmetic conversions that are not equivalent to converting the
+         * case label to the switch expression's promoted type.
+         */
+        if (comparison.constant->value().size() != switchVariable->type()->size()) {
+            break;
+        }
+
+        foreach (const SwitchCase &existing, cases) {
+            if (existing.value.value() == comparison.constant->value().value() ||
+                existing.value.signedValue() == comparison.constant->value().signedValue()) {
+                return nullptr;
+            }
+        }
+
+        std::unique_ptr<Statement> *matchingStatement = comparison.isEquality
+            ? &conditional->thenStatement()
+            : &conditional->elseStatement();
+        std::unique_ptr<Statement> *nonmatchingStatement = comparison.isEquality
+            ? &conditional->elseStatement()
+            : &conditional->thenStatement();
+
+        cases.push_back({conditional, comparison.variableIsLeftOperand,
+                         matchingStatement, comparison.constant->value()});
+        defaultStatement = nonmatchingStatement;
+
+        bool invalidWrapper = false;
+        If *next = getNestedIf(nonmatchingStatement->get(), invalidWrapper);
+        if (invalidWrapper) {
+            return nullptr;
+        }
+        conditional = next;
+    }
+
+    if (cases.size() < 3 || hasSwitchControlStatement(root.get())) {
+        return nullptr;
+    }
+
+    auto expression = takeComparisonOperand(cases.front().conditional, true,
+                                             cases.front().variableIsLeftOperand);
+    auto body = std::make_unique<Block>();
+
+    foreach (SwitchCase &item, cases) {
+        body->addStatement(std::make_unique<CaseLabel>(
+            takeComparisonOperand(item.conditional, false, item.variableIsLeftOperand)));
+        appendSwitchStatement(body.get(), std::move(*item.statement));
+        body->addStatement(std::make_unique<Break>());
+    }
+
+    if (defaultStatement && *defaultStatement) {
+        body->addStatement(std::make_unique<DefaultLabel>());
+        appendSwitchStatement(body.get(), std::move(*defaultStatement));
+    }
+
+    auto result = std::make_unique<Switch>(std::move(expression), std::move(body));
+    if (root->statement()) {
+        result->setStatement(root->statement());
+    }
+    return result;
+}
+
+std::size_t countVariableReferences(const TreeNode *node,
+                                    const VariableDeclaration *declaration) {
+    if (!node) {
+        return 0;
+    }
+
+    if (auto expression = node->as<Expression>()) {
+        if (auto identifier = expression->as<VariableIdentifier>()) {
+            return identifier->declaration() == declaration ? 1 : 0;
+        }
+    }
+
+    std::size_t result = 0;
+    node->callOnChildren([&](const TreeNode *child) {
+        result += countVariableReferences(child, declaration);
+    });
+    return result;
+}
+
+bool ownsDeclaration(const Block *block, const VariableDeclaration *declaration) {
+    foreach (const Declaration *item, block->declarations()) {
+        if (item == declaration) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::size_t countBlockVariableReferences(const Block *block,
+                                         const VariableDeclaration *declaration) {
+    std::size_t result = 0;
+    foreach (const Statement *statement, block->statements()) {
+        result += countVariableReferences(statement, declaration);
+    }
+    foreach (const Declaration *item, block->declarations()) {
+        if (auto variable = item->as<VariableDeclaration>()) {
+            result += countVariableReferences(variable->initialValue(), declaration);
+        }
+    }
+    return result;
+}
+
+/* Treat potentially volatile or faulting memory reads as observable too. */
+bool hasSideEffects(const Expression *expression) {
+    if (!expression) {
+        return false;
+    }
+
+    if (expression->is<CallOperator>()) {
+        return true;
+    }
+    if (expression->is<MemberAccessOperator>()) {
+        return true;
+    }
+    if (auto binary = expression->as<BinaryOperator>()) {
+        if (binary->operatorKind() == BinaryOperator::ASSIGN ||
+            binary->operatorKind() == BinaryOperator::DIV ||
+            binary->operatorKind() == BinaryOperator::REM ||
+            binary->operatorKind() == BinaryOperator::ARRAY_SUBSCRIPT) {
+            return true;
+        }
+    }
+    if (auto unary = expression->as<UnaryOperator>()) {
+        if (unary->operatorKind() == UnaryOperator::DEREFERENCE ||
+            unary->operatorKind() == UnaryOperator::PREFIX_INCREMENT ||
+            unary->operatorKind() == UnaryOperator::PREFIX_DECREMENT) {
+            return true;
+        }
+    }
+
+    bool result = false;
+    expression->callOnChildren([&](const TreeNode *child) {
+        if (!result) {
+            if (auto childExpression = child->as<Expression>()) {
+                result = hasSideEffects(childExpression);
+            }
+        }
+    });
+    return result;
+}
+
+/*
+ * Returns whether an expression can be evaluated on either side of a moved
+ * call without changing observable state.  Reads of unrelated variables are
+ * intentionally rejected: the moved call could modify the storage they read.
+ */
+bool isStableAroundVariable(const Expression *expression,
+                            const VariableDeclaration *declaration) {
+    switch (expression->expressionKind()) {
+        case Expression::VARIABLE_IDENTIFIER:
+            return expression->as<VariableIdentifier>()->declaration() == declaration;
+        case Expression::FUNCTION_IDENTIFIER:
+        case Expression::INTEGER_CONSTANT:
+        case Expression::LABEL_IDENTIFIER:
+        case Expression::STRING:
+            return true;
+        case Expression::BINARY_OPERATOR: {
+            auto binary = expression->as<BinaryOperator>();
+            return binary->operatorKind() != BinaryOperator::ASSIGN &&
+                   isStableAroundVariable(binary->left(), declaration) &&
+                   isStableAroundVariable(binary->right(), declaration);
+        }
+        case Expression::TYPECAST:
+            return isStableAroundVariable(expression->as<Typecast>()->operand(), declaration);
+        case Expression::UNARY_OPERATOR: {
+            auto unary = expression->as<UnaryOperator>();
+            switch (unary->operatorKind()) {
+                case UnaryOperator::BITWISE_NOT:
+                case UnaryOperator::LOGICAL_NOT:
+                case UnaryOperator::NEGATION:
+                    return isStableAroundVariable(unary->operand(), declaration);
+                default:
+                    return false;
+            }
+        }
+        case Expression::CALL_OPERATOR:
+        case Expression::MEMBER_ACCESS_OPERATOR:
+        case Expression::UNDECLARED_IDENTIFIER:
+            return false;
+    }
+    unreachable();
+}
+
+std::unique_ptr<Expression> *statementExpression(Statement *statement) {
+    if (auto expressionStatement = statement->as<ExpressionStatement>()) {
+        return &expressionStatement->expression();
+    }
+    if (auto returnStatement = statement->as<Return>()) {
+        if (returnStatement->returnValue()) {
+            return &returnStatement->returnValue();
+        }
+    }
+    return nullptr;
+}
+
+bool isSafeInliningDestination(const Expression *expression,
+                               const VariableDeclaration *declaration,
+                               bool sourceHasSideEffects) {
+    const Expression *payload = expression;
+
+    if (auto assignment = payload->as<BinaryOperator>()) {
+        if (assignment->operatorKind() == BinaryOperator::ASSIGN) {
+            if (countVariableReferences(assignment->left(), declaration) != 0 ||
+                hasSideEffects(assignment->left()) ||
+                (sourceHasSideEffects &&
+                 !assignment->left()->is<VariableIdentifier>() &&
+                 !assignment->left()->is<UndeclaredIdentifier>())) {
+                return false;
+            }
+            payload = assignment->right();
+        }
+    }
+
+    if (auto call = payload->as<CallOperator>()) {
+        if (countVariableReferences(call->callee(), declaration) != 0 ||
+            hasSideEffects(call->callee()) ||
+            (sourceHasSideEffects &&
+             !isStableAroundVariable(call->callee(), declaration))) {
+            return false;
+        }
+        foreach (const Expression *argument, call->arguments()) {
+            if (hasSideEffects(argument)) {
+                return false;
+            }
+            if (sourceHasSideEffects &&
+                !isStableAroundVariable(argument, declaration)) {
+                return false;
+            }
+        }
+    } else {
+        if (hasSideEffects(payload)) {
+            return false;
+        }
+        if (sourceHasSideEffects &&
+            !isStableAroundVariable(payload, declaration)) {
+            return false;
+        }
+    }
+
+    return countVariableReferences(payload, declaration) == 1;
+}
+
+enum VariableUseContext {
+    READ_VARIABLE,
+    FORBID_VARIABLE
+};
+
+struct ReplacementSite {
+    std::unique_ptr<Expression> *expression = nullptr;
+    std::size_t uses = 0;
+    bool invalid = false;
+};
+
+void findReplacementSite(std::unique_ptr<Expression> &expression,
+                         const VariableDeclaration *declaration,
+                         VariableUseContext context,
+                         ReplacementSite &result) {
+    if (auto identifier = expression->as<VariableIdentifier>()) {
+        if (identifier->declaration() == declaration) {
+            ++result.uses;
+            if (context == FORBID_VARIABLE || result.expression) {
+                result.invalid = true;
+            } else {
+                result.expression = &expression;
+            }
+        }
+        return;
+    }
+
+    switch (expression->expressionKind()) {
+        case Expression::BINARY_OPERATOR: {
+            auto binary = expression->as<BinaryOperator>();
+            if (binary->operatorKind() == BinaryOperator::ASSIGN) {
+                findReplacementSite(binary->left(), declaration, FORBID_VARIABLE, result);
+                findReplacementSite(binary->right(), declaration, context, result);
+            } else {
+                findReplacementSite(binary->left(), declaration, context, result);
+                findReplacementSite(binary->right(), declaration, context, result);
+            }
+            break;
+        }
+        case Expression::CALL_OPERATOR: {
+            auto call = expression->as<CallOperator>();
+            findReplacementSite(call->callee(), declaration, FORBID_VARIABLE, result);
+            foreach (auto &argument, call->arguments()) {
+                findReplacementSite(argument, declaration, context, result);
+            }
+            break;
+        }
+        case Expression::MEMBER_ACCESS_OPERATOR:
+            findReplacementSite(expression->as<MemberAccessOperator>()->compound(),
+                                declaration, context, result);
+            break;
+        case Expression::TYPECAST:
+            findReplacementSite(expression->as<Typecast>()->operand(),
+                                declaration, context, result);
+            break;
+        case Expression::UNARY_OPERATOR: {
+            auto unary = expression->as<UnaryOperator>();
+            VariableUseContext operandContext = context;
+            if (unary->operatorKind() == UnaryOperator::REFERENCE ||
+                unary->operatorKind() == UnaryOperator::PREFIX_INCREMENT ||
+                unary->operatorKind() == UnaryOperator::PREFIX_DECREMENT) {
+                operandContext = FORBID_VARIABLE;
+            }
+            findReplacementSite(unary->operand(), declaration, operandContext, result);
+            break;
+        }
+        case Expression::FUNCTION_IDENTIFIER:
+        case Expression::INTEGER_CONSTANT:
+        case Expression::LABEL_IDENTIFIER:
+        case Expression::STRING:
+        case Expression::VARIABLE_IDENTIFIER:
+        case Expression::UNDECLARED_IDENTIFIER:
+            break;
+    }
+}
+
+bool inlineSingleUseTemporary(Block *block, TypeCalculator &typeCalculator) {
+    auto &statements = block->statements();
+
+    for (std::size_t i = 0; i + 1 < statements.size(); ++i) {
+        auto expressionStatement = statements[i]->as<ExpressionStatement>();
+        if (!expressionStatement) {
+            continue;
+        }
+        auto assignment = expressionStatement->expression()->as<BinaryOperator>();
+        if (!assignment || assignment->operatorKind() != BinaryOperator::ASSIGN) {
+            continue;
+        }
+        auto identifier = assignment->left()->as<VariableIdentifier>();
+        if (!identifier) {
+            continue;
+        }
+
+        VariableDeclaration *declaration = identifier->declaration();
+        if (!ownsDeclaration(block, declaration) || declaration->initialValue()) {
+            continue;
+        }
+
+        /*
+         * The assignment may narrow or otherwise convert its right operand.
+         * Dropping that conversion while substituting the operand changes the
+         * value observed at the use site.  Keep floating-point stores too,
+         * since they can round excess precision before the later load.
+         */
+        const Type *temporaryType = declaration->type();
+        if (!temporaryType->isScalar() || temporaryType->isFloat() ||
+            typeCalculator.getType(assignment->right().get()) != temporaryType) {
+            continue;
+        }
+
+        if (countBlockVariableReferences(block, declaration) != 2 ||
+            countVariableReferences(assignment->right().get(), declaration) != 0 ||
+            countVariableReferences(statements[i + 1].get(), declaration) != 1) {
+            continue;
+        }
+
+        auto destination = statementExpression(statements[i + 1].get());
+        if (!destination ||
+            !isSafeInliningDestination(destination->get(), declaration,
+                                       hasSideEffects(assignment->right().get()))) {
+            continue;
+        }
+
+        ReplacementSite replacementSite;
+        findReplacementSite(*destination, declaration, READ_VARIABLE, replacementSite);
+        if (replacementSite.invalid || replacementSite.uses != 1 ||
+            !replacementSite.expression) {
+            continue;
+        }
+
+        *replacementSite.expression = std::move(assignment->right());
+        statements.erase(statements.begin() + i);
+        return true;
+    }
+
+    return false;
+}
+
+bool removeDeadLocalAssignment(Block *block) {
+    auto &statements = block->statements();
+
+    for (auto i = statements.begin(); i != statements.end(); ++i) {
+        auto expressionStatement = (*i)->as<ExpressionStatement>();
+        if (!expressionStatement) {
+            continue;
+        }
+        auto assignment = expressionStatement->expression()->as<BinaryOperator>();
+        if (!assignment || assignment->operatorKind() != BinaryOperator::ASSIGN) {
+            continue;
+        }
+        auto identifier = assignment->left()->as<VariableIdentifier>();
+        if (!identifier) {
+            continue;
+        }
+
+        VariableDeclaration *declaration = identifier->declaration();
+        if (!ownsDeclaration(block, declaration) || declaration->initialValue() ||
+            hasSideEffects(assignment->right().get()) ||
+            countVariableReferences(assignment->right().get(), declaration) != 0 ||
+            countBlockVariableReferences(block, declaration) != 1) {
+            continue;
+        }
+
+        statements.erase(i);
+        return true;
+    }
+
+    return false;
+}
+
+bool hasLoopTransfer(const TreeNode *node) {
+    if (!node) {
+        return false;
+    }
+    if (auto statement = node->as<Statement>()) {
+        if (statement->statementKind() == Statement::CONTINUE ||
+            statement->statementKind() == Statement::GOTO ||
+            statement->statementKind() == Statement::LABEL_STATEMENT) {
+            return true;
+        }
+    }
+
+    bool result = false;
+    node->callOnChildren([&](const TreeNode *child) {
+        if (!result) {
+            result = hasLoopTransfer(child);
+        }
+    });
+    return result;
+}
+
+bool hasUnsafeInductionAccess(const TreeNode *node,
+                              const VariableDeclaration *declaration) {
+    if (!node) {
+        return false;
+    }
+
+    if (auto expression = node->as<Expression>()) {
+        if (auto binary = expression->as<BinaryOperator>()) {
+            if (binary->operatorKind() == BinaryOperator::ASSIGN) {
+                if (auto identifier = binary->left()->as<VariableIdentifier>()) {
+                    if (identifier->declaration() == declaration) {
+                        return true;
+                    }
+                }
+            }
+        }
+        if (auto unary = expression->as<UnaryOperator>()) {
+            if ((unary->operatorKind() == UnaryOperator::REFERENCE ||
+                 unary->operatorKind() == UnaryOperator::PREFIX_INCREMENT ||
+                 unary->operatorKind() == UnaryOperator::PREFIX_DECREMENT) &&
+                countVariableReferences(unary->operand(), declaration) != 0) {
+                return true;
+            }
+        }
+    }
+
+    bool result = false;
+    node->callOnChildren([&](const TreeNode *child) {
+        if (!result) {
+            result = hasUnsafeInductionAccess(child, declaration);
+        }
+    });
+    return result;
+}
+
+VariableDeclaration *assignedVariable(ExpressionStatement *statement) {
+    auto assignment = statement->expression()->as<BinaryOperator>();
+    if (!assignment || assignment->operatorKind() != BinaryOperator::ASSIGN) {
+        return nullptr;
+    }
+    auto identifier = assignment->left()->as<VariableIdentifier>();
+    return identifier ? identifier->declaration() : nullptr;
+}
+
+bool isIncrementOf(const Expression *expression,
+                   const VariableDeclaration *declaration) {
+    auto unary = expression->as<UnaryOperator>();
+    if (!unary ||
+        (unary->operatorKind() != UnaryOperator::PREFIX_INCREMENT &&
+         unary->operatorKind() != UnaryOperator::PREFIX_DECREMENT)) {
+        return false;
+    }
+    auto identifier = unary->operand()->as<VariableIdentifier>();
+    return identifier && identifier->declaration() == declaration;
+}
+
+bool isPositiveIncrementOf(const Expression *expression,
+                           const VariableDeclaration *declaration) {
+    auto unary = expression->as<UnaryOperator>();
+    if (!unary || unary->operatorKind() != UnaryOperator::PREFIX_INCREMENT) {
+        return false;
+    }
+    auto identifier = unary->operand()->as<VariableIdentifier>();
+    return identifier && identifier->declaration() == declaration;
+}
+
+const VariableIdentifier *variableIdentifierThroughCasts(const Expression *expression) {
+    while (auto typecast = expression->as<Typecast>()) {
+        expression = typecast->operand();
+    }
+    return expression->as<VariableIdentifier>();
+}
+
+bool isZeroAssignment(ExpressionStatement *statement,
+                      VariableDeclaration *&declaration) {
+    auto assignment = statement->expression()->as<BinaryOperator>();
+    if (!assignment || assignment->operatorKind() != BinaryOperator::ASSIGN ||
+        !isZero(assignment->right().get())) {
+        return false;
+    }
+
+    auto identifier = assignment->left()->as<VariableIdentifier>();
+    if (!identifier) {
+        return false;
+    }
+    declaration = identifier->declaration();
+    return true;
+}
+
+bool sameStableExpression(const Expression *left, const Expression *right) {
+    if (left->expressionKind() != right->expressionKind()) {
+        return false;
+    }
+
+    switch (left->expressionKind()) {
+        case Expression::VARIABLE_IDENTIFIER:
+            return left->as<VariableIdentifier>()->declaration() ==
+                   right->as<VariableIdentifier>()->declaration();
+        case Expression::INTEGER_CONSTANT: {
+            auto leftConstant = left->as<IntegerConstant>();
+            auto rightConstant = right->as<IntegerConstant>();
+            return leftConstant->type() == rightConstant->type() &&
+                   leftConstant->value().value() == rightConstant->value().value();
+        }
+        case Expression::TYPECAST: {
+            auto leftCast = left->as<Typecast>();
+            auto rightCast = right->as<Typecast>();
+            return leftCast->castKind() == rightCast->castKind() &&
+                   leftCast->type() == rightCast->type() &&
+                   sameStableExpression(leftCast->operand(), rightCast->operand());
+        }
+        case Expression::UNARY_OPERATOR: {
+            auto leftUnary = left->as<UnaryOperator>();
+            auto rightUnary = right->as<UnaryOperator>();
+            return leftUnary->operatorKind() == UnaryOperator::REFERENCE &&
+                   rightUnary->operatorKind() == UnaryOperator::REFERENCE &&
+                   sameStableExpression(leftUnary->operand(), rightUnary->operand());
+        }
+        case Expression::BINARY_OPERATOR: {
+            auto leftBinary = left->as<BinaryOperator>();
+            auto rightBinary = right->as<BinaryOperator>();
+            const int operatorKind = leftBinary->operatorKind();
+            if (operatorKind != rightBinary->operatorKind() ||
+                (operatorKind != BinaryOperator::ADD &&
+                 operatorKind != BinaryOperator::SUB &&
+                 operatorKind != BinaryOperator::ARRAY_SUBSCRIPT)) {
+                return false;
+            }
+            return sameStableExpression(leftBinary->left(), rightBinary->left()) &&
+                   sameStableExpression(leftBinary->right(), rightBinary->right());
+        }
+        case Expression::CALL_OPERATOR:
+        case Expression::FUNCTION_IDENTIFIER:
+        case Expression::LABEL_IDENTIFIER:
+        case Expression::MEMBER_ACCESS_OPERATOR:
+        case Expression::STRING:
+        case Expression::UNDECLARED_IDENTIFIER:
+            return false;
+    }
+    unreachable();
+}
+
+bool sameStrlenCall(const Expression *left, const Expression *right) {
+    while (auto leftCast = left->as<Typecast>()) {
+        auto rightCast = right->as<Typecast>();
+        if (!rightCast || leftCast->castKind() != rightCast->castKind() ||
+            leftCast->type() != rightCast->type()) {
+            return false;
+        }
+        left = leftCast->operand();
+        right = rightCast->operand();
+    }
+    if (right->is<Typecast>()) {
+        return false;
+    }
+
+    auto leftCall = left->as<CallOperator>();
+    auto rightCall = right->as<CallOperator>();
+    if (!leftCall || !rightCall || leftCall->arguments().size() != 1 ||
+        rightCall->arguments().size() != 1) {
+        return false;
+    }
+
+    auto leftCallee = leftCall->callee()->as<UndeclaredIdentifier>();
+    auto rightCallee = rightCall->callee()->as<UndeclaredIdentifier>();
+    return leftCallee && rightCallee &&
+           leftCallee->name() == QLatin1String("strlen") &&
+           rightCallee->name() == QLatin1String("strlen") &&
+           sameStableExpression(leftCall->arguments().front(),
+                                rightCall->arguments().front());
+}
+
+const Expression *expressionThroughCasts(const Expression *expression) {
+    while (auto typecast = expression->as<Typecast>()) {
+        expression = typecast->operand();
+    }
+    return expression;
+}
+
+const VariableDeclaration *variableAtDeclaredType(const Expression *expression) {
+    const Type *castType = nullptr;
+    while (auto typecast = expression->as<Typecast>()) {
+        if (castType && castType != typecast->type()) {
+            return nullptr;
+        }
+        castType = typecast->type();
+        expression = typecast->operand();
+    }
+    auto identifier = expression->as<VariableIdentifier>();
+    if (!identifier) {
+        return nullptr;
+    }
+    const VariableDeclaration *declaration = identifier->declaration();
+    return !castType || castType == declaration->type() ? declaration : nullptr;
+}
+
+const VariableDeclaration *zeroEqualityVariable(const Expression *expression) {
+    expression = expressionThroughCasts(expression);
+    if (auto logicalNot = expression->as<UnaryOperator>()) {
+        if (logicalNot->operatorKind() == UnaryOperator::LOGICAL_NOT) {
+            return variableAtDeclaredType(logicalNot->operand());
+        }
+    }
+
+    auto comparison = expression->as<BinaryOperator>();
+    if (!comparison || comparison->operatorKind() != BinaryOperator::EQ) {
+        return nullptr;
+    }
+    const Expression *variable = nullptr;
+    if (isZero(comparison->right())) {
+        variable = comparison->left();
+    } else if (isZero(comparison->left())) {
+        variable = comparison->right();
+    }
+    return variable ? variableAtDeclaredType(variable) : nullptr;
+}
+
+const VariableDeclaration *negativeComparisonVariable(const Expression *expression) {
+    expression = expressionThroughCasts(expression);
+    auto comparison = expression->as<BinaryOperator>();
+    if (!comparison) {
+        return nullptr;
+    }
+
+    const Expression *variable = nullptr;
+    if (comparison->operatorKind() == BinaryOperator::LT &&
+        isZero(comparison->right())) {
+        variable = comparison->left();
+    } else if (comparison->operatorKind() == BinaryOperator::GT &&
+               isZero(comparison->left())) {
+        variable = comparison->right();
+    } else {
+        return nullptr;
+    }
+
+    const VariableDeclaration *declaration = variableAtDeclaredType(variable);
+    if (!declaration) {
+        return nullptr;
+    }
+    auto integerType = declaration->type()->as<IntegerType>();
+    return integerType && integerType->isSigned() ? declaration : nullptr;
+}
+
+const VariableDeclaration *positiveComparisonVariable(const Expression *expression) {
+    expression = expressionThroughCasts(expression);
+    if (auto comparison = expression->as<BinaryOperator>()) {
+        const Expression *variable = nullptr;
+        const Expression *zero = nullptr;
+        if (comparison->operatorKind() == BinaryOperator::GT) {
+            variable = comparison->left();
+            zero = comparison->right();
+        } else if (comparison->operatorKind() == BinaryOperator::LT) {
+            zero = comparison->left();
+            variable = comparison->right();
+        }
+        return variable && isZero(zero) ? variableAtDeclaredType(variable) : nullptr;
+    }
+
+    auto logicalNot = expression->as<UnaryOperator>();
+    if (!logicalNot || logicalNot->operatorKind() != UnaryOperator::LOGICAL_NOT) {
+        return nullptr;
+    }
+    auto disjunction = expressionThroughCasts(logicalNot->operand())
+        ->as<BinaryOperator>();
+    if (!disjunction ||
+        (disjunction->operatorKind() != BinaryOperator::LOGICAL_OR &&
+         disjunction->operatorKind() != BinaryOperator::BITWISE_OR)) {
+        return nullptr;
+    }
+
+    const VariableDeclaration *negative =
+        negativeComparisonVariable(disjunction->left());
+    const VariableDeclaration *zero =
+        zeroEqualityVariable(disjunction->right());
+    if (!negative || negative != zero) {
+        negative = negativeComparisonVariable(disjunction->right());
+        zero = zeroEqualityVariable(disjunction->left());
+    }
+    return negative && negative == zero ? negative : nullptr;
+}
+
+bool isCanonicalIndexReset(const Statement *statement,
+                           const VariableDeclaration *index) {
+    auto conditional = statement->as<If>();
+    if (!conditional || conditional->elseStatement()) {
+        return false;
+    }
+
+    auto comparison = conditional->condition()->as<BinaryOperator>();
+    if (!comparison) {
+        return false;
+    }
+    const Expression *variable = nullptr;
+    const IntegerConstant *limit = nullptr;
+    if (comparison->operatorKind() == BinaryOperator::GEQ) {
+        variable = comparison->left();
+        limit = comparison->right()->as<IntegerConstant>();
+    } else if (comparison->operatorKind() == BinaryOperator::LEQ) {
+        variable = comparison->right();
+        limit = comparison->left()->as<IntegerConstant>();
+    }
+    auto identifier = variable ? variableIdentifierThroughCasts(variable) : nullptr;
+    if (!identifier || identifier->declaration() != index || !limit ||
+        limit->value().value() == 0) {
+        return false;
+    }
+
+    const Statement *resetStatement = conditional->thenStatement();
+    if (auto block = resetStatement->as<Block>()) {
+        if (!block->declarations().empty() || block->statements().size() != 1) {
+            return false;
+        }
+        resetStatement = block->statements().front();
+    }
+    auto expressionStatement = resetStatement->as<ExpressionStatement>();
+    if (!expressionStatement) {
+        return false;
+    }
+    auto assignment = expressionStatement->expression()->as<BinaryOperator>();
+    if (!assignment || assignment->operatorKind() != BinaryOperator::ASSIGN ||
+        !isZero(assignment->right())) {
+        return false;
+    }
+    auto resetIdentifier = assignment->left()->as<VariableIdentifier>();
+    return resetIdentifier && resetIdentifier->declaration() == index;
+}
+
+void recoverGuardedDoWhileForLoops(Block *block, TypeCalculator &typeCalculator) {
+    auto &statements = block->statements();
+
+    for (std::size_t i = 3; i < statements.size(); ++i) {
+        auto counterInitializer = statements[i - 3]->as<ExpressionStatement>();
+        auto indexInitializer = statements[i - 2]->as<ExpressionStatement>();
+        auto lengthInitializer = statements[i - 1]->as<ExpressionStatement>();
+        auto conditional = statements[i]->as<If>();
+        if (!counterInitializer || !indexInitializer || !lengthInitializer ||
+            !conditional || conditional->elseStatement()) {
+            continue;
+        }
+
+        VariableDeclaration *counter = nullptr;
+        VariableDeclaration *index = nullptr;
+        if (!isZeroAssignment(counterInitializer, counter) ||
+            !isZeroAssignment(indexInitializer, index) || counter == index ||
+            !ownsDeclaration(block, counter) || !ownsDeclaration(block, index) ||
+            counter->initialValue() || index->initialValue()) {
+            continue;
+        }
+
+        auto initialLengthAssignment =
+            lengthInitializer->expression()->as<BinaryOperator>();
+        VariableDeclaration *initialLength = assignedVariable(lengthInitializer);
+        if (!initialLengthAssignment || !initialLength ||
+            positiveComparisonVariable(conditional->condition().get()) != initialLength ||
+            !ownsDeclaration(block, initialLength) || initialLength->initialValue()) {
+            continue;
+        }
+
+        DoWhile *loop = conditional->thenStatement()->as<DoWhile>();
+        Block *wrapper = conditional->thenStatement()->as<Block>();
+        if (!loop && wrapper && wrapper->declarations().empty() &&
+            wrapper->statements().size() == 1) {
+            loop = wrapper->statements().front()->as<DoWhile>();
+        }
+        auto body = loop ? loop->body()->as<Block>() : nullptr;
+        if (!loop || !body || body->statements().size() < 2 ||
+            hasLoopTransfer(body)) {
+            continue;
+        }
+
+        auto incrementStatement =
+            body->statements()[body->statements().size() - 2]->as<ExpressionStatement>();
+        auto tailLengthStatement = body->statements().back()->as<ExpressionStatement>();
+        if (!incrementStatement || !tailLengthStatement ||
+            !isPositiveIncrementOf(incrementStatement->expression().get(), index)) {
+            continue;
+        }
+
+        auto tailLengthAssignment =
+            tailLengthStatement->expression()->as<BinaryOperator>();
+        VariableDeclaration *tailLength = assignedVariable(tailLengthStatement);
+        if (!tailLengthAssignment || !tailLength ||
+            !ownsDeclaration(block, tailLength) || tailLength->initialValue() ||
+            initialLength == counter || initialLength == index ||
+            tailLength == counter || tailLength == index ||
+            initialLength->type() != tailLength->type() ||
+            typeCalculator.getType(initialLengthAssignment->right().get()) !=
+                initialLength->type() ||
+            typeCalculator.getType(tailLengthAssignment->right().get()) !=
+                tailLength->type() ||
+            !sameStrlenCall(initialLengthAssignment->right().get(),
+                            tailLengthAssignment->right().get())) {
+            continue;
+        }
+
+        auto tailCondition = loop->condition()->as<BinaryOperator>();
+        if (!tailCondition || tailCondition->operatorKind() != BinaryOperator::LT) {
+            continue;
+        }
+        auto tailCounter = variableIdentifierThroughCasts(tailCondition->left().get());
+        auto tailLengthIdentifier = tailCondition->right()->as<VariableIdentifier>();
+        if (!tailCounter || tailCounter->declaration() != counter ||
+            !tailLengthIdentifier || tailLengthIdentifier->declaration() != tailLength) {
+            continue;
+        }
+
+        std::size_t expectedInitialLengthReferences = 1 +
+            countVariableReferences(conditional->condition().get(), initialLength);
+        if (initialLength == tailLength) {
+            expectedInitialLengthReferences += 2;
+        }
+        if (countBlockVariableReferences(block, initialLength) !=
+                expectedInitialLengthReferences ||
+            (initialLength != tailLength &&
+             countBlockVariableReferences(block, tailLength) != 2)) {
+            continue;
+        }
+
+        bool sawIndexReset = false;
+        bool unsafeIndexWrite = false;
+        std::size_t counterIncrements = 0;
+        bool unsafeCounterWrite = false;
+        for (std::size_t j = 0; j + 2 < body->statements().size(); ++j) {
+            Statement *statement = body->statements()[j].get();
+            if (!sawIndexReset && isCanonicalIndexReset(statement, index)) {
+                sawIndexReset = true;
+            } else if (hasUnsafeInductionAccess(statement, index)) {
+                unsafeIndexWrite = true;
+                break;
+            }
+
+            if (auto expressionStatement = statement->as<ExpressionStatement>()) {
+                if (isPositiveIncrementOf(expressionStatement->expression().get(),
+                                          counter)) {
+                    ++counterIncrements;
+                    continue;
+                }
+            }
+            if (hasUnsafeInductionAccess(statement, counter)) {
+                unsafeCounterWrite = true;
+                break;
+            }
+        }
+        if (unsafeIndexWrite || unsafeCounterWrite || counterIncrements != 1) {
+            continue;
+        }
+
+        auto initializerExpression = indexInitializer->releaseExpression();
+        auto incrementExpression = incrementStatement->releaseExpression();
+        auto conditionExpression = std::make_unique<BinaryOperator>(
+            BinaryOperator::LT, std::move(tailCondition->left()),
+            std::move(tailLengthAssignment->right()));
+        body->statements().erase(body->statements().end() - 2,
+                                 body->statements().end());
+
+        std::unique_ptr<Statement> loopStatement;
+        if (wrapper) {
+            loopStatement = std::move(wrapper->statements().front());
+        } else {
+            loopStatement = std::move(conditional->thenStatement());
+        }
+        auto doWhileNode = as<DoWhile>(std::move(loopStatement));
+        const ir::Statement *irStatement = doWhileNode->statement();
+        if (!irStatement) {
+            irStatement = conditional->statement();
+        }
+        auto forNode = std::make_unique<For>(
+            std::move(initializerExpression), std::move(conditionExpression),
+            std::move(incrementExpression), std::move(doWhileNode->body()));
+        if (irStatement) {
+            forNode->setStatement(irStatement);
+        }
+
+        statements[i] = std::move(forNode);
+        statements.erase(statements.begin() + i - 2, statements.begin() + i);
+        i -= 2;
+    }
+}
+
+void recoverForLoops(Block *block) {
+    auto &statements = block->statements();
+
+    for (std::size_t i = 1; i < statements.size(); ++i) {
+        auto initializerStatement = statements[i - 1]->as<ExpressionStatement>();
+        auto loop = statements[i]->as<While>();
+        if (!initializerStatement || !loop) {
+            continue;
+        }
+
+        VariableDeclaration *declaration = assignedVariable(initializerStatement);
+        auto initializer = initializerStatement->expression()->as<BinaryOperator>();
+        auto body = loop->body()->as<Block>();
+        if (!declaration || !initializer || !ownsDeclaration(block, declaration) ||
+            declaration->initialValue() || !body || body->statements().empty() ||
+            countVariableReferences(initializer->right().get(), declaration) != 0 ||
+            hasUnsafeInductionAccess(loop->condition().get(), declaration) ||
+            hasLoopTransfer(body)) {
+            continue;
+        }
+
+        auto incrementStatement = body->statements().back()->as<ExpressionStatement>();
+        if (!incrementStatement ||
+            !isIncrementOf(incrementStatement->expression().get(), declaration)) {
+            continue;
+        }
+
+        bool unsafeBody = false;
+        for (std::size_t j = 0; j + 1 < body->statements().size(); ++j) {
+            if (hasUnsafeInductionAccess(body->statements()[j].get(), declaration)) {
+                unsafeBody = true;
+                break;
+            }
+        }
+        if (unsafeBody) {
+            continue;
+        }
+
+        auto initializerExpression = initializerStatement->releaseExpression();
+        auto incrementExpression = incrementStatement->releaseExpression();
+        body->statements().pop_back();
+
+        auto whileNode = as<While>(std::move(statements[i]));
+        const ir::Statement *irStatement = whileNode->statement();
+        auto forNode = std::make_unique<For>(
+            std::move(initializerExpression), std::move(whileNode->condition()),
+            std::move(incrementExpression), std::move(whileNode->body()));
+        if (irStatement) {
+            forNode->setStatement(irStatement);
+        }
+        statements[i] = std::move(forNode);
+        statements.erase(statements.begin() + i - 1);
+
+        if (i > 1) {
+            --i;
+        }
+    }
+}
+
+void pruneUnusedDeclarations(Block *block) {
+    auto &declarations = block->declarations();
+    std::vector<const Declaration *> unused;
+    const Block *constBlock = block;
+
+    foreach (const Declaration *item, constBlock->declarations()) {
+        auto variable = item->as<VariableDeclaration>();
+        if (!variable || variable->initialValue()) {
+            continue;
+        }
+
+        bool referenced = false;
+        foreach (const Statement *statement, constBlock->statements()) {
+            if (countVariableReferences(statement, variable) != 0) {
+                referenced = true;
+                break;
+            }
+        }
+        if (referenced) {
+            continue;
+        }
+
+        foreach (const Declaration *other, constBlock->declarations()) {
+            if (other == variable) {
+                continue;
+            }
+            if (auto otherVariable = other->as<VariableDeclaration>()) {
+                if (countVariableReferences(otherVariable->initialValue(), variable) != 0) {
+                    referenced = true;
+                    break;
+                }
+            }
+        }
+        if (!referenced) {
+            unused.push_back(item);
+        }
+    }
+
+    declarations.erase(std::remove_if(declarations.begin(), declarations.end(),
+        [&](const std::unique_ptr<Declaration> &item) {
+            return std::find(unused.begin(), unused.end(), item.get()) != unused.end();
+        }), declarations.end());
 }
 
 } // anonymous namespace
@@ -549,7 +1727,8 @@ std::unique_ptr<Expression> Simplifier::simplify(std::unique_ptr<UnaryOperator> 
     return std::move(node);
 }
 
-std::unique_ptr<Expression> Simplifier::simplifyBooleanExpression(std::unique_ptr<Expression> node) {
+std::unique_ptr<Expression> Simplifier::simplifyBooleanExpression(
+        std::unique_ptr<Expression> node, bool preserveEqualityComparison) {
     while (auto typecast = node->as<Typecast>()) {
         auto operandType = typeCalculator_.getType(typecast->operand().get());
         if (typecast->type()->isScalar() && operandType->isScalar() &&
@@ -564,11 +1743,17 @@ std::unique_ptr<Expression> Simplifier::simplifyBooleanExpression(std::unique_pt
         if (unary1->operatorKind() == UnaryOperator::LOGICAL_NOT) {
             if (auto unary2 = unary1->operand()->as<UnaryOperator>()) {
                 if (unary2->operatorKind() == UnaryOperator::LOGICAL_NOT) {
-                    return simplifyBooleanExpression(std::move(unary2->operand()));
+                    return simplifyBooleanExpression(
+                        std::move(unary2->operand()), preserveEqualityComparison);
                 }
             }
         }
     } else if (auto binary = node->as<BinaryOperator>()) {
+        if (preserveEqualityComparison &&
+            (binary->operatorKind() == BinaryOperator::EQ ||
+             binary->operatorKind() == BinaryOperator::NEQ)) {
+            return node;
+        }
         if (binary->operatorKind() == BinaryOperator::NEQ) {
             if (isZero(binary->right().get())) {
                 return simplifyBooleanExpression(std::move(binary->left()));
@@ -600,6 +1785,8 @@ std::unique_ptr<Statement> Simplifier::simplify(std::unique_ptr<Statement> node)
             return node;
         case Statement::DO_WHILE:
             return simplify(as<DoWhile>(std::move(node)));
+        case Statement::FOR:
+            return simplify(as<For>(std::move(node)));
         case Statement::EXPRESSION_STATEMENT:
             return simplify(as<ExpressionStatement>(std::move(node)));
         case Statement::GOTO:
@@ -627,6 +1814,21 @@ std::unique_ptr<Statement> Simplifier::simplify(std::unique_ptr<Statement> node)
 std::unique_ptr<Block> Simplifier::simplify(std::unique_ptr<Block> node) {
     node->declarations() = simplify(std::move(node->declarations()));
     node->statements() = simplify(std::move(node->statements()));
+
+    bool changed;
+    do {
+        changed = false;
+        while (inlineSingleUseTemporary(node.get(), typeCalculator_)) {
+            changed = true;
+        }
+        while (removeDeadLocalAssignment(node.get())) {
+            changed = true;
+        }
+    } while (changed);
+
+    recoverGuardedDoWhileForLoops(node.get(), typeCalculator_);
+    recoverForLoops(node.get());
+    pruneUnusedDeclarations(node.get());
     return node;
 }
 
@@ -641,12 +1843,52 @@ std::unique_ptr<ExpressionStatement> Simplifier::simplify(std::unique_ptr<Expres
     return node;
 }
 
+std::unique_ptr<For> Simplifier::simplify(std::unique_ptr<For> node) {
+    node->initializer() = simplify(std::move(node->initializer()));
+    node->condition() = simplifyBooleanExpression(simplify(std::move(node->condition())));
+    node->increment() = simplify(std::move(node->increment()));
+    node->body() = simplify(std::move(node->body()));
+    return node;
+}
+
 std::unique_ptr<Goto> Simplifier::simplify(std::unique_ptr<Goto> node) {
     node->destination() = simplify(std::move(node->destination()));
     return node;
 }
 
-std::unique_ptr<If> Simplifier::simplify(std::unique_ptr<If> node) {
+std::unique_ptr<Statement> Simplifier::simplify(std::unique_ptr<If> node) {
+    /*
+     * Recover switches compiled as a chain of equality/inequality tests.  Do
+     * this before simplifying child statements so the longest outer chain is
+     * considered before any of its suffixes.  Normalize only the conditions
+     * first: otherwise harmless casts can hide the comparisons from the
+     * matcher.  Keep comparisons against zero intact during this pass so they
+     * can still become case 0.
+     */
+    If *conditional = node.get();
+    while (conditional) {
+        conditional->condition() = simplifyBooleanExpression(
+            simplify(std::move(conditional->condition())), true);
+
+        SwitchComparison comparison;
+        if (!getSwitchComparison(conditional, comparison)) {
+            break;
+        }
+
+        std::unique_ptr<Statement> *nonmatchingStatement = comparison.isEquality
+            ? &conditional->elseStatement()
+            : &conditional->thenStatement();
+        bool invalidWrapper = false;
+        conditional = getNestedIf(nonmatchingStatement->get(), invalidWrapper);
+        if (invalidWrapper) {
+            break;
+        }
+    }
+
+    if (auto switchStatement = makeSwitchFromIfLadder(node)) {
+        return simplify(std::move(switchStatement));
+    }
+
     node->thenStatement() = simplify(std::move(node->thenStatement()));
 
     if (node->elseStatement()) {

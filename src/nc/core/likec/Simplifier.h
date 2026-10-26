@@ -22,6 +22,7 @@ class Declaration;
 class DoWhile;
 class Expression;
 class ExpressionStatement;
+class For;
 class FunctionDefinition;
 class Goto;
 class If;
@@ -74,13 +75,15 @@ private:
     std::unique_ptr<Block> simplify(std::unique_ptr<Block> node);
     std::unique_ptr<DoWhile> simplify(std::unique_ptr<DoWhile> node);
     std::unique_ptr<ExpressionStatement> simplify(std::unique_ptr<ExpressionStatement> node);
+    std::unique_ptr<For> simplify(std::unique_ptr<For> node);
     std::unique_ptr<Goto> simplify(std::unique_ptr<Goto> node);
-    std::unique_ptr<If> simplify(std::unique_ptr<If> node);
+    std::unique_ptr<Statement> simplify(std::unique_ptr<If> node);
     std::unique_ptr<LabelStatement> simplify(std::unique_ptr<LabelStatement> node);
     std::unique_ptr<Return> simplify(std::unique_ptr<Return> node);
     std::unique_ptr<While> simplify(std::unique_ptr<While> node);
     std::unique_ptr<Switch> simplify(std::unique_ptr<Switch> node);
-    std::unique_ptr<Expression> simplifyBooleanExpression(std::unique_ptr<Expression> node);
+    std::unique_ptr<Expression> simplifyBooleanExpression(
+        std::unique_ptr<Expression> node, bool preserveEqualityComparison = false);
 
     /**
      * Simplifies all the nodes in the given range.

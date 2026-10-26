@@ -26,6 +26,7 @@ class DefaultLabel;
 class DoWhile;
 class Expression;
 class ExpressionStatement;
+class For;
 class FunctionDeclaration;
 class FunctionDefinition;
 class FunctionIdentifier;
@@ -105,6 +106,7 @@ private:
     void doPrint(const Continue *node);
     void doPrint(const DoWhile *node);
     void doPrint(const ExpressionStatement *node);
+    void doPrint(const For *node);
     void doPrint(const Goto *node);
     void doPrint(const If *node);
     void doPrint(const LabelStatement *node);

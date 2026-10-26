@@ -53,6 +53,7 @@ public:
     class Chunk {
         MemoryLocation location_; ///< Memory location.
         std::vector<const Term *> definitions_; ///< Terms defining this memory location.
+        bool hasUnknownDefinition_; ///< Whether an unmodelled write may define this location.
 
         public:
 
@@ -62,8 +63,10 @@ public:
          * \param location      Valid memory location.
          * \param definitions   List of terms defining this memory location.
          */
-        Chunk(const MemoryLocation &location, std::vector<const Term *> definitions):
-            location_(location), definitions_(std::move(definitions))
+        Chunk(const MemoryLocation &location, std::vector<const Term *> definitions,
+              bool hasUnknownDefinition = false):
+            location_(location), definitions_(std::move(definitions)),
+            hasUnknownDefinition_(hasUnknownDefinition)
         {
             assert(location);
         }
@@ -84,13 +87,20 @@ public:
         const std::vector<const Term *> &definitions() const { return definitions_; }
 
         /**
+         * \return True when this location can also be defined by an operation
+         *         whose value has no corresponding IR term.
+         */
+        bool hasUnknownDefinition() const { return hasUnknownDefinition_; }
+
+        /**
          * \param that Another object of the same type.
          *
          * \return True if *this and that have the same memory location and list of terms,
          *         false otherwise.
          */
         bool operator==(const Chunk &that) const {
-            return location_ == that.location_ && definitions_ == that.definitions_;
+            return location_ == that.location_ && definitions_ == that.definitions_ &&
+                   hasUnknownDefinition_ == that.hasUnknownDefinition_;
         }
     };
 
@@ -127,6 +137,15 @@ public:
      * \param[in] term Term which is the definition.
      */
     void addDefinition(const MemoryLocation &memoryLocation, const Term *term);
+
+    /**
+     * Replaces definitions of a location with an unknown definition.
+     *
+     * Unlike merely killing definitions, retaining an explicit unknown keeps
+     * constant propagation sound when this state is merged with a path on
+     * which an older concrete definition still reaches the join.
+     */
+    void addUnknownDefinition(const MemoryLocation &memoryLocation);
 
     /**
      * Kills definitions of given memory location.
@@ -204,7 +223,9 @@ public:
         }
         chunks_.erase(
             std::remove_if(chunks_.begin(), chunks_.end(),
-                [](const Chunk &chunk) -> bool { return chunk.definitions().empty(); }),
+                [](const Chunk &chunk) -> bool {
+                    return chunk.definitions().empty() && !chunk.hasUnknownDefinition();
+                }),
             chunks_.end());
         selfTest();
     }

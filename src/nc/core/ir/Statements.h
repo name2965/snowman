@@ -203,6 +203,36 @@ protected:
     std::unique_ptr<Statement> doClone() const override;
 };
 
+/**
+ * Invalidates stack memory which can be reached through pointer-valued call
+ * arguments. The candidate terms are evaluated by DataflowAnalyzer before any
+ * reaching definitions are removed.
+ *
+ * This is a dataflow-only statement. It produces no source-level code.
+ */
+class StackMemoryInvalidation: public Statement {
+    std::vector<std::unique_ptr<Term>> pointerCandidates_;
+
+public:
+    /**
+     * \param pointerCandidates Terms whose runtime values may point into the
+     *        current stack frame.
+     */
+    explicit StackMemoryInvalidation(std::vector<std::unique_ptr<Term>> pointerCandidates);
+
+    /**
+     * \return Terms whose values must be checked for stack offsets.
+     */
+    const std::vector<std::unique_ptr<Term>> &pointerCandidates() const {
+        return pointerCandidates_;
+    }
+
+    void print(QTextStream &out) const override;
+
+protected:
+    std::unique_ptr<Statement> doClone() const override;
+};
+
 /*
  * Statement implementation follows.
  */

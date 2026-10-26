@@ -40,6 +40,7 @@ namespace liveness {
 namespace calling {
 
 class FunctionSignature;
+class Convention;
 class Hooks;
 class Signatures;
 class ReturnHook;
@@ -155,11 +156,12 @@ private:
 
     /**
      * \param[in] call Valid pointer to a call statement.
+     * \param[in] convention Calling convention used by the call.
      *
      * \return Memory locations that are defined before the call, but never used.
      *         Stack offsets are fixed up in accordance to the reaching stack pointer value.
      */
-    std::vector<MemoryLocation> getUnusedDefines(const Call *call);
+    std::vector<MemoryLocation> getUnusedDefines(const Call *call, const Convention *convention);
 
     /**
      * \param[in] call Valid pointer to a call statement.

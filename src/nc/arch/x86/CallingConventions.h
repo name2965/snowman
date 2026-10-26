@@ -57,7 +57,6 @@ public:
 
 /**
  * 32-bit cdecl calling convention.
- * Tweaked to allow passing one argument via ecx (like in thiscall).
  */
 class Cdecl32CallingConvention: public core::ir::calling::Convention {
 public:
@@ -80,7 +79,6 @@ public:
 
 /**
  * 32-bit stdcall calling convention.
- * Tweaked to allow passing one argument via ecx (like in thiscall).
  */
 class Stdcall32CallingConvention: public core::ir::calling::Convention {
 public:
@@ -88,6 +86,17 @@ public:
      * Class constructor.
      */
     Stdcall32CallingConvention(const X86Architecture *architecture);
+};
+
+/**
+ * 32-bit Microsoft thiscall calling convention.
+ */
+class Thiscall32CallingConvention: public core::ir::calling::Convention {
+public:
+    /**
+     * Class constructor.
+     */
+    Thiscall32CallingConvention(const X86Architecture *architecture);
 };
 
 } // namespace x86

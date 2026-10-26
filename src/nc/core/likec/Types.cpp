@@ -41,6 +41,10 @@ void VoidType::print(QTextStream &out) const {
 }
 
 void IntegerType::print(QTextStream &out) const {
+    if (!displayName().isEmpty()) {
+        out << displayName();
+        return;
+    }
     if (isUnsigned()) {
         out << 'u';
     }
@@ -52,7 +56,11 @@ void FloatType::print(QTextStream &out) const {
 }
 
 void PointerType::print(QTextStream &out) const {
-    out << *pointeeType_ << '*';
+    if (!displayName().isEmpty()) {
+        out << displayName();
+    } else {
+        out << *pointeeType_ << '*';
+    }
 }
 
 void ArrayType::print(QTextStream &out) const {

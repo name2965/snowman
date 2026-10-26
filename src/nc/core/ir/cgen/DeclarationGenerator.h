@@ -46,6 +46,7 @@ class Term;
 
 namespace calling {
     class FunctionSignature;
+    class TypeDescription;
 }
 
 namespace cgen {
@@ -114,6 +115,12 @@ protected:
      * \return Type of function's return value.
      */
     const likec::Type *makeReturnType();
+
+    /**
+     * Converts presentation metadata into a LikeC type without losing its
+     * integer/pointer kind.
+     */
+    const likec::Type *makePresentationType(const calling::TypeDescription &description);
 
     /**
      * \return Whether the function has variable number of arguments.

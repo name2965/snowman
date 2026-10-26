@@ -143,7 +143,8 @@ public:
      * \param[in] size Size.
      * \param[in] isUnsigned Type must unsigned.
      */
-    const IntegerType *makeIntegerType(SmallBitSize size, bool isUnsigned);
+    const IntegerType *makeIntegerType(SmallBitSize size, bool isUnsigned,
+                                       const QString &displayName = QString());
 
     /**
      * \return Float type of given size.
@@ -158,15 +159,16 @@ public:
      * \param[in] size Size.
      * \param[in] pointee Pointee type.
      */
-    const PointerType *makePointerType(SmallBitSize size, const Type *pointee);
+    const PointerType *makePointerType(SmallBitSize size, const Type *pointee,
+                                       const QString &displayName = QString());
 
     /**
      * \return Pointer type to given type. Usual pointer size is used.
      *
      * \param[in] pointee Pointee type.
      */
-    const PointerType *makePointerType(const Type *pointee) {
-        return makePointerType(pointerSize(), pointee);
+    const PointerType *makePointerType(const Type *pointee, const QString &displayName = QString()) {
+        return makePointerType(pointerSize(), pointee, displayName);
     }
 
     /**

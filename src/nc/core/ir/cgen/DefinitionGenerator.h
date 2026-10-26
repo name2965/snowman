@@ -29,6 +29,10 @@
 #include <boost/unordered_map.hpp>
 #include <boost/unordered_set.hpp>
 
+#include <vector>
+
+#include <nc/common/Types.h>
+
 #include "DeclarationGenerator.h"
 
 namespace nc {
@@ -59,6 +63,7 @@ class UnaryOperator;
 namespace cflow {
     class Graph;
     class Node;
+    class Region;
 }
 
 namespace dflow {
@@ -96,6 +101,15 @@ class DefinitionGenerator: public DeclarationGenerator {
     boost::unordered_map<const ir::vars::Variable *, likec::VariableDeclaration *> variableDeclarations_;
     boost::unordered_map<const BasicBlock *, likec::LabelDeclaration *> labels_;
     boost::unordered_map<const Term *, boost::optional<bool>> isSubstituted_;
+
+    /** A byte-array view proven by a fixed-size REP STOS over the local frame. */
+    struct StackBuffer {
+        SignedConstantValue offset;
+        ByteSize size;
+        likec::VariableDeclaration *declaration;
+    };
+    std::vector<StackBuffer> stackBuffers_;
+    bool suppressStackBufferExpressions_;
 
 public:
     /**
@@ -136,6 +150,12 @@ private:
      * \return Valid pointer to the local variable declaration.
      */
     likec::VariableDeclaration *makeLocalVariableDeclaration(const vars::Variable *variable);
+
+    /**
+     * Returns source-level type metadata when a local variable is the result
+     * of calls whose recovered prototypes agree on that type.
+     */
+    const calling::TypeDescription *getCallResultType(const vars::Variable *variable) const;
 
     /**
      * \param[in] variable Valid pointer to a variable.
@@ -226,6 +246,64 @@ private:
      * \return Valid pointer to created LikeC statement.
      */
     std::unique_ptr<likec::Statement> doMakeStatement(const Statement *statement, const BasicBlock *nextBB, const BasicBlock *breakBB, const BasicBlock *continueBB);
+
+    /**
+     * Tries to replace a compiler-generated REP STOS loop with an equivalent
+     * memset call. The rewrite is deliberately limited to operations whose
+     * initial destination, fill byte and iteration count can be recovered and
+     * whose final index/count register values are not observed.
+     *
+     * \param region Structured loop region to inspect.
+     *
+     * \return The memset statement, or nullptr when the loop is not safe to
+     *         rewrite.
+     */
+    std::unique_ptr<likec::Statement> makeRepStos(const cflow::Region *region);
+
+    /**
+     * Tries to replace the canonical strlen sequence
+     *
+     *     xor eax, eax
+     *     mov ecx, -1
+     *     repne scasb
+     *     not ecx
+     *     dec ecx
+     *
+     * with an assignment from strlen. The rewrite is only performed when the
+     * complete post-SCAS use chain is present and the resulting index and flag
+     * values are not observed.
+     *
+     * \param region Structured REPNE SCASB loop to inspect.
+     *
+     * \return The strlen assignment, or nullptr when the sequence is not safe
+     *         to rewrite.
+     */
+    std::unique_ptr<likec::Statement> makeRepneScasLength(const cflow::Region *region);
+
+    /**
+     * Recovers an exact stack-frame offset from ZERO_STACK_OFFSET, constant
+     * pointer arithmetic and unambiguous copy definitions. Unlike the general
+     * dataflow stack-offset flag, this deliberately rejects loop-carried
+     * pointer values.
+     */
+    boost::optional<SignedConstantValue> getProvenStackOffset(const Term *term) const;
+
+    /**
+     * Registers a non-overlapping local byte array initialized by REP STOS.
+     * Returns the declaration, or nullptr when the address is not a proven
+     * local-frame offset or the range cannot be represented safely.
+     */
+    likec::VariableDeclaration *registerStackBuffer(const Term *address,
+                                                    ConstantValue byteCount);
+
+    /**
+     * Converts a proven pointer into a previously registered local byte-array
+     * expression. Returns nullptr when no such array covers the pointer.
+     */
+    std::unique_ptr<likec::Expression> makeStackBufferAddress(const Term *term);
+
+    /** Generates an expression without applying a registered stack-array view. */
+    std::unique_ptr<likec::Expression> makeExpressionWithoutStackBuffers(const Term *term);
 
     /**
      * Creates a goto statement to the given target.

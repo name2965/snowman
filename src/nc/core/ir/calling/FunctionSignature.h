@@ -32,6 +32,8 @@
 
 #include <nc/core/ir/Term.h>
 
+#include "FunctionPrototype.h"
+
 namespace nc {
 namespace core {
 namespace ir {
@@ -44,6 +46,7 @@ class FunctionSignature {
     std::vector<std::shared_ptr<const Term>> arguments_; ///< Terms representing the arguments.
     bool variadic_; ///< True if the function is variadic.
     std::shared_ptr<const Term> returnValue_; ///< Term representing the return value.
+    std::shared_ptr<const FunctionPrototype> prototype_; ///< Optional source-level prototype metadata.
 
 public:
     /**
@@ -84,6 +87,14 @@ public:
      * \param term Valid pointer to the term.
      */
     void setReturnValue(std::shared_ptr<Term> term) { returnValue_ = std::move(term); }
+
+    /** \return Optional source-level prototype metadata. */
+    const std::shared_ptr<const FunctionPrototype> &prototype() const { return prototype_; }
+
+    /** Sets optional source-level prototype metadata. */
+    void setPrototype(std::shared_ptr<const FunctionPrototype> prototype) {
+        prototype_ = std::move(prototype);
+    }
 };
 
 } // namespace calling

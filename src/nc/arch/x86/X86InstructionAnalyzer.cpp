@@ -349,11 +349,15 @@ public:
 
                 auto di = resizedRegister(X86Registers::di(), ud_obj_.adr_mode);
                 auto si = resizedRegister(X86Registers::si(), ud_obj_.adr_mode);
-                auto cx = resizedRegister(X86Registers::cx(), ud_obj_.opr_mode);
+                /*
+                 * REP uses CX/ECX/RCX selected by the address-size attribute,
+                 * not by the operand size of the string element.
+                 */
+                auto cx = resizedRegister(X86Registers::cx(), ud_obj_.adr_mode);
 
                 auto increment = temporary(ud_obj_.adr_mode);
                 _[
-                    increment ^= constant(accessSize / CHAR_BIT) - constant(2 * accessSize / CHAR_BIT, si.memoryLocation().size()) * zero_extend(df)
+                    increment ^= constant(accessSize / CHAR_BIT) - constant(2 * accessSize / CHAR_BIT, di.memoryLocation().size()) * zero_extend(df)
                 ];
 
                 X86ExpressionFactoryCallback condition(factory, program->createBasicBlock(), instr);
@@ -385,18 +389,26 @@ public:
 
                             less             ^= signed_(left) < right,
                             less_or_equal    ^= signed_(left) <= right,
-                            below_or_equal   ^= unsigned_(left) <= right
+                            below_or_equal   ^= unsigned_(left) <= right,
+
+                            si ^= si + increment,
+                            di ^= di + increment
                         ];
                         break;
                     }
                     case UD_Imovsb: case UD_Imovsw: case UD_Imovsd: case UD_Imovsq: {
                         repPrefixIsValid = true;
-                        body[dereference(di, accessSize) ^= *si];
+                        body[
+                            dereference(di, accessSize) ^= *si,
+                            si ^= si + increment,
+                            di ^= di + increment
+                        ];
                         break;
                     }
                     case UD_Iscasb: case UD_Iscasw: case UD_Iscasd: case UD_Iscasq: {
-                        auto left = dereference(di, accessSize);
-                        auto right = resizedRegister(X86Registers::ax(), accessSize);
+                        /* SCAS compares accumulator - [DI], in that order. */
+                        auto left = resizedRegister(X86Registers::ax(), accessSize);
+                        auto right = dereference(di, accessSize);
 
                         body[
                             cf ^= unsigned_(left) < right,
@@ -408,23 +420,23 @@ public:
 
                             less             ^= signed_(left) < right,
                             less_or_equal    ^= signed_(left) <= right,
-                            below_or_equal   ^= unsigned_(left) <= right
+                            below_or_equal   ^= unsigned_(left) <= right,
+
+                            di ^= di + increment
                         ];
                         break;
                     }
                     case UD_Istosb: case UD_Istosw: case UD_Istosd: case UD_Istosq: {
                         repPrefixIsValid = true;
-                        body[dereference(di, accessSize) ^= resizedRegister(X86Registers::ax(), accessSize)];
+                        body[
+                            dereference(di, accessSize) ^= resizedRegister(X86Registers::ax(), accessSize),
+                            di ^= di + increment
+                        ];
                         break;
                     }
                     default:
                         unreachable();
                 }
-
-                body[
-                    di ^= di + increment,
-                    si ^= si + increment
-                ];
 
                 /* libudis86 sets REP prefix together with REPZ/REPNZ. */
                 if (ud_obj_.pfx_rep != UD_NONE && repPrefixIsValid) {

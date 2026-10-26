@@ -53,6 +53,21 @@ void ReachingDefinitions::addDefinition(const MemoryLocation &mloc, const Term *
     selfTest();
 }
 
+void ReachingDefinitions::addUnknownDefinition(const MemoryLocation &mloc) {
+    assert(mloc);
+
+    killDefinitions(mloc);
+
+    auto i = std::lower_bound(chunks_.begin(), chunks_.end(), mloc,
+        [](const Chunk &a, const MemoryLocation &b) -> bool {
+            return a.location() < b;
+        });
+
+    chunks_.insert(i, Chunk(mloc, std::vector<const Term *>(), true));
+
+    selfTest();
+}
+
 void ReachingDefinitions::killDefinitions(const MemoryLocation &mloc) {
     assert(mloc);
 
@@ -71,17 +86,17 @@ void ReachingDefinitions::killDefinitions(const MemoryLocation &mloc) {
                 if (mloc.endAddr() < chunk.location().endAddr()) {
                     result.push_back(Chunk(
                         MemoryLocation(mloc.domain(), chunk.location().addr(), mloc.addr() - chunk.location().addr()),
-                        chunk.definitions()));
+                        chunk.definitions(), chunk.hasUnknownDefinition()));
                 } else {
                     result.push_back(Chunk(
                         MemoryLocation(mloc.domain(), chunk.location().addr(), mloc.addr() - chunk.location().addr()),
-                        std::move(chunk.definitions())));
+                        std::move(chunk.definitions()), chunk.hasUnknownDefinition()));
                 }
             }
             if (mloc.endAddr() < chunk.location().endAddr()) {
                 result.push_back(Chunk(
                     MemoryLocation(mloc.domain(), mloc.endAddr(), chunk.location().endAddr() - mloc.endAddr()),
-                    std::move(chunk.definitions())));
+                    std::move(chunk.definitions()), chunk.hasUnknownDefinition()));
             }
         }
     }
@@ -104,7 +119,7 @@ void ReachingDefinitions::project(const MemoryLocation &mloc, ReachingDefinition
             if (addr < endAddr) {
                 result.chunks_.push_back(Chunk(
                     MemoryLocation(mloc.domain(), addr, endAddr - addr),
-                    chunk.definitions()));
+                    chunk.definitions(), chunk.hasUnknownDefinition()));
             }
         }
     }
@@ -152,40 +167,45 @@ void ReachingDefinitions::merge(const ReachingDefinitions &those) {
         }
 
         if (!b) {
-            result.push_back(Chunk(a, i->definitions()));
+            result.push_back(Chunk(a, i->definitions(), i->hasUnknownDefinition()));
             ++i;
         } else if (!a) {
-            result.push_back(Chunk(b, j->definitions()));
+            result.push_back(Chunk(b, j->definitions(), j->hasUnknownDefinition()));
             ++j;
         } else if (a.domain() < b.domain()) {
-            result.push_back(Chunk(a, i->definitions()));
+            result.push_back(Chunk(a, i->definitions(), i->hasUnknownDefinition()));
             ++i;
         } else if (b.domain() < a.domain()) {
-            result.push_back(Chunk(b, j->definitions()));
+            result.push_back(Chunk(b, j->definitions(), j->hasUnknownDefinition()));
             ++j;
         } else if (a.endAddr() <= b.addr()) {
-            result.push_back(Chunk(a, i->definitions()));
+            result.push_back(Chunk(a, i->definitions(), i->hasUnknownDefinition()));
             ++i;
         } else if (b.endAddr() <= a.addr()) {
-            result.push_back(Chunk(b, j->definitions()));
+            result.push_back(Chunk(b, j->definitions(), j->hasUnknownDefinition()));
             ++j;
         } else if (a.addr() < b.addr()) {
-            result.push_back(Chunk(MemoryLocation(a.domain(), a.addr(), b.addr() - a.addr()), i->definitions()));
+            result.push_back(Chunk(MemoryLocation(a.domain(), a.addr(), b.addr() - a.addr()),
+                                   i->definitions(), i->hasUnknownDefinition()));
         } else if (b.addr() < a.addr()) {
-            result.push_back(Chunk(MemoryLocation(b.domain(), b.addr(), a.addr() - b.addr()), j->definitions()));
+            result.push_back(Chunk(MemoryLocation(b.domain(), b.addr(), a.addr() - b.addr()),
+                                   j->definitions(), j->hasUnknownDefinition()));
         } else {
             std::vector<const Term *> merged;
             merged.reserve(i->definitions().size() + j->definitions().size());
             std::set_union(i->definitions().begin(), i->definitions().end(), j->definitions().begin(), j->definitions().end(), std::back_inserter(merged));
 
             if (a.size() < b.size()) {
-                result.push_back(Chunk(a, std::move(merged)));
+                result.push_back(Chunk(a, std::move(merged),
+                    i->hasUnknownDefinition() || j->hasUnknownDefinition()));
                 ++i;
             } else if (b.size() < a.size()) {
-                result.push_back(Chunk(b, std::move(merged)));
+                result.push_back(Chunk(b, std::move(merged),
+                    i->hasUnknownDefinition() || j->hasUnknownDefinition()));
                 ++j;
             } else {
-                result.push_back(Chunk(a, std::move(merged)));
+                result.push_back(Chunk(a, std::move(merged),
+                    i->hasUnknownDefinition() || j->hasUnknownDefinition()));
                 ++i;
                 ++j;
             }
@@ -201,6 +221,9 @@ void ReachingDefinitions::print(QTextStream &out) const {
     out << '{';
     foreach (const auto &chunk, chunks_) {
         out << chunk.location() << ':';
+        if (chunk.hasUnknownDefinition()) {
+            out << " unknown";
+        }
         foreach (const Term *term, chunk.definitions()) {
             out << ' ' << *term;
         }

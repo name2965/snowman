@@ -52,6 +52,7 @@ class Callback;
 class Halt;
 class InlineAssembly;
 class Jump;
+class StackMemoryInvalidation;
 class Term;
 class Touch;
 
@@ -74,6 +75,7 @@ public:
         TOUCH,          ///< Reads or writes a term.
         CALLBACK,       ///< Custom operation.
         REMEMBER_REACHING_DEFINITIONS, ///< Remembers reaching definition.
+        STACK_MEMORY_INVALIDATION, ///< Invalidates stack memory reachable through call arguments.
         USER = 1000     ///< Base for user-defined statements.
     };
 
@@ -174,5 +176,7 @@ NC_REGISTER_STATEMENT_CLASS(nc::core::ir::Call,           nc::core::ir::Statemen
 NC_REGISTER_STATEMENT_CLASS(nc::core::ir::Halt,           nc::core::ir::Statement::HALT)
 NC_REGISTER_STATEMENT_CLASS(nc::core::ir::Touch,          nc::core::ir::Statement::TOUCH)
 NC_REGISTER_STATEMENT_CLASS(nc::core::ir::Callback,       nc::core::ir::Statement::CALLBACK)
+NC_REGISTER_STATEMENT_CLASS(nc::core::ir::StackMemoryInvalidation,
+                            nc::core::ir::Statement::STACK_MEMORY_INVALIDATION)
 
 /* vim:set et sts=4 sw=4: */

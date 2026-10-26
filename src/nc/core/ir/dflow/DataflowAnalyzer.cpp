@@ -24,6 +24,10 @@
 
 #include "DataflowAnalyzer.h"
 
+#include <algorithm>
+#include <climits>
+#include <limits>
+
 #include <boost/unordered_map.hpp>
 
 #include <nc/common/CancellationToken.h>
@@ -201,6 +205,78 @@ void DataflowAnalyzer::execute(const Statement *statement, ReachingDefinitions &
             dataflow_.getDefinitions(statement) = definitions;
             break;
         }
+        case Statement::STACK_MEMORY_INVALIDATION: {
+            auto invalidation = statement->as<StackMemoryInvalidation>();
+            std::vector<SignedConstantValue> stackOffsets;
+
+            /* Resolve every argument before invalidating any stack slot. */
+            foreach (const auto &term, invalidation->pointerCandidates()) {
+                auto value = computeValue(term.get(), definitions);
+                if (value->isStackOffset()) {
+                    stackOffsets.push_back(value->stackOffset());
+                }
+            }
+
+            foreach (auto stackOffset, stackOffsets) {
+                BitAddr begin;
+                BitAddr end;
+
+                if (stackOffset < 0) {
+                    if (stackOffset <=
+                        (std::numeric_limits<BitAddr>::min)() / CHAR_BIT)
+                    {
+                        continue;
+                    }
+
+                    begin = stackOffset * CHAR_BIT;
+                    end = 0;
+                } else {
+                    /*
+                     * Addresses of incoming stack arguments have non-negative
+                     * offsets. They are mutable objects too (for example,
+                     * f(&argument)), so omitting them would let a pre-call
+                     * value propagate through a call which may overwrite it.
+                     *
+                     * There is no explicit frame-end metadata here. Cover at
+                     * least the addressed byte and extend through all stack
+                     * definitions currently known above it. Function-entry
+                     * argument definitions normally provide the required
+                     * upper bound without manufacturing an enormous interval.
+                     */
+                    if (stackOffset >
+                        ((std::numeric_limits<BitAddr>::max)() - CHAR_BIT) /
+                            CHAR_BIT)
+                    {
+                        continue;
+                    }
+
+                    begin = stackOffset * CHAR_BIT;
+                    end = begin + CHAR_BIT;
+                    foreach (const auto &location,
+                             definitions.getDefinedMemoryLocationsWithin(
+                                 MemoryDomain::STACK))
+                    {
+                        if (location.endAddr() > begin) {
+                            end = std::max(end, location.endAddr());
+                        }
+                    }
+                }
+
+                /*
+                 * A pointer argument denotes a possible write, not a
+                 * definite write to every byte in the covered frame range.
+                 * Preserve the old definitions while adding an explicit
+                 * unknown alternative. This both blocks stale constant
+                 * propagation and keeps pre/post-call accesses connected
+                 * to the same reconstructed local variable.
+                 */
+                ReachingDefinitions possibleWrite;
+                possibleWrite.addUnknownDefinition(MemoryLocation(
+                    MemoryDomain::STACK, begin, end - begin));
+                definitions.merge(possibleWrite);
+            }
+            break;
+        }
         default:
             log_.warning(tr("%1: Unknown statement kind: %2.").arg(Q_FUNC_INFO).arg(statement->kind()));
             break;
@@ -342,6 +418,7 @@ Value *DataflowAnalyzer::computeValue(const Term *term, const MemoryLocation &me
      * Merge abstract values.
      */
     AbstractValue abstractValue(value->abstractValue().size(), 0, 0);
+    bool hasUnknownDefinition = false;
 
     foreach (const auto &chunk, definitions.chunks()) {
         assert(memoryLocation.covers(chunk.location()));
@@ -354,6 +431,14 @@ Value *DataflowAnalyzer::computeValue(const Term *term, const MemoryLocation &me
             mask = bitShift(mask, chunk.location().addr() - memoryLocation.addr());
         } else {
             mask = bitShift(mask, memoryLocation.endAddr() - chunk.location().endAddr());
+        }
+
+        if (chunk.hasUnknownDefinition()) {
+            hasUnknownDefinition = true;
+            abstractValue = AbstractValue(abstractValue.size(),
+                abstractValue.zeroBits() | mask,
+                abstractValue.oneBits() | mask,
+                AbstractValue::exact);
         }
 
         foreach (auto definition, chunk.definitions()) {
@@ -384,25 +469,32 @@ Value *DataflowAnalyzer::computeValue(const Term *term, const MemoryLocation &me
 
     value->setAbstractValue(abstractValue);
 
+    /* Any unknown part prevents whole-value provenance classifications. */
+    if (hasUnknownDefinition) {
+        value->makeNotStackOffset();
+        value->makeNotProduct();
+        value->makeNotReturnAddress();
+    }
+
     /*
      * Merge stack offset and product flags.
      *
      * Heuristic: merge information only from terms that define lower bits of the term's value.
      */
-    const std::vector<const Term *> *lowerBitsDefinitions = nullptr;
+    const ReachingDefinitions::Chunk *lowerBitsChunk = nullptr;
 
     if (byteOrder == ByteOrder::LittleEndian) {
         if (definitions.chunks().front().location().addr() == memoryLocation.addr()) {
-            lowerBitsDefinitions = &definitions.chunks().front().definitions();
+            lowerBitsChunk = &definitions.chunks().front();
         }
     } else {
         if (definitions.chunks().back().location().endAddr() == memoryLocation.endAddr()) {
-            lowerBitsDefinitions = &definitions.chunks().back().definitions();
+            lowerBitsChunk = &definitions.chunks().back();
         }
     }
 
-    if (lowerBitsDefinitions) {
-        foreach (auto definition, *lowerBitsDefinitions) {
+    if (lowerBitsChunk) {
+        foreach (auto definition, lowerBitsChunk->definitions()) {
             auto definitionValue = dataflow().getValue(definition);
 
             if (definitionValue->isNotStackOffset()) {

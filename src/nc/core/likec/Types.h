@@ -26,6 +26,9 @@
 #include <nc/config.h>
 
 #include <cassert>
+#include <utility>
+
+#include <QString>
 
 #include "Type.h"
 
@@ -68,6 +71,7 @@ class VoidType: public Type {
  */
 class IntegerType: public Type {
     bool isUnsigned_; ///< Whether this type is unsigned.
+    QString displayName_; ///< Optional source-level alias used when printing.
 
     public:
 
@@ -77,7 +81,9 @@ class IntegerType: public Type {
      * \param[in] size Type size.
      * \param[in] isUnsigned Whether this type is unsigned.
      */
-    IntegerType(BitSize size, bool isUnsigned): Type(size, INTEGER), isUnsigned_(isUnsigned) {}
+    IntegerType(BitSize size, bool isUnsigned, QString displayName = QString()):
+        Type(size, INTEGER), isUnsigned_(isUnsigned), displayName_(std::move(displayName))
+    {}
 
     /**
      * \return True, if the type is signed.
@@ -88,6 +94,9 @@ class IntegerType: public Type {
      * \return True, if the type is unsigned.
      */
     bool isUnsigned() const { return isUnsigned_; }
+
+    /** \return Optional source-level alias used when printing. */
+    const QString &displayName() const { return displayName_; }
 
     virtual bool isInteger() const override { return true; }
 
@@ -119,6 +128,7 @@ class PointerType: public Type {
     NC_BASE_CLASS(Type, pointerKind)
 
     const Type *pointeeType_; ///< Type this one points to.
+    QString displayName_; ///< Optional source-level alias used when printing.
 
     public:
 
@@ -137,8 +147,9 @@ class PointerType: public Type {
      * \param[in] size Type size.
      * \param[in] pointeeType Pointee type.
      */
-    PointerType(BitSize size, const Type *pointeeType):
-        Type(size, POINTER), pointerKind_(PLAIN_PTR), pointeeType_(pointeeType)
+    PointerType(BitSize size, const Type *pointeeType, QString displayName = QString()):
+        Type(size, POINTER), pointerKind_(PLAIN_PTR), pointeeType_(pointeeType),
+        displayName_(std::move(displayName))
     {
         assert(pointeeType);
     }
@@ -152,8 +163,9 @@ class PointerType: public Type {
      * \param[in] pointeeType Pointee type.
      * \param[in] pointerKind Pointer kind.
      */
-    PointerType(BitSize size, const Type *pointeeType, int pointerKind):
-        Type(size, POINTER), pointerKind_(pointerKind), pointeeType_(pointeeType)
+    PointerType(BitSize size, const Type *pointeeType, int pointerKind, QString displayName = QString()):
+        Type(size, POINTER), pointerKind_(pointerKind), pointeeType_(pointeeType),
+        displayName_(std::move(displayName))
     {
         assert(pointeeType);
     }
@@ -164,6 +176,9 @@ class PointerType: public Type {
      * \return Type this one points to.
      */
     const Type *pointeeType() const { return pointeeType_; }
+
+    /** \return Optional source-level alias used when printing. */
+    const QString &displayName() const { return displayName_; }
 
     virtual bool isPointer() const override { return true; }
     virtual bool isVoidPointer() const override { return pointeeType()->isVoid(); }

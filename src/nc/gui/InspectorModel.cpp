@@ -41,6 +41,7 @@
 #include <nc/core/likec/DoWhile.h>
 #include <nc/core/likec/Expression.h>
 #include <nc/core/likec/ExpressionStatement.h>
+#include <nc/core/likec/For.h>
 #include <nc/core/likec/FunctionDefinition.h>
 #include <nc/core/likec/FunctionIdentifier.h>
 #include <nc/core/likec/Goto.h>
@@ -147,6 +148,14 @@ void expand(InspectorItem *item, const core::ir::Statement *statement) {
         }
         case core::ir::Statement::CALLBACK: {
             item->addComment("Callback");
+            break;
+        }
+        case core::ir::Statement::STACK_MEMORY_INVALIDATION: {
+            auto *invalidation = statement->as<core::ir::StackMemoryInvalidation>();
+            item->addComment("Stack Memory Invalidation");
+            foreach (const auto &candidate, invalidation->pointerCandidates()) {
+                item->addChild(tr("pointer candidate"), candidate.get());
+            }
             break;
         }
         default: {
@@ -420,6 +429,15 @@ void expand(InspectorItem *item, const core::likec::Statement *statement) {
             item->addComment(tr("Do-While"));
             item->addChild(tr("body"), doWhile->body());
             item->addChild(tr("condition"), doWhile->condition());
+            break;
+        }
+        case core::likec::Statement::FOR: {
+            const core::likec::For *loop = statement->as<core::likec::For>();
+            item->addComment(tr("For"));
+            item->addChild(tr("initializer"), loop->initializer());
+            item->addChild(tr("condition"), loop->condition());
+            item->addChild(tr("increment"), loop->increment());
+            item->addChild(tr("body"), loop->body());
             break;
         }
         case core::likec::Statement::EXPRESSION_STATEMENT: {

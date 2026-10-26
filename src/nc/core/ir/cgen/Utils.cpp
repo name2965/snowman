@@ -179,9 +179,14 @@ const Term *getTheOnlyDefinition(const Term *term, const dflow::Dataflow &datafl
     const auto &definitions = dataflow.getDefinitions(term);
 
     if (definitions.chunks().size() == 1 &&
+        definitions.chunks().front().location() == dataflow.getMemoryLocation(term) &&
+        !definitions.chunks().front().hasUnknownDefinition() &&
         definitions.chunks().front().definitions().size() == 1)
     {
-        return definitions.chunks().front().definitions().front();
+        const Term *definition = definitions.chunks().front().definitions().front();
+        if (dataflow.getMemoryLocation(definition) == dataflow.getMemoryLocation(term)) {
+            return definition;
+        }
     }
     return nullptr;
 }

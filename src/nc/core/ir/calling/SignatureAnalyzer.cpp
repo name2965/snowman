@@ -3,13 +3,17 @@
 
 #include "SignatureAnalyzer.h"
 
+#include <algorithm>
+#include <climits>
 #include <cstdint> /* uintptr_t */
+#include <limits>
 
 #include <boost/range/adaptor/map.hpp>
 
 #include <nc/common/Foreach.h>
 #include <nc/common/make_unique.h>
 
+#include <nc/core/arch/Instruction.h>
 #include <nc/core/ir/BasicBlock.h>
 #include <nc/core/ir/Function.h>
 #include <nc/core/ir/Functions.h>
@@ -163,7 +167,7 @@ bool SignatureAnalyzer::computeArguments(const CalleeId &calleeId) {
     }
 
     foreach (auto call, referrers.calls) {
-        foreach (const auto &memoryLocation, getUnusedDefines(call)) {
+        foreach (const auto &memoryLocation, getUnusedDefines(call, convention)) {
             if (auto argumentLocation = convention->getArgumentLocationCovering(memoryLocation)) {
                 placements[argumentLocation].inCalls[call].merge(memoryLocation);
             }
@@ -329,6 +333,146 @@ public:
     }
 };
 
+/**
+ * Matches the expression produced for a caller-side stack cleanup. In
+ * particular, x86 ADD is represented as a temporary assignment followed by
+ * an assignment of that temporary to the stack pointer.
+ */
+boost::optional<ByteSize> getCallerCleanupSize(const Call *call, const Convention *convention) {
+    assert(call != nullptr);
+    assert(convention != nullptr);
+
+    const auto &stackPointer = convention->stackPointer();
+    if (convention->name() != QLatin1String("cdecl32") ||
+        convention->calleeCleanup() ||
+        !stackPointer ||
+        stackPointer.size() != 32 ||
+        convention->argumentAlignment() <= 0 ||
+        convention->argumentAlignment() % CHAR_BIT != 0)
+    {
+        return boost::none;
+    }
+
+    auto basicBlock = call->basicBlock();
+    auto callInstruction = call->instruction();
+    if (!basicBlock || !callInstruction) {
+        return boost::none;
+    }
+
+    /*
+     * Hooks and the implicit restoration of the return-address slot can occur
+     * after the Call statement. Skip those, but do not skip a real machine
+     * instruction: the cleanup must immediately follow the call.
+     */
+    const arch::Instruction *cleanupInstruction = nullptr;
+    auto statement = basicBlock->statements().get_iterator(call);
+    for (++statement; statement != basicBlock->statements().end(); ++statement) {
+        if ((*statement)->instruction() && (*statement)->instruction() != callInstruction) {
+            cleanupInstruction = (*statement)->instruction();
+            break;
+        }
+    }
+
+    if (!cleanupInstruction || cleanupInstruction->addr() != callInstruction->endAddr()) {
+        return boost::none;
+    }
+
+    std::vector<const Assignment *> assignments;
+    const Assignment *stackPointerWrite = nullptr;
+
+    foreach (const auto candidate, basicBlock->statements()) {
+        if (candidate->instruction() != cleanupInstruction) {
+            continue;
+        }
+
+        auto assignment = candidate->asAssignment();
+        if (!assignment) {
+            continue;
+        }
+        assignments.push_back(assignment);
+
+        if (auto access = assignment->left()->asMemoryLocationAccess()) {
+            if (MemoryLocation::intersect(access->memoryLocation(), stackPointer)) {
+                /* A partial or second write would make the update ambiguous. */
+                if (access->memoryLocation() != stackPointer || stackPointerWrite) {
+                    return boost::none;
+                }
+                stackPointerWrite = assignment;
+            }
+        }
+    }
+
+    if (!stackPointerWrite) {
+        return boost::none;
+    }
+
+    auto matchAddition = [&](const Term *term) -> boost::optional<ByteSize> {
+        auto addition = term ? term->asBinaryOperator() : nullptr;
+        if (!addition || addition->operatorKind() != BinaryOperator::ADD ||
+            addition->size() != stackPointer.size())
+        {
+            return boost::none;
+        }
+
+        const Constant *constant = nullptr;
+        const MemoryLocationAccess *access = nullptr;
+        if ((access = addition->left()->asMemoryLocationAccess()) != nullptr) {
+            constant = addition->right()->asConstant();
+        } else if ((access = addition->right()->asMemoryLocationAccess()) != nullptr) {
+            constant = addition->left()->asConstant();
+        }
+
+        if (!access || access->memoryLocation() != stackPointer || !constant ||
+            constant->size() != stackPointer.size())
+        {
+            return boost::none;
+        }
+
+        const SignedConstantValue amount = constant->value().signedValue();
+        const ByteSize alignment = convention->argumentAlignment() / CHAR_BIT;
+        const BitAddr firstArgumentOffset = convention->firstArgumentOffset();
+        if (amount <= 0 || amount % alignment != 0 ||
+            firstArgumentOffset < 0 ||
+            amount > ((std::numeric_limits<BitAddr>::max)() - firstArgumentOffset) / CHAR_BIT)
+        {
+            return boost::none;
+        }
+        return static_cast<ByteSize>(amount);
+    };
+
+    if (auto amount = matchAddition(stackPointerWrite->right())) {
+        return amount;
+    }
+
+    /* Accept the canonical x86 IR form: tmp = oldSP + imm; SP = tmp. */
+    auto temporary = stackPointerWrite->right()->asMemoryLocationAccess();
+    if (!temporary || temporary->memoryLocation() == stackPointer) {
+        return boost::none;
+    }
+
+    const Assignment *temporaryWrite = nullptr;
+    bool reachedStackPointerWrite = false;
+    foreach (const auto assignment, assignments) {
+        if (assignment == stackPointerWrite) {
+            reachedStackPointerWrite = true;
+            continue;
+        }
+        if (auto access = assignment->left()->asMemoryLocationAccess()) {
+            if (MemoryLocation::intersect(access->memoryLocation(), temporary->memoryLocation())) {
+                if (reachedStackPointerWrite ||
+                    access->memoryLocation() != temporary->memoryLocation() ||
+                    temporaryWrite)
+                {
+                    return boost::none;
+                }
+                temporaryWrite = assignment;
+            }
+        }
+    }
+
+    return temporaryWrite ? matchAddition(temporaryWrite->right()) : boost::none;
+}
+
 } // anonymous namespace
 
 std::vector<MemoryLocation> SignatureAnalyzer::getUndefinedUses(const Function *function) {
@@ -380,8 +524,11 @@ std::vector<MemoryLocation> SignatureAnalyzer::getUndefinedUses(const Function *
     return result;
 }
 
-std::vector<MemoryLocation> SignatureAnalyzer::getUnusedDefines(const Call *call) {
+std::vector<MemoryLocation> SignatureAnalyzer::getUnusedDefines(
+    const Call *call, const Convention *convention)
+{
     assert(call != nullptr);
+    assert(convention != nullptr);
 
     std::vector<MemoryLocation> result;
 
@@ -413,6 +560,23 @@ std::vector<MemoryLocation> SignatureAnalyzer::getUnusedDefines(const Call *call
                 }
             }
         }
+    }
+
+    /*
+     * A direct cdecl cleanup is stronger evidence than the speculative
+     * reaching-definition heuristic. Keep only the stack words that the
+     * caller demonstrably removes for this particular call.
+     */
+    if (auto cleanupSize = getCallerCleanupSize(call, convention)) {
+        const BitAddr begin = convention->firstArgumentOffset();
+        const BitAddr end = begin + *cleanupSize * CHAR_BIT;
+        result.erase(
+            std::remove_if(result.begin(), result.end(),
+                [&](const MemoryLocation &location) {
+                    return location.domain() != MemoryDomain::STACK ||
+                           location.addr() < begin || location.endAddr() > end;
+                }),
+            result.end());
     }
 
     return result;
@@ -575,6 +739,7 @@ void SignatureAnalyzer::computeSignatures(const CalleeId &calleeId) {
             }
         }
         callSignature->setReturnValue(functionSignature->returnValue());
+        callSignature->setPrototype(functionSignature->prototype());
 
         signatures_.setSignature(call, callSignature);
     }

@@ -73,10 +73,31 @@ CallHook::CallHook(const Convention *convention, const CallSignature *signature,
     };
 
     if (signature) {
+        std::vector<std::unique_ptr<Term>> pointerCandidates;
+        pointerCandidates.reserve(signature->arguments().size());
+
+        std::size_t argumentIndex = 0;
         foreach (const auto &term, signature->arguments()) {
             auto clone = term->clone();
+            const auto &prototype = signature->prototype();
+            const bool mayWriteMemory =
+                !prototype || argumentIndex >= prototype->parameters().size() ||
+                prototype->parameters()[argumentIndex].mayWriteMemory();
+            if (mayWriteMemory) {
+                pointerCandidates.push_back(clone->clone());
+            }
             argumentTerms_[term.get()] = clone.get();
             addArgumentRead(std::move(clone));
+            ++argumentIndex;
+        }
+
+        /*
+         * This statement follows all argument reads so invalidating a local
+         * buffer cannot erase another argument before its value is captured.
+         */
+        if (!pointerCandidates.empty()) {
+            statements.push_back(std::make_unique<StackMemoryInvalidation>(
+                std::move(pointerCandidates)));
         }
 
         if (signature->returnValue()) {

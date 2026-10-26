@@ -21,6 +21,7 @@
 #include "DoWhile.h"
 #include "Expression.h"
 #include "ExpressionStatement.h"
+#include "For.h"
 #include "FunctionDefinition.h"
 #include "Goto.h"
 #include "If.h"
@@ -35,6 +36,7 @@
 #include "StructTypeDeclaration.h"
 #include "Switch.h"
 #include "Typecast.h"
+#include "Types.h"
 #include "UnaryOperator.h"
 #include "UndeclaredIdentifier.h"
 #include "VariableDeclaration.h"
@@ -251,6 +253,9 @@ void TreePrinter::doPrint(const FunctionDefinition *node) {
 
 void TreePrinter::printSignature(const FunctionDeclaration *node) {
     out_ << *node->type()->returnType() << ' ';
+    if (!node->callingConvention().isEmpty()) {
+        out_ << node->callingConvention() << ' ';
+    }
     print(node->functionIdentifier());
     out_ << '(';
 
@@ -294,8 +299,18 @@ void TreePrinter::doPrint(const StructTypeDeclaration *node) {
 void TreePrinter::doPrint(const VariableDeclaration *node) {
     printComment(node);
 
-    out_ << *node->type() << ' ';
-    print(node->variableIdentifier());
+    const PointerType *pointerType = node->type()->as<PointerType>();
+    const ArrayType *arrayType =
+        pointerType && pointerType->pointerKind() == PointerType::ARRAY_PTR ?
+            static_cast<const ArrayType *>(pointerType) : nullptr;
+    if (arrayType) {
+        out_ << *arrayType->elementType() << ' ';
+        print(node->variableIdentifier());
+        out_ << '[' << arrayType->length() << ']';
+    } else {
+        out_ << *node->type() << ' ';
+        print(node->variableIdentifier());
+    }
     if (node->initialValue()) {
         out_ << " = ";
         print(node->initialValue());
@@ -628,6 +643,9 @@ void TreePrinter::doPrint(const Statement *node) {
         case Statement::DO_WHILE:
             doPrint(node->as<DoWhile>());
             break;
+        case Statement::FOR:
+            doPrint(node->as<For>());
+            break;
         case Statement::EXPRESSION_STATEMENT:
             doPrint(node->as<ExpressionStatement>());
             break;
@@ -719,6 +737,17 @@ void TreePrinter::doPrint(const DoWhile *node) {
 void TreePrinter::doPrint(const ExpressionStatement *node) {
     print(node->expression());
     out_ << ';';
+}
+
+void TreePrinter::doPrint(const For *node) {
+    out_ << "for (";
+    print(node->initializer());
+    out_ << "; ";
+    print(node->condition());
+    out_ << "; ";
+    print(node->increment());
+    out_ << ") ";
+    printNestedStatement(node->body());
 }
 
 void TreePrinter::doPrint(const Goto *node) {

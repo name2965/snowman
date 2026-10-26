@@ -26,6 +26,7 @@
 
 #include <QTextStream>
 
+#include <nc/common/Foreach.h>
 #include <nc/common/Unreachable.h>
 #include <nc/common/make_unique.h>
 
@@ -131,6 +132,30 @@ std::unique_ptr<Statement> RememberReachingDefinitions::doClone() const {
 
 void RememberReachingDefinitions::print(QTextStream &out) const {
     out << "remember_reaching_definitions" << endl;
+}
+
+StackMemoryInvalidation::StackMemoryInvalidation(std::vector<std::unique_ptr<Term>> pointerCandidates):
+    Statement(STACK_MEMORY_INVALIDATION), pointerCandidates_(std::move(pointerCandidates))
+{
+    foreach (auto &term, pointerCandidates_) {
+        assert(term != nullptr);
+        term->setStatement(this);
+    }
+}
+
+std::unique_ptr<Statement> StackMemoryInvalidation::doClone() const {
+    std::vector<std::unique_ptr<Term>> pointerCandidates;
+    pointerCandidates.reserve(pointerCandidates_.size());
+
+    foreach (const auto &term, pointerCandidates_) {
+        pointerCandidates.push_back(term->clone());
+    }
+
+    return std::make_unique<StackMemoryInvalidation>(std::move(pointerCandidates));
+}
+
+void StackMemoryInvalidation::print(QTextStream &out) const {
+    out << "invalidate_stack_memory" << endl;
 }
 
 } // namespace ir

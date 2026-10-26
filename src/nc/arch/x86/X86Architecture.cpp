@@ -41,6 +41,7 @@ X86Architecture::X86Architecture(Mode mode) {
         mBasePointer  = X86Registers::ebp();
         addCallingConvention(std::make_unique<Cdecl32CallingConvention>(this));
         addCallingConvention(std::make_unique<Stdcall32CallingConvention>(this));
+        addCallingConvention(std::make_unique<Thiscall32CallingConvention>(this));
         break;
     case LONG_MODE:
         setName("x86-64");

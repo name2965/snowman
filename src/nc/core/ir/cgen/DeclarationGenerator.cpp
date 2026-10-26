@@ -25,6 +25,7 @@
 #include "DeclarationGenerator.h"
 
 #include <nc/common/Foreach.h>
+#include <nc/common/Unreachable.h>
 #include <nc/common/make_unique.h>
 
 #include <nc/core/image/Image.h>
@@ -45,6 +46,23 @@ namespace core {
 namespace ir {
 namespace cgen {
 
+const likec::Type *DeclarationGenerator::makePresentationType(
+        const calling::TypeDescription &description) {
+    switch (description.kind()) {
+        case calling::TypeDescription::VOID:
+            return tree().makeVoidType();
+        case calling::TypeDescription::INTEGER:
+            return tree().makeIntegerType(
+                description.size(), description.isUnsigned(), description.displayName());
+        case calling::TypeDescription::POINTER:
+            return tree().makePointerType(
+                description.size(), tree().makeVoidType(), description.displayName());
+    }
+
+    unreachable();
+    return tree().makeErroneousType();
+}
+
 DeclarationGenerator::DeclarationGenerator(CodeGenerator &parent, const calling::CalleeId &calleeId, const calling::FunctionSignature *signature):
     parent_(parent),
     calleeId_(calleeId),
@@ -57,11 +75,17 @@ DeclarationGenerator::DeclarationGenerator(CodeGenerator &parent, const calling:
 void DeclarationGenerator::setDeclaration(likec::FunctionDeclaration *declaration) {
     assert(!declaration_); 
     declaration_ = declaration;
+    if (signature()->prototype()) {
+        declaration_->setCallingConvention(signature()->prototype()->callingConvention());
+    }
     parent().setFunctionDeclaration(signature_, declaration);
 }
 
 std::unique_ptr<likec::FunctionDeclaration> DeclarationGenerator::createDeclaration() {
     auto nameAndComment = parent().nameGenerator().getFunctionName(calleeId_);
+    if (signature()->prototype() && !signature()->prototype()->preferredName().isEmpty()) {
+        nameAndComment.name() = signature()->prototype()->preferredName();
+    }
 
     auto functionDeclaration = std::make_unique<likec::FunctionDeclaration>(tree(),
         std::move(nameAndComment.name()), makeReturnType(), signature()->variadic());
@@ -77,6 +101,9 @@ std::unique_ptr<likec::FunctionDeclaration> DeclarationGenerator::createDeclarat
 }
 
 const likec::Type *DeclarationGenerator::makeReturnType() {
+    if (signature()->prototype()) {
+        return makePresentationType(signature()->prototype()->returnType());
+    }
     if (signature()->returnValue()) {
         return parent().makeType(parent().types().getType(signature()->returnValue().get()));
     }
@@ -84,10 +111,20 @@ const likec::Type *DeclarationGenerator::makeReturnType() {
 }
 
 likec::ArgumentDeclaration *DeclarationGenerator::makeArgumentDeclaration(const Term *term) {
-    auto nameAndComment = parent().nameGenerator().getArgumentName(term, declaration()->arguments().size() + 1);
+    const std::size_t index = declaration()->arguments().size();
+    auto nameAndComment = parent().nameGenerator().getArgumentName(term, index + 1);
+    const likec::Type *type = parent().makeType(parent().types().getType(term));
+
+    if (signature()->prototype() && index < signature()->prototype()->parameters().size()) {
+        const auto &parameter = signature()->prototype()->parameters()[index];
+        if (!parameter.name().isEmpty()) {
+            nameAndComment.name() = parameter.name();
+        }
+        type = makePresentationType(parameter.type());
+    }
 
     auto argumentDeclaration = std::make_unique<likec::ArgumentDeclaration>(
-        std::move(nameAndComment.name()), parent().makeType(parent().types().getType(term)));
+        std::move(nameAndComment.name()), type);
     argumentDeclaration->setComment(std::move(nameAndComment.comment()));
 
     auto result = argumentDeclaration.get();

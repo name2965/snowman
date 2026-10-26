@@ -138,6 +138,7 @@ set(SOURCES
     core/ir/calling/Convention.h
     core/ir/calling/EntryHook.cpp
     core/ir/calling/EntryHook.h
+    core/ir/calling/FunctionPrototype.h
     core/ir/calling/FunctionSignature.h
     core/ir/calling/Hooks.cpp
     core/ir/calling/Hooks.h
@@ -235,6 +236,8 @@ set(SOURCES
     core/likec/Expression.h
     core/likec/ExpressionStatement.cpp
     core/likec/ExpressionStatement.h
+    core/likec/For.cpp
+    core/likec/For.h
     core/likec/FunctionDeclaration.cpp
     core/likec/FunctionDeclaration.h
     core/likec/FunctionDefinition.cpp

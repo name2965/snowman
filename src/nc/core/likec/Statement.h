@@ -54,6 +54,7 @@ public:
         BREAK,                          ///< Break.
         CONTINUE,                       ///< Continue.
         DO_WHILE,                       ///< Do-While loop.
+        FOR,                            ///< For loop.
         EXPRESSION_STATEMENT,           ///< Expression statement.
         GOTO,                           ///< Goto.
         IF,                             ///< Conditional statement.
