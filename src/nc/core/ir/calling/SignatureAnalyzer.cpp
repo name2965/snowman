@@ -13,6 +13,7 @@
 #include <nc/common/Foreach.h>
 #include <nc/common/make_unique.h>
 
+#include <nc/core/arch/Instruction.h>
 #include <nc/core/ir/BasicBlock.h>
 #include <nc/core/ir/Function.h>
 #include <nc/core/ir/Functions.h>
@@ -26,6 +27,7 @@
 #include <nc/core/ir/liveness/Livenesses.h>
 
 #include "CallHook.h"
+#include "CallFrameAnalyzer.h"
 #include "Convention.h"
 #include "Conventions.h"
 #include "EntryHook.h"
@@ -46,6 +48,21 @@ SignatureAnalyzer::SignatureAnalyzer(Signatures &signatures, const dflow::Datafl
 }
 
 SignatureAnalyzer::~SignatureAnalyzer() {}
+
+CalleeId SignatureAnalyzer::getAnalysisCalleeId(
+        const Call *call, const dflow::Dataflow &dataflow) const {
+    assert(call != nullptr);
+    if (call->instruction()) {
+        const CalleeId callSiteId(
+            CallAddress(call->instruction()->addr()));
+        if (hooks_.conventions().getConvention(callSiteId) &&
+            !hooks_.conventions().isFallbackConvention(callSiteId))
+        {
+            return callSiteId;
+        }
+    }
+    return getCalleeId(call, dataflow);
+}
 
 void SignatureAnalyzer::analyze() {
     computeMappings();
@@ -71,12 +88,19 @@ void SignatureAnalyzer::computeMappings() {
         foreach (auto basicBlock, function->basicBlocks()) {
             foreach (auto statement, basicBlock->statements()) {
                 if (auto call = statement->asCall()) {
-                    auto id = getCalleeId(call, dataflow);
+                    const CalleeId id =
+                        getAnalysisCalleeId(call, dataflow);
 
                     id2referrers_[id].calls.push_back(call);
                     function2calls_[function].push_back(call);
 
-                    foreach (const auto &locationAndTerm, hooks_.getCallHook(call)->speculativeReturnValueTerms()) {
+                    const CallHook *callHook = hooks_.getCallHook(call);
+                    foreach (const Term *term,
+                             callHook->observedArgumentTerms()) {
+                        function2observedCallArgumentTerms_[function].insert(
+                            term);
+                    }
+                    foreach (const auto &locationAndTerm, callHook->speculativeReturnValueTerms()) {
                         speculativeReturnValueTerm2calleeId_[locationAndTerm.second] = id;
                     }
                 } else if (auto jump = statement->asJump()) {
@@ -86,7 +110,14 @@ void SignatureAnalyzer::computeMappings() {
                         id2referrers_[id].returns.push_back(jump);
                         function2returns_[function].push_back(jump);
 
-                        foreach (const auto &locationAndTerm, hooks_.getReturnHook(jump)->speculativeReturnValueTerms()) {
+                        const ReturnHook *returnHook =
+                            hooks_.getReturnHook(jump);
+                        foreach (const Term *term,
+                                 returnHook->observedReturnValueTerms()) {
+                            function2observedReturnValueTerms_[function].insert(
+                                term);
+                        }
+                        foreach (const auto &locationAndTerm, returnHook->speculativeReturnValueTerms()) {
                             speculativeReturnValueTerm2calleeId_[locationAndTerm.second] = id;
                         }
                     }
@@ -145,6 +176,95 @@ bool isHomogeneous(const Container &container) {
     return true;
 }
 
+boost::optional<std::size_t> getVariadicFixedArgumentCount(
+        const Signatures &signatures, const Call *call) {
+    const auto &signature = signatures.getSignature(
+        call, SignatureSource::EXTERNAL);
+    const auto &prototype = signature ? signature->prototype() :
+                                        std::shared_ptr<const FunctionPrototype>();
+    if (!prototype || !prototype->variadic() ||
+        signature->arguments().size() < prototype->parameters().size())
+    {
+        return boost::none;
+    }
+    return prototype->parameters().size();
+}
+
+bool makeScalarFixedArgumentPrefix(
+        const Convention &convention, std::size_t fixedArgumentCount,
+        std::vector<MemoryLocation> &result) {
+    result.clear();
+    result.reserve(fixedArgumentCount);
+
+    const auto &groups = convention.argumentGroups();
+    const std::vector<MemoryLocation> *registerArguments =
+        groups.empty() ? nullptr : &groups.front();
+    const std::size_t registerArgumentCount =
+        registerArguments ? registerArguments->size() : 0;
+    const std::size_t fixedRegisterCount =
+        std::min(fixedArgumentCount, registerArgumentCount);
+    for (std::size_t index = 0; index < fixedRegisterCount; ++index) {
+        result.push_back((*registerArguments)[index]);
+    }
+
+    const std::size_t fixedStackCount =
+        fixedArgumentCount - fixedRegisterCount;
+    if (fixedStackCount == 0) {
+        return true;
+    }
+
+    const BitSize firstOffset = convention.firstArgumentOffset();
+    const BitSize alignment = convention.argumentAlignment();
+    if (firstOffset < 0 || alignment <= 0 ||
+        static_cast<ConstantValue>(fixedStackCount - 1) >
+            static_cast<ConstantValue>(
+                ((std::numeric_limits<BitSize>::max)() - firstOffset) /
+                alignment))
+    {
+        result.clear();
+        return false;
+    }
+    for (std::size_t index = 0; index < fixedStackCount; ++index) {
+        result.push_back(MemoryLocation(
+            MemoryDomain::STACK,
+            firstOffset + static_cast<BitSize>(index) * alignment,
+            alignment));
+    }
+    return true;
+}
+
+std::vector<MemoryLocation> sortVariadicTailArguments(
+        const Convention &convention,
+        std::vector<MemoryLocation> arguments,
+        const boost::optional<std::size_t> &fixedArgumentCount) {
+    if (!fixedArgumentCount) {
+        return convention.sortArguments(std::move(arguments));
+    }
+
+    /* sortArguments intentionally rejects a suffix after a gap. An external
+     * variadic prototype supplies exactly the missing fixed prefix, while the
+     * inferred snapshot contains only the tail. Add ABI-slot placeholders for
+     * sorting, then remove them from the inferred result. Schema-v1 external
+     * prototypes contain only scalar integer/pointer parameters, so the first
+     * convention group and one aligned stack slot per remaining parameter are
+     * the complete fixed-prefix layout. */
+    std::vector<MemoryLocation> prefix;
+    if (!makeScalarFixedArgumentPrefix(
+            convention, *fixedArgumentCount, prefix))
+    {
+        return convention.sortArguments(std::move(arguments));
+    }
+    arguments.insert(arguments.end(), prefix.begin(), prefix.end());
+    arguments = convention.sortArguments(std::move(arguments));
+    arguments.erase(
+        std::remove_if(arguments.begin(), arguments.end(),
+            [&](const MemoryLocation &location) {
+                return nc::contains(prefix, location);
+            }),
+        arguments.end());
+    return arguments;
+}
+
 } // anonymous namespace
 
 bool SignatureAnalyzer::computeArguments(const CalleeId &calleeId) {
@@ -180,10 +300,16 @@ bool SignatureAnalyzer::computeArguments(const CalleeId &calleeId) {
         }
     }
 
-    auto getArgumentLocation = [](const Placement &placement) -> MemoryLocation {
+    auto getArgumentLocation = [&](const Placement &placement) -> MemoryLocation {
         if (placement.inFunctions) {
             return placement.inFunctions;
-        } else if (!placement.inCalls.empty() && isHomogeneous(placement.inCalls | boost::adaptors::map_values)) {
+        } else if (!placement.inCalls.empty() &&
+                   placement.inCalls.size() == referrers.calls.size() &&
+                   isHomogeneous(
+                       placement.inCalls | boost::adaptors::map_values)) {
+            /* Call-site evidence is a common formal only when every known
+             * call supplies the slot.  Otherwise a long variadic call would
+             * promote its trailing slots into shorter calls. */
             return placement.inCalls.begin()->second;
         } else {
             return MemoryLocation();
@@ -207,12 +333,34 @@ bool SignatureAnalyzer::computeArguments(const CalleeId &calleeId) {
         }
     }
 
-    arguments = convention->sortArguments(std::move(arguments));
+    boost::optional<std::size_t> commonVariadicFixedArgumentCount;
+    bool commonVariadicPrefix = !referrers.calls.empty();
+    foreach (const Call *call, referrers.calls) {
+        const auto fixedArgumentCount =
+            getVariadicFixedArgumentCount(signatures_, call);
+        if (!fixedArgumentCount ||
+            (commonVariadicFixedArgumentCount &&
+             *commonVariadicFixedArgumentCount != *fixedArgumentCount))
+        {
+            commonVariadicPrefix = false;
+            break;
+        }
+        commonVariadicFixedArgumentCount = fixedArgumentCount;
+    }
+    if (!commonVariadicPrefix) {
+        commonVariadicFixedArgumentCount = boost::none;
+    }
+    arguments = sortVariadicTailArguments(
+        *convention, std::move(arguments),
+        commonVariadicFixedArgumentCount);
 
     foreach (auto &callAndLocations, extraArguments) {
         auto &callArguments = callAndLocations.second;
         callArguments.insert(callArguments.end(), arguments.begin(), arguments.end());
-        callArguments = convention->sortArguments(std::move(callArguments));
+        callArguments = sortVariadicTailArguments(
+            *convention, std::move(callArguments),
+            getVariadicFixedArgumentCount(
+                signatures_, callAndLocations.first));
         callArguments.erase(
             std::remove_if(callArguments.begin(), callArguments.end(),
                 [&](const MemoryLocation &location) {
@@ -229,10 +377,24 @@ bool SignatureAnalyzer::computeArguments(const CalleeId &calleeId) {
         changed = true;
     }
 
-    foreach (auto &callAndLocations, extraArguments) {
-        auto &oldExtraArguments = call2extraArguments_[callAndLocations.first];
-        if (oldExtraArguments != callAndLocations.second) {
-            oldExtraArguments = std::move(callAndLocations.second);
+    /* Replace the per-call set as a whole. A location can move from
+     * call-specific to common during the fixpoint; retaining its old entry
+     * would make that stale argument survive in the final signature. */
+    foreach (const Call *call, referrers.calls) {
+        auto newArguments = extraArguments.find(call);
+        auto oldExtraArguments = call2extraArguments_.find(call);
+        if (newArguments == extraArguments.end() ||
+            newArguments->second.empty())
+        {
+            if (oldExtraArguments != call2extraArguments_.end()) {
+                call2extraArguments_.erase(oldExtraArguments);
+                changed = true;
+            }
+        } else if (oldExtraArguments == call2extraArguments_.end() ||
+                   oldExtraArguments->second != newArguments->second)
+        {
+            call2extraArguments_[call] =
+                std::move(newArguments->second);
             changed = true;
         }
     }
@@ -385,6 +547,36 @@ public:
     }
 };
 
+/** Removes an exact byte/bit interval from a set of disjoint candidate
+ * intervals.  A wide machine write can feed independent consumers through
+ * different subranges, so definition-wide used/unused booleans are not a
+ * sufficiently precise abstraction here. */
+void subtractLocation(
+        std::vector<MemoryLocation> &parts,
+        const MemoryLocation &excluded) {
+    std::vector<MemoryLocation> result;
+    result.reserve(parts.size() + 1);
+    foreach (const MemoryLocation &part, parts) {
+        const MemoryLocation overlap =
+            MemoryLocation::intersect(part, excluded);
+        if (!overlap) {
+            result.push_back(part);
+            continue;
+        }
+        if (part.addr() < overlap.addr()) {
+            result.push_back(MemoryLocation(
+                part.domain(), part.addr(),
+                overlap.addr() - part.addr()));
+        }
+        if (overlap.endAddr() < part.endAddr()) {
+            result.push_back(MemoryLocation(
+                part.domain(), overlap.endAddr(),
+                part.endAddr() - overlap.endAddr()));
+        }
+    }
+    parts.swap(result);
+}
+
 /**
  * Appends the parts of a read whose value can come from the function's
  * incoming machine state.
@@ -398,6 +590,7 @@ public:
 void appendIncomingParts(
         const MemoryLocation &location,
         const dflow::ReachingDefinitions &definitions,
+        const EntryHook *entryHook,
         std::vector<MemoryLocation> &result) {
     if (!location) {
         return;
@@ -417,7 +610,16 @@ void appendIncomingParts(
                 location.domain(), coveredUntil,
                 overlap.addr() - coveredUntil));
         }
-        if (chunk.hasIncomingDefinition()) {
+        bool hasObservedEntryDefinition = false;
+        if (entryHook) {
+            foreach (const Term *definition, chunk.definitions()) {
+                if (entryHook->isObservedArgumentTerm(definition)) {
+                    hasObservedEntryDefinition = true;
+                    break;
+                }
+            }
+        }
+        if (chunk.hasIncomingDefinition() || hasObservedEntryDefinition) {
             result.push_back(overlap);
         }
         if (overlap.endAddr() > coveredUntil) {
@@ -446,6 +648,11 @@ std::vector<MemoryLocation> SignatureAnalyzer::getUndefinedUses(const Function *
          * evidence. */
         return result;
     }
+    const EntryHook *entryHook = hooks_.getEntryHook(function);
+    const auto &observedCallArgumentTerms = nc::find(
+        function2observedCallArgumentTerms_, function);
+    const auto &observedReturnValueTerms = nc::find(
+        function2observedReturnValueTerms_, function);
 
     /*
      * If a term reads a memory location through which an argument
@@ -456,12 +663,21 @@ std::vector<MemoryLocation> SignatureAnalyzer::getUndefinedUses(const Function *
         auto term = termAndLocation.first;
         const auto &memoryLocation = termAndLocation.second;
 
-        if (memoryLocation && term->isRead()) {
+        /* Inference probes are not source-level consumers. In particular, a
+         * variadic-tail probe with no caller store must not become a formal
+         * input and then feed itself through the next pass's EntryHook. Fixed
+         * authoritative argument reads are deliberately absent from these
+         * registries and remain valid evidence. */
+        if (memoryLocation && term->isRead() &&
+            !nc::contains(observedCallArgumentTerms, term) &&
+            !nc::contains(observedReturnValueTerms, term))
+        {
             const MemoryLocation usedPart = intersect(term, memoryLocation);
             if (usedPart) {
                 appendIncomingParts(
                     usedPart,
                     dataflow.getDefinitions(term).projected(usedPart),
+                    entryHook,
                     result);
             }
         }
@@ -474,7 +690,8 @@ std::vector<MemoryLocation> SignatureAnalyzer::getUndefinedUses(const Function *
      * to be used for passing an argument.
      */
     foreach (auto call, nc::find(function2calls_, function)) {
-        const auto &callArguments = nc::find(id2arguments_, getCalleeId(call, dataflow));
+        const auto &callArguments = nc::find(
+            id2arguments_, getAnalysisCalleeId(call, dataflow));
         if (callArguments.empty()) {
             continue;
         }
@@ -492,7 +709,8 @@ std::vector<MemoryLocation> SignatureAnalyzer::getUndefinedUses(const Function *
             if (memoryLocation) {
                 appendIncomingParts(
                     memoryLocation,
-                    reachingDefinitions.projected(memoryLocation), result);
+                    reachingDefinitions.projected(memoryLocation), entryHook,
+                    result);
             }
         }
     }
@@ -519,12 +737,27 @@ std::vector<MemoryLocation> SignatureAnalyzer::getUnusedDefines(
     }
     auto &uses = *function2uses_.at(function);
     auto fixer = StackOffsetFixer(callHook->stackPointer(), dataflow);
+    const auto &observedCallArgumentTerms = nc::find(
+        function2observedCallArgumentTerms_, function);
 
-    const CalleeId calleeId = getCalleeId(call, dataflow);
+    const CalleeId calleeId = getAnalysisCalleeId(call, dataflow);
+    CalleeId callSiteId;
+    if (call->instruction()) {
+        callSiteId = CalleeId(CallAddress(call->instruction()->addr()));
+    }
+    const bool hasCallSiteConvention = callSiteId &&
+        hooks_.conventions().getConvention(callSiteId) &&
+        !hooks_.conventions().isFallbackConvention(callSiteId);
     boost::optional<ByteSize> stackArgumentsSize =
-        hooks_.conventions().getStackArgumentsSize(calleeId);
+        hasCallSiteConvention ?
+            hooks_.conventions().getStackArgumentsSize(callSiteId) :
+            hooks_.conventions().getStackArgumentsSize(calleeId);
 
-    const ReturnStackCleanup returnCleanup =
+    /* A resolved address can be shared by forwarded imports with distinct
+     * source contracts. Once a call-site convention exists, never combine it
+     * with the target body's stack effect or extent. */
+    ReturnStackCleanup returnCleanup = hasCallSiteConvention ?
+        hooks_.conventions().getReturnStackCleanup(callSiteId) :
         hooks_.conventions().getReturnStackCleanup(calleeId);
     if (returnCleanup.isExact() && convention->stackPointer() &&
         convention->firstArgumentOffset() ==
@@ -543,6 +776,37 @@ std::vector<MemoryLocation> SignatureAnalyzer::getUnusedDefines(
             }
         }
     }
+
+    /* A body-less external cdecl call has no callee-side reads from which to
+     * reconstruct stack parameters.  Accept caller evidence only when the
+     * call-frame analysis proves a complete push/restore extent.  This stays
+     * call-site-local: it does not relabel the target's calling convention or
+     * manufacture a callee cleanup effect. */
+    const auto &referrers = nc::find(id2referrers_, calleeId);
+    const bool implementationBodyUnavailable =
+        referrers.functions.empty() ||
+        hooks_.conventions().isExternalBodyOpaque(calleeId);
+    if (!stackArgumentsSize && returnCleanup.isUnknown() &&
+        implementationBodyUnavailable)
+    {
+        stackArgumentsSize =
+            CallFrameAnalyzer::inferCallerCleanupArgumentSize(
+                call, convention, callHook, dataflow);
+    }
+
+    /* An authoritative variadic prototype deliberately has no fixed total
+     * stack extent.  Once a tail slot has been observed, the external call
+     * hook carries that slot into the next semantic pass so it can be
+     * revalidated.  Remember only locations for which a real reaching
+     * definition still feeds that synthetic tail read.  This is a whitelist,
+     * not fresh argument evidence: it cannot manufacture a new stack
+     * argument, and a removed or overwritten store disappears immediately.
+     *
+     * Do not apply the rule to wholly inferred signatures.  Without an
+     * authoritative variadic fixed prefix, retaining every previous stack
+     * candidate would make a local dead store self-sustaining after the
+     * original frame-extent proof vanished. */
+    std::vector<MemoryLocation> revalidatedVariadicStackParts;
     foreach (const auto &chunk, dataflow.getDefinitions(callHook->snapshotStatement()).chunks()) {
         foreach (const Term *term, chunk.definitions()) {
             /* Do not mistake the caller's own return-address slot for a trailing argument. */
@@ -550,17 +814,72 @@ std::vector<MemoryLocation> SignatureAnalyzer::getUnusedDefines(
                 chunk.location().domain() == MemoryDomain::STACK &&
                 chunk.location().addr() == 0 &&
                 dflow::isReturnAddress(term, dataflow);
-            if (!isEntryReturnAddress && intersect(term, chunk.location())) {
-                bool used = false;
+            const MemoryLocation definedPart =
+                intersect(term, chunk.location());
+            if (!isEntryReturnAddress && definedPart) {
+                std::vector<MemoryLocation> unusedParts(1, definedPart);
+                std::vector<MemoryLocation> observedVariadicTailParts;
                 foreach (const auto &use, uses.getUses(term)) {
-                    if (intersect(use.term(), use.location())) {
-                        used = true;
-                        break;
+                    const MemoryLocation usedPart =
+                        MemoryLocation::intersect(
+                            definedPart, use.location());
+                    if (!usedPart) {
+                        continue;
+                    }
+                    const MemoryLocation effectiveUsedPart =
+                        intersect(use.term(), usedPart);
+                    if (!effectiveUsedPart) {
+                        continue;
+                    }
+                    if (callHook->isObservedArgumentTerm(use.term())) {
+                        if (callHook->argumentObservation() ==
+                                CallHook::ArgumentObservation::VARIADIC_TAIL)
+                        {
+                            observedVariadicTailParts.push_back(
+                                effectiveUsedPart);
+                        }
+                    } else if (nc::contains(
+                                   observedCallArgumentTerms,
+                                   use.term()))
+                    {
+                        /* This is an inference probe owned by a different call
+                         * site in the same function, not a real consumer. */
+                        continue;
+                    } else {
+                        /* A single wide definition can supply a fixed argument
+                         * and an independent variadic tail slot. Remove only
+                         * the subrange consumed by the non-tail use. */
+                        subtractLocation(
+                            unusedParts, effectiveUsedPart);
+                        if (unusedParts.empty()) {
+                            break;
+                        }
                     }
                 }
-                if (!used) {
-                    if (auto memoryLocation = fixer.removeStackOffset(chunk.location())) {
+                foreach (const MemoryLocation &unusedPart, unusedParts) {
+                    if (auto memoryLocation =
+                            fixer.removeStackOffset(unusedPart))
+                    {
                         result.push_back(memoryLocation);
+                        if (!observedVariadicTailParts.empty() &&
+                            memoryLocation.domain() == MemoryDomain::STACK)
+                        {
+                            foreach (const MemoryLocation &tailPart,
+                                     observedVariadicTailParts) {
+                                const MemoryLocation retainedTailPart =
+                                    MemoryLocation::intersect(
+                                        unusedPart, tailPart);
+                                const MemoryLocation normalizedTailPart =
+                                    retainedTailPart ?
+                                    fixer.removeStackOffset(
+                                        retainedTailPart) :
+                                    MemoryLocation();
+                                if (normalizedTailPart) {
+                                    revalidatedVariadicStackParts.push_back(
+                                        normalizedTailPart);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -590,24 +909,38 @@ std::vector<MemoryLocation> SignatureAnalyzer::getUnusedDefines(
             *stackArgumentsSize * CHAR_BIT;
         validStackExtent = true;
     }
-    result.erase(
-        std::remove_if(result.begin(), result.end(),
-            [&](const MemoryLocation &location) {
-                if (location.domain() != MemoryDomain::STACK) {
-                    return false;
-                }
-                if (!validStackExtent ||
-                    location.addr() < convention->firstArgumentOffset() ||
-                    location.addr() > stackArgumentsEnd)
-                {
-                    return true;
-                }
+    std::vector<MemoryLocation> boundedResult;
+    foreach (const MemoryLocation &location, result) {
+        if (location.domain() != MemoryDomain::STACK) {
+            boundedResult.push_back(location);
+            continue;
+        }
+        if (validStackExtent) {
+            if (location.addr() >= convention->firstArgumentOffset() &&
+                location.addr() <= stackArgumentsEnd &&
                 /* Avoid MemoryLocation::endAddr(): malformed/extreme input
                  * must not turn a signed overflow into an accepted extent. */
-                return location.size() >
-                    stackArgumentsEnd - location.addr();
-            }),
-        result.end());
+                location.size() <= stackArgumentsEnd - location.addr())
+            {
+                boundedResult.push_back(location);
+            }
+            continue;
+        }
+
+        /* Preserve exactly the part still consumed by a previously observed
+         * variadic tail. A wide reaching definition can span unrelated
+         * locals or fixed parameters, so retaining its whole chunk would
+         * turn partial historical evidence into new arguments. */
+        foreach (const MemoryLocation &tailPart,
+                 revalidatedVariadicStackParts) {
+            const MemoryLocation overlap =
+                MemoryLocation::intersect(location, tailPart);
+            if (overlap) {
+                boundedResult.push_back(overlap);
+            }
+        }
+    }
+    result.swap(boundedResult);
 
     return result;
 }
@@ -627,14 +960,33 @@ std::vector<MemoryLocation> SignatureAnalyzer::getUsedReturnValueLocations(const
     auto &uses = *function2uses_.at(function);
 
     foreach (const auto &locationAndTerm, callHook->speculativeReturnValueTerms()) {
-        MemoryLocation usedPart;
+        std::vector<MemoryLocation> usedParts;
 
         foreach (const auto &use, uses.getUses(locationAndTerm.second)) {
-            usedPart.merge(intersect(use.term(), use.location()));
+            const MemoryLocation usedPart = MemoryLocation::intersect(
+                locationAndTerm.first,
+                intersect(use.term(), use.location()));
+            if (usedPart) {
+                usedParts.push_back(usedPart);
+            }
         }
 
-        if (usedPart && usedPart.addr() == locationAndTerm.first.addr()) {
-            result.push_back(usedPart);
+        std::sort(usedParts.begin(), usedParts.end());
+        BitAddr contiguousEnd = locationAndTerm.first.addr();
+        foreach (const MemoryLocation &usedPart, usedParts) {
+            if (usedPart.endAddr() <= contiguousEnd) {
+                continue;
+            }
+            if (usedPart.addr() > contiguousEnd) {
+                break;
+            }
+            contiguousEnd = usedPart.endAddr();
+        }
+        if (contiguousEnd > locationAndTerm.first.addr()) {
+            result.push_back(MemoryLocation(
+                locationAndTerm.first.domain(),
+                locationAndTerm.first.addr(),
+                contiguousEnd - locationAndTerm.first.addr()));
         }
     }
 
@@ -654,31 +1006,70 @@ std::vector<MemoryLocation> SignatureAnalyzer::getUnusedReturnValueLocations(con
     }
     auto &uses = *function2uses_.at(function);
     auto &liveness = *livenesses_.at(function);
+    const auto &observedReturnValueTerms = nc::find(
+        function2observedReturnValueTerms_, function);
 
     foreach (const auto &locationAndTerm, returnHook->speculativeReturnValueTerms()) {
-        MemoryLocation unusedPart;
+        std::vector<MemoryLocation> unusedParts;
 
         foreach (const auto &chunk, dataflow.getDefinitions(locationAndTerm.second).chunks()) {
             foreach (const Term *definition, chunk.definitions()) {
                 if (auto intersection = intersect(definition, chunk.location())) {
-                    bool used = false;
+                    std::vector<MemoryLocation> definitionUnusedParts(
+                        1, intersection);
                     foreach (const auto &use, uses.getUses(definition)) {
-                        if (use.term() != locationAndTerm.second && intersect(use.term(), use.location()) &&
-                            liveness.isLive(use.term()))
+                        if (use.term() == locationAndTerm.second ||
+                            nc::contains(observedReturnValueTerms,
+                                         use.term()) ||
+                            !liveness.isLive(use.term()))
                         {
-                            used = true;
-                            break;
+                            continue;
+                        }
+                        const MemoryLocation usedPart =
+                            MemoryLocation::intersect(
+                                intersection, use.location());
+                        if (!usedPart) {
+                            continue;
+                        }
+                        const MemoryLocation liveUsedPart =
+                            intersect(use.term(), usedPart);
+                        if (liveUsedPart) {
+                            subtractLocation(
+                                definitionUnusedParts, liveUsedPart);
+                            if (definitionUnusedParts.empty()) {
+                                break;
+                            }
                         }
                     }
-                    if (!used) {
-                        unusedPart.merge(intersection);
-                    }
+                    unusedParts.insert(
+                        unusedParts.end(),
+                        definitionUnusedParts.begin(),
+                        definitionUnusedParts.end());
                 }
             }
         }
 
-        if (unusedPart && unusedPart.addr() == locationAndTerm.first.addr()) {
-            result.push_back(unusedPart);
+        /* Return values are a contiguous ABI prefix. Sort and coalesce only
+         * adjacent/overlapping unused pieces starting at the declared return
+         * location; never bridge a live middle subrange. */
+        std::sort(unusedParts.begin(), unusedParts.end());
+        BitAddr contiguousEnd = locationAndTerm.first.addr();
+        foreach (const MemoryLocation &unusedPart, unusedParts) {
+            const MemoryLocation candidate = MemoryLocation::intersect(
+                unusedPart, locationAndTerm.first);
+            if (!candidate || candidate.endAddr() <= contiguousEnd) {
+                continue;
+            }
+            if (candidate.addr() > contiguousEnd) {
+                break;
+            }
+            contiguousEnd = candidate.endAddr();
+        }
+        if (contiguousEnd > locationAndTerm.first.addr()) {
+            result.push_back(MemoryLocation(
+                locationAndTerm.first.domain(),
+                locationAndTerm.first.addr(),
+                contiguousEnd - locationAndTerm.first.addr()));
         }
     }
 
@@ -757,15 +1148,7 @@ void SignatureAnalyzer::computeSignatures(const CalleeId &calleeId) {
         functionSignature->setReturnValue(std::make_shared<MemoryLocationAccess>(returnValueLocation));
     }
 
-    if (calleeId.entryAddress()) {
-        signatures_.setSignature(*calleeId.entryAddress(), functionSignature);
-    }
-
     const auto &referrers = nc::find(id2referrers_, calleeId);
-    foreach (auto function, referrers.functions) {
-        signatures_.setSignature(function, functionSignature);
-    }
-
     foreach (auto call, referrers.calls) {
         auto callSignature = std::make_shared<CallSignature>();
 
@@ -778,8 +1161,32 @@ void SignatureAnalyzer::computeSignatures(const CalleeId &calleeId) {
         }
         callSignature->setReturnValue(functionSignature->returnValue());
         callSignature->setPrototype(functionSignature->prototype());
+        const auto callHook = hooks_.getCallHook(call);
+        if (callHook && callHook->argumentObservation() ==
+                CallHook::ArgumentObservation::VARIADIC_TAIL)
+        {
+            callSignature->setArgumentEvidence(
+                CallSignature::ArgumentEvidence::VARIADIC_TAIL);
+        }
 
-        signatures_.setSignature(call, callSignature);
+        signatures_.setSignature(
+            call, callSignature, SignatureSource::INFERRED);
+    }
+
+    /* Complete the shared function signature before publishing it. In
+     * particular, extra call-site arguments above can prove variadicity.
+     * Signatures keeps stable objects for semantically equal replacements,
+     * so mutating a discarded candidate after insertion would otherwise lose
+     * that fact and bypass its semantic revision counter. */
+    if (calleeId.entryAddress()) {
+        signatures_.setSignature(
+            *calleeId.entryAddress(), functionSignature,
+            SignatureSource::INFERRED);
+    }
+
+    foreach (auto function, referrers.functions) {
+        signatures_.setSignature(
+            function, functionSignature, SignatureSource::INFERRED);
     }
 }
 

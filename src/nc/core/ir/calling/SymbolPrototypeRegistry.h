@@ -23,6 +23,16 @@ namespace calling {
 
 class FunctionPrototype;
 
+/**
+ * Checks the target-width invariants required by the scalar prototype model.
+ *
+ * This is a trust boundary for programmatic providers as well as JSON-backed
+ * providers: integers must fit one ABI slot, pointers must match the target,
+ * and nested callback parameters must remain pointer-typed scalar contracts.
+ */
+bool isFunctionPrototypeTargetCompatible(
+    const FunctionPrototype &prototype, SmallBitSize targetBitness);
+
 /** Target properties used by external symbol prototype providers. */
 class SymbolPrototypeTarget {
     QString architecture_;

@@ -24,6 +24,8 @@
 
 #include "Image.h"
 
+#include <utility>
+
 #include <nc/common/Foreach.h>
 #include <nc/common/Range.h>
 #include <nc/common/make_unique.h>
@@ -44,7 +46,20 @@ Image::~Image() {}
 
 void Image::addSection(std::unique_ptr<Section> section) {
     assert(section != nullptr);
+    Section *pointer = section.get();
     sections_.push_back(std::move(section));
+    try {
+        mutableSectionView_.push_back(pointer);
+        try {
+            sectionView_.push_back(pointer);
+        } catch (...) {
+            mutableSectionView_.pop_back();
+            throw;
+        }
+    } catch (...) {
+        sections_.pop_back();
+        throw;
+    }
 }
 
 const Section *Image::getSectionContainingAddress(ByteAddr addr) const {
@@ -77,9 +92,26 @@ const Symbol *Image::addSymbol(std::unique_ptr<Symbol> symbol) {
     auto result = symbol.get();
 
     symbols_.push_back(std::move(symbol));
+    try {
+        symbolView_.push_back(result);
+    } catch (...) {
+        symbols_.pop_back();
+        throw;
+    }
 
     if (result->value()) {
-        value2symbol_[*result->value()] = result;
+        auto position = value2symbol_.find(*result->value());
+        if (position != value2symbol_.end()) {
+            position->second = result;
+        } else {
+            try {
+                value2symbol_.insert(std::make_pair(*result->value(), result));
+            } catch (...) {
+                symbolView_.pop_back();
+                symbols_.pop_back();
+                throw;
+            }
+        }
     }
 
     return result;
@@ -93,7 +125,25 @@ const Relocation *Image::addRelocation(std::unique_ptr<Relocation> relocation) {
     auto result = relocation.get();
 
     relocations_.push_back(std::move(relocation));
-    address2relocation_[result->address()] = result;
+    try {
+        relocationView_.push_back(result);
+    } catch (...) {
+        relocations_.pop_back();
+        throw;
+    }
+    auto position = address2relocation_.find(result->address());
+    if (position != address2relocation_.end()) {
+        position->second = result;
+    } else {
+        try {
+            address2relocation_.insert(
+                std::make_pair(result->address(), result));
+        } catch (...) {
+            relocationView_.pop_back();
+            relocations_.pop_back();
+            throw;
+        }
+    }
 
     return result;
 }

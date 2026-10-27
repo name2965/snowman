@@ -109,6 +109,9 @@ public:
             return hasIncomingDefinition_;
         }
 
+        /** Adds a value-less may-definition to this exact interval. */
+        void addUnknownDefinition() { hasUnknownDefinition_ = true; }
+
         /**
          * \param that Another object of the same type.
          *
@@ -130,6 +133,21 @@ private:
      */
     std::vector<Chunk> chunks_;
 
+    /*
+     * An extent-less write (for example through an escaped pointer) also
+     * applies to intervals which have not been observed yet.  Existing
+     * chunks receive an explicit unknown marker immediately; these category
+     * markers cover future gaps.  A later exact definition creates a chunk
+     * without the marker and therefore shadows earlier extent-less writes for
+     * precisely that range while leaving the rest of the domain conservative.
+     */
+    bool hasUnknownRegisterDefinition_ = false;
+    bool hasUnknownStackDefinition_ = false;
+    bool hasUnknownOtherMemoryDefinition_ = false;
+    bool hasIncomingRegisterDefinition_ = false;
+    bool hasIncomingStackDefinition_ = false;
+    bool hasIncomingOtherMemoryDefinition_ = false;
+
 public:
     /**
      * \return Pairs of memory locations and vectors of terms defining them.
@@ -141,12 +159,36 @@ public:
     /**
      * \return True if the list of pairs (chunks) is empty, false otherwise.
      */
-    bool empty() const { return chunks_.empty(); }
+    bool empty() const {
+        return chunks_.empty() &&
+            !hasUnknownRegisterDefinition_ &&
+            !hasUnknownStackDefinition_ &&
+            !hasUnknownOtherMemoryDefinition_ &&
+            !hasIncomingRegisterDefinition_ &&
+            !hasIncomingStackDefinition_ &&
+            !hasIncomingOtherMemoryDefinition_;
+    }
 
     /**
      * Clears the reaching definitions.
      */
-    void clear() { chunks_.clear(); }
+    void clear() {
+        chunks_.clear();
+        hasUnknownRegisterDefinition_ = false;
+        hasUnknownStackDefinition_ = false;
+        hasUnknownOtherMemoryDefinition_ = false;
+        hasIncomingRegisterDefinition_ = false;
+        hasIncomingStackDefinition_ = false;
+        hasIncomingOtherMemoryDefinition_ = false;
+    }
+
+    /**
+     * Adds an extent-less unknown may-definition for selected domain classes.
+     * The marker survives until exact later definitions shadow individual
+     * ranges, including ranges which are first observed after this call.
+     */
+    void addUnknownDomainDefinitions(
+        bool includeRegisters, bool includeStack, bool includeOtherMemory);
 
     /**
      * Adds a definition of memory location, removing all previous definitions of overlapping memory locations.
@@ -227,7 +269,21 @@ public:
      *
      * \param[in] those Reaching definitions.
      */
-    bool operator==(const ReachingDefinitions &those) const { return chunks_ == those.chunks_; }
+    bool operator==(const ReachingDefinitions &those) const {
+        return chunks_ == those.chunks_ &&
+            hasUnknownRegisterDefinition_ ==
+                those.hasUnknownRegisterDefinition_ &&
+            hasUnknownStackDefinition_ ==
+                those.hasUnknownStackDefinition_ &&
+            hasUnknownOtherMemoryDefinition_ ==
+                those.hasUnknownOtherMemoryDefinition_ &&
+            hasIncomingRegisterDefinition_ ==
+                those.hasIncomingRegisterDefinition_ &&
+            hasIncomingStackDefinition_ ==
+                those.hasIncomingStackDefinition_ &&
+            hasIncomingOtherMemoryDefinition_ ==
+                those.hasIncomingOtherMemoryDefinition_;
+    }
 
     /**
      * \return True, if these and given reaching definitions are different.
@@ -272,6 +328,12 @@ private:
      */
     void selfTest() const {
 #ifndef NDEBUG
+        assert(!hasIncomingRegisterDefinition_ ||
+               hasUnknownRegisterDefinition_);
+        assert(!hasIncomingStackDefinition_ ||
+               hasUnknownStackDefinition_);
+        assert(!hasIncomingOtherMemoryDefinition_ ||
+               hasUnknownOtherMemoryDefinition_);
         for (std::size_t i = 1; i < chunks_.size(); ++i) {
             assert(chunks_[i-1].location() < chunks_[i].location());
             if (chunks_[i-1].location().domain() ==
@@ -287,6 +349,12 @@ private:
     /** Combines another definition set, optionally treating it as a mutually
      * exclusive CFG alternative rather than a may-write overlay. */
     void mergeImpl(const ReachingDefinitions &those, bool alternative);
+
+    /** Whether a future unrepresented interval in this domain is unknown. */
+    bool hasUnknownDomainDefinition(Domain domain) const;
+
+    /** Whether an entry value is a default alternative in this domain. */
+    bool hasIncomingDomainDefinition(Domain domain) const;
 };
 
 } // namespace dflow

@@ -10,6 +10,7 @@
 #include <QCoreApplication>
 
 #include <boost/unordered_map.hpp>
+#include <boost/unordered_set.hpp>
 
 #include <nc/common/CancellationToken.h>
 #include <nc/common/LogToken.h>
@@ -29,6 +30,7 @@ class Jump;
 class Term;
 
 namespace dflow {
+    class Dataflow;
     class Dataflows;
     class Uses;
 }
@@ -73,6 +75,18 @@ class SignatureAnalyzer {
     /** Mapping from a function to the list of returns in it.*/
     boost::unordered_map<const Function *, std::vector<const Jump *>> function2returns_;
 
+    /** Function-wide synthetic call-argument reads. Keeping this registry
+     * wider than one CallHook prevents two call sites from treating each
+     * other's inference probes as real consumers. */
+    boost::unordered_map<const Function *,
+        boost::unordered_set<const Term *>>
+        function2observedCallArgumentTerms_;
+
+    /** Function-wide synthetic return-value reads from all return sites. */
+    boost::unordered_map<const Function *,
+        boost::unordered_set<const Term *>>
+        function2observedReturnValueTerms_;
+
     /** Mapping of terms that represent potential return values in the hooks to callee ids. */
     boost::unordered_map<const Term *, CalleeId> speculativeReturnValueTerm2calleeId_;
 
@@ -111,6 +125,14 @@ public:
     void analyze();
 
 private:
+    /**
+     * Returns the ABI identity used for signature inference at one call.
+     * A non-fallback CallAddress contract is stronger than a resolved target
+     * address and must remain isolated from calls using a different ABI.
+     */
+    CalleeId getAnalysisCalleeId(
+        const Call *call, const dflow::Dataflow &dataflow) const;
+
     /**
      * Precomputes various useful mappings.
      */

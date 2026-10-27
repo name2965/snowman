@@ -29,6 +29,7 @@
 
 #include <boost/optional.hpp>
 #include <boost/unordered_map.hpp>
+#include <boost/unordered_set.hpp>
 
 #include <nc/common/Range.h>
 #include <nc/common/Types.h>
@@ -53,6 +54,14 @@ class CallSignature;
  * Hooks installed at a call site.
  */
 class CallHook {
+public:
+    enum class ArgumentObservation {
+        NONE,
+        ALL,
+        VARIADIC_TAIL
+    };
+
+private:
     /** Term for tracking stack pointer. */
     const Term *stackPointer_;
 
@@ -68,6 +77,17 @@ class CallHook {
 
     /** Mapping from argument terms to their clones. */
     boost::unordered_map<const Term *, const Term *> argumentTerms_;
+
+    /**
+     * Hook terms for the non-fixed tail of a variadic signature. Signature
+     * inference ignores these synthetic reads when re-establishing which
+     * trailing locations are factual arguments, avoiding a self-sustaining
+     * or self-erasing fixed-point artifact.
+     */
+    boost::unordered_set<const Term *> observedArgumentTerms_;
+
+    /** Kind of argument evidence captured by snapshotStatement_. */
+    ArgumentObservation argumentObservation_;
 
     /** Mapping from return value terms to their clones. */
     boost::unordered_map<const Term *, const Term *> returnValueTerms_;
@@ -88,10 +108,13 @@ public:
      *             model a callee cleanup.
      * \param[in] unknownStackCleanup Whether incompatible return effects make
      *             the post-call stack pointer unknown.
+     * \param[in] signatureIsInferred Whether \p signature is reconstructed
+     *             evidence which must be revalidated on every analysis pass.
      */
     CallHook(const Convention *convention, const CallSignature *signature,
              const boost::optional<ByteSize> &stackCleanupSize,
-             bool unknownStackCleanup = false);
+             bool unknownStackCleanup = false,
+             bool signatureIsInferred = false);
 
     /**
      * Destructor.
@@ -107,8 +130,9 @@ public:
     const Patch &patch() const { return patch_; }
 
     /**
-     * \return Pointer to the statement used for snapshotting reaching definitions.
-     *         Will be nullptr if signature was given to the constructor.
+     * \return Pointer to the statement used for snapshotting reaching
+     *         definitions. It is retained for unknown signatures, inferred
+     *         signatures, and authoritative variadic tails.
      */
     const Statement *snapshotStatement() const { return snapshotStatement_; }
 
@@ -158,6 +182,21 @@ public:
      * \return Mapping from argument terms from the signature to their clones.
      */
     const boost::unordered_map<const Term *, const Term *> &argumentTerms() const { return argumentTerms_; }
+
+    /** Whether a synthetic argument read must be ignored as inference input. */
+    bool isObservedArgumentTerm(const Term *term) const {
+        return observedArgumentTerms_.find(term) !=
+            observedArgumentTerms_.end();
+    }
+
+    /** Synthetic argument reads owned by this hook. */
+    const boost::unordered_set<const Term *> &observedArgumentTerms() const {
+        return observedArgumentTerms_;
+    }
+
+    ArgumentObservation argumentObservation() const {
+        return argumentObservation_;
+    }
 
     /**
      * \return Mapping from return value terms from the signature to their clones.

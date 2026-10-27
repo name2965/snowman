@@ -38,7 +38,9 @@ namespace core {
 namespace ir {
 namespace calling {
 
-ReturnHook::ReturnHook(const Convention *convention, const FunctionSignature *signature) {
+ReturnHook::ReturnHook(const Convention *convention,
+                       const FunctionSignature *signature,
+                       bool signatureIsInferred) {
     assert(convention != nullptr);
 
     auto &statements = patch_.statements();
@@ -50,17 +52,40 @@ ReturnHook::ReturnHook(const Convention *convention, const FunctionSignature *si
         ));
     };
 
+    auto addSpeculativeReturnValueRead =
+        [&](const MemoryLocation &memoryLocation) {
+            auto term =
+                std::make_unique<MemoryLocationAccess>(memoryLocation);
+            const Term *termPointer = term.get();
+            speculativeReturnValueTerms_.push_back(
+                std::make_pair(memoryLocation, termPointer));
+            observedReturnValueTerms_.insert(termPointer);
+            addReturnValueRead(std::move(term));
+        };
+
     if (signature) {
+        if (signatureIsInferred) {
+            foreach (const auto &memoryLocation,
+                     convention->returnValueLocations()) {
+                addSpeculativeReturnValueRead(memoryLocation);
+            }
+        }
         if (signature->returnValue()) {
             auto clone = signature->returnValue()->clone();
-            returnValueTerms_[signature->returnValue().get()] = clone.get();
+            const Term *clonePointer = clone.get();
+            returnValueTerms_[signature->returnValue().get()] = clonePointer;
+            if (signatureIsInferred) {
+                observedReturnValueTerms_.insert(clonePointer);
+                /* Every ABI return location already has one speculative read
+                 * above. The mapped clone keeps existing consumers stable,
+                 * but adding it as a second vote would make the previous
+                 * inferred location self-confirming. */
+            }
             addReturnValueRead(std::move(clone));
         }
     } else {
         foreach (const auto &memoryLocation, convention->returnValueLocations()) {
-            auto term = std::make_unique<MemoryLocationAccess>(memoryLocation);
-            speculativeReturnValueTerms_.push_back(std::make_pair(memoryLocation, term.get()));
-            addReturnValueRead(std::move(term));
+            addSpeculativeReturnValueRead(memoryLocation);
         }
     }
 }

@@ -1,5 +1,6 @@
 #include <nc/config.h>
 #include <nc/common/Branding.h>
+#include <nc/common/CheckedAddress.h>
 #include <nc/common/make_unique.h>
 #include <nc/common/Types.h>
 #include <nc/core/image/ByteSource.h>
@@ -10,19 +11,28 @@
 #include <nc/core/mangling/DefaultDemangler.h>
 #include <nc/core/image/Section.h>
 #include <nc/core/image/Relocation.h>
+#include <nc/core/ir/calling/DeclarativeSymbolPrototypeProvider.h>
 #include <nc/gui/MainWindow.h>
 #include <nc/gui/Project.h>
 #include <nc/gui/InstructionsView.h>
 #include <nc/gui/CxxView.h>
 
 #include "SnowmanView.h"
+#include "pluginmain.h"
 #include <QVBoxLayout>
 #include <QPlainTextEdit>
 #include <QTreeView>
 #include <QApplication>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <algorithm>
 #include <climits>
 #include <cstdint>
+#include <exception>
 #include <limits>
+#include <memory>
+#include <string>
 #include <vector>
 #include <_scriptapi_module.h>
 #include <_scriptapi_memory.h>
@@ -33,6 +43,239 @@ using namespace Script;
 
 namespace
 {
+
+const qint64 maximumPrototypeDatabaseSize =
+    static_cast<qint64>(32) * 1024 * 1024;
+
+QString wideEnvironmentVariable(const wchar_t *name)
+{
+    /* qgetenv()/QFile::decodeName uses the process ANSI code page on
+     * Windows. Read the override with the wide API so paths outside that
+     * code page remain lossless. */
+    std::vector<wchar_t> buffer(256);
+    for (;;) {
+        const DWORD length = GetEnvironmentVariableW(
+            name, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (length == 0) {
+            return QString();
+        }
+        if (length < buffer.size()) {
+            return QString::fromWCharArray(
+                buffer.data(), static_cast<int>(length));
+        }
+        if (length > 32767) {
+            return QString();
+        }
+        /* On insufficient capacity the returned length includes the null
+         * terminator. The next call can therefore use it directly. */
+        buffer.resize(static_cast<std::size_t>(length));
+    }
+}
+
+QString pluginDirectory()
+{
+    /* Resolve relative to this module, not x64dbg's process working
+     * directory. One metadata document can contain both 32- and 64-bit
+     * targets, so the same filename works beside snowman.dp32 and dp64. */
+    static int moduleAnchor;
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&moduleAnchor), &module))
+    {
+        return QString();
+    }
+
+    std::vector<wchar_t> buffer(1024);
+    for (;;) {
+        const DWORD length = GetModuleFileNameW(
+            module, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (length == 0) {
+            return QString();
+        }
+        if (length < buffer.size()) {
+            return QFileInfo(QString::fromWCharArray(
+                buffer.data(), static_cast<int>(length))).absolutePath();
+        }
+        if (buffer.size() >= 32768) {
+            return QString();
+        }
+        buffer.resize(std::min<std::size_t>(
+            buffer.size() * 2, static_cast<std::size_t>(32768)));
+    }
+}
+
+std::shared_ptr<const
+    nc::core::ir::calling::DeclarativeSymbolPrototypeProvider>
+loadSymbolPrototypeProviderImpl()
+{
+    const QString configuredPath = wideEnvironmentVariable(
+        L"SNOWMAN_SYMBOL_PROTOTYPES");
+    const bool explicitlyConfigured = !configuredPath.isEmpty();
+    QString path;
+    if (explicitlyConfigured) {
+        if (!QDir::isAbsolutePath(configuredPath)) {
+            const QByteArray printablePath = QDir::toNativeSeparators(
+                configuredPath).toUtf8();
+            _plugin_logprintf(
+                "[Snowman] SNOWMAN_SYMBOL_PROTOTYPES must be an absolute "
+                "path; refusing relative metadata path: %s\n",
+                printablePath.constData());
+            return std::shared_ptr<const
+                nc::core::ir::calling::DeclarativeSymbolPrototypeProvider>();
+        }
+        path = configuredPath;
+    } else {
+        const QString directory = pluginDirectory();
+        if (!directory.isEmpty()) {
+            path = QDir(directory).filePath(
+                QLatin1String("snowman-symbol-prototypes.json"));
+        }
+    }
+
+    if (path.isEmpty()) {
+        _plugin_logprintf(
+            "[Snowman] Cannot locate the plugin directory; set "
+            "SNOWMAN_SYMBOL_PROTOTYPES to an absolute metadata path.\n");
+        return std::shared_ptr<const
+            nc::core::ir::calling::DeclarativeSymbolPrototypeProvider>();
+    }
+
+    QFile file(path);
+    if (!file.exists()) {
+        const QByteArray printablePath = QDir::toNativeSeparators(
+            path).toUtf8();
+        if (explicitlyConfigured) {
+            _plugin_logprintf(
+                "[Snowman] Symbol prototype database does not exist: %s\n",
+                printablePath.constData());
+        } else {
+            _plugin_logprintf(
+                "[Snowman] No symbol prototype database found at %s; "
+                "external ABI contracts will remain conservative.\n",
+                printablePath.constData());
+        }
+        return std::shared_ptr<const
+            nc::core::ir::calling::DeclarativeSymbolPrototypeProvider>();
+    }
+    if (!file.open(QIODevice::ReadOnly)) {
+        const QByteArray printablePath = QDir::toNativeSeparators(
+            path).toUtf8();
+        const QByteArray printableError = file.errorString().toUtf8();
+        _plugin_logprintf(
+            "[Snowman] Cannot read symbol prototype database %s: %s\n",
+            printablePath.constData(), printableError.constData());
+        return std::shared_ptr<const
+            nc::core::ir::calling::DeclarativeSymbolPrototypeProvider>();
+    }
+    const qint64 expectedSize = file.size();
+    if (expectedSize < 0 ||
+        expectedSize > maximumPrototypeDatabaseSize) {
+        const QByteArray printablePath = QDir::toNativeSeparators(
+            path).toUtf8();
+        _plugin_logprintf(
+            "[Snowman] Symbol prototype database exceeds the 32 MiB "
+            "safety limit: %s\n", printablePath.constData());
+        return std::shared_ptr<const
+            nc::core::ir::calling::DeclarativeSymbolPrototypeProvider>();
+    }
+
+    QByteArray contents = file.read(
+        maximumPrototypeDatabaseSize + 1);
+    if (contents.size() > maximumPrototypeDatabaseSize || !file.atEnd()) {
+        const QByteArray printablePath = QDir::toNativeSeparators(
+            path).toUtf8();
+        _plugin_logprintf(
+            "[Snowman] Symbol prototype database grew beyond the 32 MiB "
+            "safety limit while reading: %s\n", printablePath.constData());
+        return std::shared_ptr<const
+            nc::core::ir::calling::DeclarativeSymbolPrototypeProvider>();
+    }
+    if (contents.size() != expectedSize) {
+        const QByteArray printablePath = QDir::toNativeSeparators(
+            path).toUtf8();
+        _plugin_logprintf(
+            "[Snowman] Short read while loading symbol prototype database: "
+            "%s\n", printablePath.constData());
+        return std::shared_ptr<const
+            nc::core::ir::calling::DeclarativeSymbolPrototypeProvider>();
+    }
+
+    /* Keep one raw input representation during parsing. The declarative
+     * parser builds typed node storage, so retaining QByteArray as well would
+     * cause an avoidable peak-memory penalty in x32dbg. */
+    const std::string json(
+        contents.constData(), static_cast<std::size_t>(contents.size()));
+    contents.clear();
+    contents.squeeze();
+
+    QString error;
+    const auto provider = nc::core::ir::calling::
+        DeclarativeSymbolPrototypeProvider::fromJson(json, &error);
+    if (!provider) {
+        const QByteArray printablePath = QDir::toNativeSeparators(
+            path).toUtf8();
+        const QByteArray printableError = error.toUtf8();
+        _plugin_logprintf(
+            "[Snowman] Rejected symbol prototype database %s: %s\n",
+            printablePath.constData(), printableError.constData());
+        return provider;
+    }
+
+    const QByteArray printablePath = QDir::toNativeSeparators(path).toUtf8();
+    const QByteArray printableId = provider->id().toUtf8();
+    const nc::SmallBitSize targetBitness =
+        static_cast<nc::SmallBitSize>(sizeof(void *) * CHAR_BIT);
+    const nc::core::ir::calling::SymbolPrototypeTarget target(
+        QLatin1String("x86"), QLatin1String("windows"), targetBitness);
+    const std::size_t matchingRecords = provider->prototypeCount(target);
+    if (matchingRecords == 0) {
+        _plugin_logprintf(
+            "[Snowman] Symbol prototype provider '%s' from %s has no "
+            "records for x86/windows/%u; external ABI contracts will "
+            "remain conservative in this module.\n",
+            printableId.constData(), printablePath.constData(),
+            static_cast<unsigned int>(targetBitness));
+        return provider;
+    }
+    _plugin_logprintf(
+        "[Snowman] Loaded symbol prototype provider '%s' from %s with %u "
+        "records for x86/windows/%u.\n",
+        printableId.constData(), printablePath.constData(),
+        static_cast<unsigned int>(matchingRecords),
+        static_cast<unsigned int>(targetBitness));
+    return provider;
+}
+
+std::shared_ptr<const
+    nc::core::ir::calling::DeclarativeSymbolPrototypeProvider>
+loadSymbolPrototypeProvider()
+{
+    try {
+        return loadSymbolPrototypeProviderImpl();
+    } catch (const std::exception &exception) {
+        _plugin_logprintf(
+            "[Snowman] Cannot load the symbol prototype database: %s\n",
+            exception.what());
+    } catch (...) {
+        _plugin_logprintf(
+            "[Snowman] Cannot load the symbol prototype database: "
+            "unknown failure.\n");
+    }
+    return std::shared_ptr<const
+        nc::core::ir::calling::DeclarativeSymbolPrototypeProvider>();
+}
+
+std::shared_ptr<const
+    nc::core::ir::calling::DeclarativeSymbolPrototypeProvider>
+symbolPrototypeProvider()
+{
+    /* Parsing a full SDK catalog is intentionally process-wide and immutable.
+     * The provider itself is target-aware and safe to share across Projects. */
+    static const auto provider = loadSymbolPrototypeProvider();
+    return provider;
+}
 
 /*
  * Minimal PE structures used while parsing a module which is already mapped
@@ -49,6 +292,31 @@ struct PeImportDescriptor
 };
 
 static_assert(sizeof(PeImportDescriptor) == 20, "Unexpected PE import descriptor size");
+
+struct PeDelayImportDescriptor
+{
+    std::uint32_t attributes;
+    std::uint32_t name;
+    std::uint32_t moduleHandle;
+    std::uint32_t importAddressTable;
+    std::uint32_t importNameTable;
+    std::uint32_t boundImportAddressTable;
+    std::uint32_t unloadImportAddressTable;
+    std::uint32_t timeDateStamp;
+};
+
+static_assert(sizeof(PeDelayImportDescriptor) == 32,
+              "Unexpected PE delay-import descriptor size");
+
+struct PeAmd64RuntimeFunction
+{
+    std::uint32_t beginAddress;
+    std::uint32_t endAddress;
+    std::uint32_t unwindInfoAddress;
+};
+
+static_assert(sizeof(PeAmd64RuntimeFunction) == 12,
+              "Unexpected AMD64 runtime-function entry size");
 
 struct PeSectionHeader
 {
@@ -79,7 +347,8 @@ bool isRangeInsideModule(duint offset, duint length, duint moduleSize)
 
 bool readModuleBytes(duint moduleBase, duint moduleSize, duint offset, void* buffer, duint size)
 {
-    if (!isRangeInsideModule(offset, size, moduleSize))
+    if (!isRangeInsideModule(offset, size, moduleSize) ||
+        moduleBase > (std::numeric_limits<duint>::max)() - offset)
         return false;
 
     duint sizeRead = 0;
@@ -176,7 +445,8 @@ bool applyPeSectionAttributes(nc::core::image::Section* section,
 
 QString readModuleString(duint moduleBase, duint moduleSize, duint offset)
 {
-    if (!isRangeInsideModule(offset, 1, moduleSize))
+    if (!isRangeInsideModule(offset, 1, moduleSize) ||
+        moduleBase > (std::numeric_limits<duint>::max)() - offset)
         return QString();
 
     char buffer[1024];
@@ -432,6 +702,198 @@ void addImportThunks(nc::core::image::Image* image, duint moduleBase, duint modu
     }
 }
 
+void addStandardImportDirectoryRelocations(
+    nc::core::image::Image* image, duint moduleBase, duint moduleSize,
+    duint importRva, duint importSize, bool is64Bit,
+    duint& remainingThunkEntries)
+{
+    if (!isRangeInsideModule(
+            importRva, sizeof(PeImportDescriptor), moduleSize))
+        return;
+
+    /* Invalid or absent sizes occur in packed images; then use guarded
+     * null-termination within the mapped module. */
+    const duint descriptorsInModule =
+        (moduleSize - importRva) / sizeof(PeImportDescriptor);
+    duint descriptorCount = 0;
+    if (importSize >= sizeof(PeImportDescriptor) &&
+        isRangeInsideModule(importRva, importSize, moduleSize))
+        descriptorCount = importSize / sizeof(PeImportDescriptor);
+    else
+        descriptorCount = descriptorsInModule;
+    if (descriptorCount > 4096)
+        descriptorCount = 4096;
+
+    for (duint index = 0;
+         index < descriptorCount && remainingThunkEntries; ++index)
+    {
+        PeImportDescriptor descriptor = {};
+        const duint descriptorOffset =
+            importRva + index * sizeof(PeImportDescriptor);
+        if (!readModuleValue(
+                moduleBase, moduleSize, descriptorOffset, descriptor))
+            break;
+        if (!descriptor.originalFirstThunk && !descriptor.timeDateStamp &&
+            !descriptor.forwarderChain && !descriptor.name &&
+            !descriptor.firstThunk)
+            break;
+
+        if (is64Bit)
+            addImportThunks<std::uint64_t>(
+                image, moduleBase, moduleSize, descriptor,
+                remainingThunkEntries);
+        else
+            addImportThunks<std::uint32_t>(
+                image, moduleBase, moduleSize, descriptor,
+                remainingThunkEntries);
+    }
+}
+
+bool delayImportFieldToRva(std::uint32_t field, bool fieldsAreRvas,
+                           duint moduleBase, duint moduleSize,
+                           std::uint32_t& result)
+{
+    if (!field)
+    {
+        result = 0;
+        return true;
+    }
+
+    duint rva = field;
+    if (!fieldsAreRvas)
+    {
+        /* The legacy form stores 32-bit preferred virtual addresses.  Do
+         * not truncate a 64-bit image base in order to make them fit. */
+        if (static_cast<duint>(field) < moduleBase)
+            return false;
+        rva = static_cast<duint>(field) - moduleBase;
+    }
+    if (rva >= moduleSize ||
+        rva > (std::numeric_limits<std::uint32_t>::max)())
+        return false;
+
+    result = static_cast<std::uint32_t>(rva);
+    return true;
+}
+
+void addDelayImportDirectoryRelocations(
+    nc::core::image::Image* image, duint moduleBase, duint moduleSize,
+    duint delayRva, duint delaySize, bool is64Bit,
+    duint& remainingThunkEntries)
+{
+    if (!isRangeInsideModule(
+            delayRva, sizeof(PeDelayImportDescriptor), moduleSize))
+        return;
+
+    const duint descriptorsInModule =
+        (moduleSize - delayRva) / sizeof(PeDelayImportDescriptor);
+    duint descriptorCount = 0;
+    if (delaySize >= sizeof(PeDelayImportDescriptor) &&
+        isRangeInsideModule(delayRva, delaySize, moduleSize))
+        descriptorCount = delaySize / sizeof(PeDelayImportDescriptor);
+    else
+        descriptorCount = descriptorsInModule;
+    if (descriptorCount > 4096)
+        descriptorCount = 4096;
+
+    for (duint index = 0;
+         index < descriptorCount && remainingThunkEntries; ++index)
+    {
+        PeDelayImportDescriptor delay = {};
+        const duint descriptorOffset =
+            delayRva + index * sizeof(PeDelayImportDescriptor);
+        if (!readModuleValue(
+                moduleBase, moduleSize, descriptorOffset, delay))
+            break;
+        if (!delay.attributes && !delay.name && !delay.moduleHandle &&
+            !delay.importAddressTable && !delay.importNameTable &&
+            !delay.boundImportAddressTable &&
+            !delay.unloadImportAddressTable && !delay.timeDateStamp)
+            break;
+
+        /* Version one defines only the RVA flag. Unknown attribute bits can
+         * change the interpretation of every pointer, so fail closed. */
+        if (delay.attributes & ~std::uint32_t(1))
+            continue;
+        const bool fieldsAreRvas = (delay.attributes & 1) != 0;
+
+        PeImportDescriptor descriptor = {};
+        if (!delayImportFieldToRva(
+                delay.name, fieldsAreRvas, moduleBase, moduleSize,
+                descriptor.name) ||
+            !delayImportFieldToRva(
+                delay.importAddressTable, fieldsAreRvas,
+                moduleBase, moduleSize, descriptor.firstThunk) ||
+            !delayImportFieldToRva(
+                delay.importNameTable, fieldsAreRvas,
+                moduleBase, moduleSize, descriptor.originalFirstThunk))
+            continue;
+        if (!descriptor.name || !descriptor.firstThunk)
+            continue;
+
+        if (is64Bit)
+            addImportThunks<std::uint64_t>(
+                image, moduleBase, moduleSize, descriptor,
+                remainingThunkEntries);
+        else
+            addImportThunks<std::uint32_t>(
+                image, moduleBase, moduleSize, descriptor,
+                remainingThunkEntries);
+    }
+}
+
+void addAmd64RuntimeFunctionEntries(
+    nc::core::image::Image* image, duint moduleBase, duint moduleSize,
+    duint directoryRva, duint directorySize)
+{
+    if (!directoryRva ||
+        directorySize < sizeof(PeAmd64RuntimeFunction) ||
+        !isRangeInsideModule(directoryRva, directorySize, moduleSize))
+        return;
+
+    duint count = directorySize / sizeof(PeAmd64RuntimeFunction);
+    if (count > 1048576)
+        count = 1048576;
+    const duint maxAddress = (std::numeric_limits<duint>::max)();
+
+    for (duint index = 0; index < count; ++index)
+    {
+        PeAmd64RuntimeFunction entry = {};
+        const duint offset =
+            directoryRva + index * sizeof(PeAmd64RuntimeFunction);
+        if (!readModuleValue(
+                moduleBase, moduleSize, offset, entry))
+            break;
+        if (entry.beginAddress >= entry.endAddress ||
+            !entry.unwindInfoAddress ||
+            entry.unwindInfoAddress % 4 != 0 ||
+            !isRangeInsideModule(
+                entry.beginAddress,
+                static_cast<duint>(entry.endAddress) - entry.beginAddress,
+                moduleSize) ||
+            !isRangeInsideModule(
+                entry.unwindInfoAddress, 1, moduleSize) ||
+            moduleBase > maxAddress - entry.beginAddress ||
+            moduleBase > maxAddress - (entry.endAddress - 1))
+            continue;
+
+        const duint begin = moduleBase + entry.beginAddress;
+        const duint last = moduleBase + entry.endAddress - 1;
+        if (begin > static_cast<duint>(
+                (std::numeric_limits<nc::ByteAddr>::max)()) ||
+            last > static_cast<duint>(
+                (std::numeric_limits<nc::ByteAddr>::max)()))
+            continue;
+        const auto beginSection = image->getSectionContainingAddress(begin);
+        const auto endSection = image->getSectionContainingAddress(last);
+        if (!beginSection || !endSection ||
+            !beginSection->isExecutable() || !endSection->isExecutable())
+            continue;
+
+        image->addFunctionEntry(static_cast<nc::ByteAddr>(begin));
+    }
+}
+
 void addPeImportRelocations(nc::core::image::Image* image, duint moduleBase, duint moduleSize)
 {
     /* PE/COFF offsets and magic values, all relative to the mapped image. */
@@ -475,62 +937,79 @@ void addPeImportRelocations(nc::core::image::Image* image, duint moduleBase, dui
     else
         return;
 
-    /* The import directory is data-directory entry 1 (8 bytes per entry). */
+    /* Read both the ordinary import directory (entry 1) and the delay-import
+     * directory (entry 13). They produce the same relocation provenance for
+     * the core analyzer; only their descriptor encodings differ. */
     const duint importDirectoryOffset = dataDirectoriesOffset + 8;
-    if (optionalHeaderSize < importDirectoryOffset + 8)
-        return;
+    const duint exceptionDirectoryOffset = dataDirectoriesOffset + 3 * 8;
+    const duint delayImportDirectoryOffset = dataDirectoriesOffset + 13 * 8;
 
     const duint optionalHeaderOffset = ntOffset + optionalHeaderOffsetFromNt;
     if (!isRangeInsideModule(optionalHeaderOffset, optionalHeaderSize, moduleSize))
         return;
+    if (optionalHeaderSize <
+        numberOfDirectoriesOffset + sizeof(std::uint32_t))
+        return;
 
     std::uint32_t numberOfDirectories = 0;
-    std::uint32_t importRva32 = 0;
-    std::uint32_t importSize32 = 0;
     if (!readModuleValue(moduleBase, moduleSize, optionalHeaderOffset + numberOfDirectoriesOffset,
-                         numberOfDirectories) || numberOfDirectories <= 1 ||
-        !readModuleValue(moduleBase, moduleSize, optionalHeaderOffset + importDirectoryOffset, importRva32) ||
-        !readModuleValue(moduleBase, moduleSize,
-                         optionalHeaderOffset + importDirectoryOffset + sizeof(importRva32), importSize32) ||
-        !importRva32)
+                         numberOfDirectories))
         return;
-
-    const duint importRva = importRva32;
-    if (!isRangeInsideModule(importRva, sizeof(PeImportDescriptor), moduleSize))
-        return;
-
-    /* Invalid or absent sizes occur in packed images; then use guarded null-termination. */
-    const duint descriptorsInModule = (moduleSize - importRva) / sizeof(PeImportDescriptor);
-    const duint importSize = importSize32;
-    duint descriptorCount = 0;
-    if (importSize >= sizeof(PeImportDescriptor) &&
-        isRangeInsideModule(importRva, importSize, moduleSize))
-        descriptorCount = importSize / sizeof(PeImportDescriptor);
-    else
-        descriptorCount = descriptorsInModule;
-    if (descriptorCount > 4096)
-        descriptorCount = 4096;
 
     duint remainingThunkEntries = 65536;
-    for (duint index = 0; index < descriptorCount; ++index)
+    const bool is64Bit = optionalMagic == pe32PlusMagic;
+    if (is64Bit && numberOfDirectories > 3 &&
+        optionalHeaderSize >= exceptionDirectoryOffset + 8)
     {
-        PeImportDescriptor descriptor = {};
-        const duint descriptorOffset = importRva + index * sizeof(PeImportDescriptor);
-        if (!readModuleValue(moduleBase, moduleSize, descriptorOffset, descriptor))
-            break;
-        if (!descriptor.originalFirstThunk && !descriptor.timeDateStamp && !descriptor.forwarderChain &&
-            !descriptor.name && !descriptor.firstThunk)
-            break;
+        std::uint32_t exceptionRva = 0;
+        std::uint32_t exceptionSize = 0;
+        if (readModuleValue(
+                moduleBase, moduleSize,
+                optionalHeaderOffset + exceptionDirectoryOffset,
+                exceptionRva) &&
+            readModuleValue(
+                moduleBase, moduleSize,
+                optionalHeaderOffset + exceptionDirectoryOffset +
+                    sizeof(exceptionRva), exceptionSize))
+            addAmd64RuntimeFunctionEntries(
+                image, moduleBase, moduleSize,
+                exceptionRva, exceptionSize);
+    }
 
-        if (optionalMagic == pe32PlusMagic)
-            addImportThunks<std::uint64_t>(image, moduleBase, moduleSize, descriptor,
-                                           remainingThunkEntries);
-        else
-            addImportThunks<std::uint32_t>(image, moduleBase, moduleSize, descriptor,
-                                           remainingThunkEntries);
+    if (numberOfDirectories > 1 &&
+        optionalHeaderSize >= importDirectoryOffset + 8)
+    {
+        std::uint32_t importRva = 0;
+        std::uint32_t importSize = 0;
+        if (readModuleValue(
+                moduleBase, moduleSize,
+                optionalHeaderOffset + importDirectoryOffset,
+                importRva) &&
+            readModuleValue(
+                moduleBase, moduleSize,
+                optionalHeaderOffset + importDirectoryOffset +
+                    sizeof(importRva), importSize) && importRva)
+            addStandardImportDirectoryRelocations(
+                image, moduleBase, moduleSize, importRva, importSize,
+                is64Bit, remainingThunkEntries);
+    }
 
-        if (!remainingThunkEntries)
-            break;
+    if (remainingThunkEntries && numberOfDirectories > 13 &&
+        optionalHeaderSize >= delayImportDirectoryOffset + 8)
+    {
+        std::uint32_t delayRva = 0;
+        std::uint32_t delaySize = 0;
+        if (readModuleValue(
+                moduleBase, moduleSize,
+                optionalHeaderOffset + delayImportDirectoryOffset,
+                delayRva) &&
+            readModuleValue(
+                moduleBase, moduleSize,
+                optionalHeaderOffset + delayImportDirectoryOffset +
+                    sizeof(delayRva), delaySize) && delayRva)
+            addDelayImportDirectoryRelocations(
+                image, moduleBase, moduleSize, delayRva, delaySize,
+                is64Bit, remainingThunkEntries);
     }
 }
 
@@ -561,10 +1040,12 @@ auto getX64DbgFunctionAddress(const FunctionInfo& function, duint& address, long
 void addX64DbgFunctionSymbols(nc::core::image::Image* image, duint moduleBase,
                               duint moduleSize)
 {
-    const duint maxAddress = (std::numeric_limits<duint>::max)();
-    if (!moduleSize || moduleBase > maxAddress - moduleSize)
+    nc::CheckedByteRange moduleRange = {0, 0, 0};
+    if (!moduleSize ||
+        !nc::checkedByteRange(
+            static_cast<nc::ConstantValue>(moduleBase),
+            static_cast<nc::ConstantValue>(moduleSize), moduleRange))
         return;
-    const duint moduleEnd = moduleBase + moduleSize;
 
     BridgeList<Script::Function::FunctionInfo> functions;
     (void)Script::Function::GetList(&functions);
@@ -572,13 +1053,18 @@ void addX64DbgFunctionSymbols(nc::core::image::Image* image, duint moduleBase,
     for (int i = 0; i < functions.Count(); ++i)
     {
         duint address = 0;
+        nc::ByteAddr checkedAddress = 0;
         if (!getX64DbgFunctionAddress(functions[i], address, 0) ||
-            address < moduleBase || address >= moduleEnd)
+            !nc::checkedByteAddressAdd(
+                static_cast<nc::ConstantValue>(address), 0,
+                checkedAddress) ||
+            checkedAddress < moduleRange.begin ||
+            checkedAddress >= moduleRange.end)
             continue;
 
-        image->addFunctionEntry(static_cast<nc::ByteAddr>(address));
+        image->addFunctionEntry(checkedAddress);
 
-        const auto existing = image->getSymbol(address);
+        const auto existing = image->getSymbol(checkedAddress);
         if (existing && existing->type() == nc::core::image::SymbolType::FUNCTION)
             continue;
 
@@ -588,7 +1074,7 @@ void addX64DbgFunctionSymbols(nc::core::image::Image* image, duint moduleBase,
          */
         image->addSymbol(std::make_unique<nc::core::image::Symbol>(
             nc::core::image::SymbolType::FUNCTION,
-            existing ? existing->name() : QString(), address));
+            existing ? existing->name() : QString(), checkedAddress));
     }
 }
 
@@ -631,6 +1117,9 @@ static std::unique_ptr<nc::gui::Project> MakeProject(duint base, duint size)
     auto project = std::make_unique<nc::gui::Project>();
     auto image = project->image().get();
 
+    if (const auto provider = symbolPrototypeProvider())
+        project->addSymbolPrototypeProvider(provider);
+
     //set architecture
 #ifdef _WIN64
     image->platform().setArchitecture(QLatin1String("x86-64"));
@@ -647,18 +1136,36 @@ static std::unique_ptr<nc::gui::Project> MakeProject(duint base, duint size)
     //create sections
     auto success = false;
     auto moduleBase = Module::BaseFromAddr(base);
+    duint moduleSize = 0;
+    nc::CheckedByteRange moduleRange = {0, 0, 0};
+    bool hasCheckedModuleRange = false;
     if (moduleBase)
     {
-        const auto peSectionAttributes = readPeSectionAttributes(moduleBase, size);
+        moduleSize = Module::SizeFromAddr(moduleBase);
+        hasCheckedModuleRange = moduleSize && nc::checkedByteRange(
+            static_cast<nc::ConstantValue>(moduleBase),
+            static_cast<nc::ConstantValue>(moduleSize), moduleRange);
+    }
+    if (hasCheckedModuleRange)
+    {
+        const auto peSectionAttributes = readPeSectionAttributes(
+            moduleBase, moduleSize);
         BridgeList<Module::ModuleSectionInfo> sections;
         if (Module::SectionListFromAddr(moduleBase, &sections))
         {
-            success = true;
             for (auto i = 0; i < sections.Count(); i++)
             {
-                auto sectionAddr = sections[i].addr;
-                auto sectionSize = sections[i].size;
-                auto section = std::make_unique<nc::core::image::Section>(sections[i].name, sectionAddr, sectionSize);
+                nc::CheckedByteRange sectionRange = {0, 0, 0};
+                if (!sections[i].size ||
+                    !nc::checkedByteRange(
+                        static_cast<nc::ConstantValue>(sections[i].addr),
+                        static_cast<nc::ConstantValue>(sections[i].size),
+                        sectionRange) ||
+                    !nc::containsByteRange(moduleRange, sectionRange))
+                    continue;
+
+                auto section = std::make_unique<nc::core::image::Section>(
+                    sections[i].name, sectionRange.begin, sectionRange.size);
                 if (!applyPeSectionAttributes(section.get(), peSectionAttributes))
                 {
                     /* Keep permissive behavior for malformed or headerless modules. */
@@ -669,8 +1176,11 @@ static std::unique_ptr<nc::gui::Project> MakeProject(duint base, duint size)
                     section->setData(true);
                     section->setAllocated(true);
                 }
-                section->setExternalByteSource(std::make_unique<DbgByteSource>(sectionAddr, sectionAddr + sectionSize));
+                section->setExternalByteSource(
+                    std::make_unique<DbgByteSource>(
+                        sectionRange.begin, sectionRange.end));
                 image->addSection(std::move(section));
+                success = true;
             }
         }
     }
@@ -678,15 +1188,28 @@ static std::unique_ptr<nc::gui::Project> MakeProject(duint base, duint size)
     //add a made-up section in case there was an error with the module sections.
     if (!success)
     {
-        auto section = std::make_unique<nc::core::image::Section>(".text", base, size);
-        section->setReadable(true);
-        section->setWritable(true);
-        section->setExecutable(true);
-        section->setCode(true);
-        section->setData(true);
-        section->setAllocated(true);
-        section->setExternalByteSource(std::make_unique<DbgByteSource>(base, base + size));
-        image->addSection(std::move(section));
+        nc::CheckedByteRange fallbackRange = {0, 0, 0};
+        const bool hasFallbackRange = hasCheckedModuleRange ||
+            (size && nc::checkedByteRange(
+                static_cast<nc::ConstantValue>(base),
+                static_cast<nc::ConstantValue>(size), fallbackRange));
+        if (hasFallbackRange)
+        {
+            if (hasCheckedModuleRange)
+                fallbackRange = moduleRange;
+            auto section = std::make_unique<nc::core::image::Section>(
+                ".text", fallbackRange.begin, fallbackRange.size);
+            section->setReadable(true);
+            section->setWritable(true);
+            section->setExecutable(true);
+            section->setCode(true);
+            section->setData(true);
+            section->setAllocated(true);
+            section->setExternalByteSource(
+                std::make_unique<DbgByteSource>(
+                    fallbackRange.begin, fallbackRange.end));
+            image->addSection(std::move(section));
+        }
     }
 
     //add symbols
@@ -699,11 +1222,38 @@ static std::unique_ptr<nc::gui::Project> MakeProject(duint base, duint size)
             auto modBase = Module::BaseFromName(symbol.mod);
             if (!modBase)
                 continue;
-            auto va = modBase + symbol.rva;
+            const duint ownerSize = Module::SizeFromAddr(modBase);
+            nc::CheckedByteRange ownerRange = {0, 0, 0};
+            nc::ByteAddr va = 0;
+            if (!ownerSize ||
+                !nc::checkedByteRange(
+                    static_cast<nc::ConstantValue>(modBase),
+                    static_cast<nc::ConstantValue>(ownerSize),
+                    ownerRange) ||
+                !nc::checkedByteAddressAdd(
+                    static_cast<nc::ConstantValue>(modBase),
+                    static_cast<nc::ConstantValue>(symbol.rva), va) ||
+                va < ownerRange.begin || va >= ownerRange.end ||
+                Module::BaseFromAddr(static_cast<duint>(va)) != modBase)
+                continue;
+
             auto name = QString::fromUtf8(symbol.name);
             if(symbol.type == Symbol::Import) //IAT entry
             {
-                if (!name.isEmpty())
+                const nc::ConstantValue pointerSize =
+                    static_cast<nc::ConstantValue>(
+                        image->platform().architecture()->bitness() /
+                        CHAR_BIT);
+                nc::CheckedByteRange pointerRange = {0, 0, 0};
+                if (!name.isEmpty() && pointerSize &&
+                    hasCheckedModuleRange && modBase == moduleBase &&
+                    nc::checkedByteRange(
+                        static_cast<nc::ConstantValue>(va), pointerSize,
+                        pointerRange) &&
+                    nc::containsByteRange(ownerRange, pointerRange) &&
+                    nc::containsByteRange(moduleRange, pointerRange) &&
+                    Module::BaseFromAddr(static_cast<duint>(
+                        pointerRange.end - 1)) == modBase)
                     image->addRelocation(
                         std::make_unique<nc::core::image::Relocation>(
                             va,
@@ -715,7 +1265,7 @@ static std::unique_ptr<nc::gui::Project> MakeProject(duint base, duint size)
                                  * resolved target supplies that separately. */
                                 QString(),
                                 nc::core::image::ExternalNameOrigin::DEBUGGER)),
-                            image->platform().architecture()->bitness() / CHAR_BIT));
+                            static_cast<nc::ByteSize>(pointerSize)));
             }
             else //Function or Export
                 image->addSymbol(std::make_unique<nc::core::image::Symbol>(
@@ -726,25 +1276,56 @@ static std::unique_ptr<nc::gui::Project> MakeProject(duint base, duint size)
     }
 
     /* Preserve boundaries recovered by x64dbg even when no symbol exists. */
-    addX64DbgFunctionSymbols(image, base, size);
+    if (hasCheckedModuleRange)
+        addX64DbgFunctionSymbols(image, moduleBase, moduleSize);
 
-    /* Fill gaps left by Symbol::GetList from the mapped module's PE imports. */
-    addPeImportRelocations(image, base, size);
+    /* Fill gaps left by debugger metadata from PE imports, delay imports,
+     * and AMD64 unwind-backed function boundaries. */
+    if (hasCheckedModuleRange)
+        addPeImportRelocations(image, moduleBase, moduleSize);
 
     return project;
 }
 
 void SnowmanView::decompileAt(const SnowmanRange* ranges, duint count) const
 {
+    if (!ranges || !count)
+        return;
+
+    nc::CheckedByteRange firstRange = {0, 0, 0};
+    if (!nc::checkedInclusiveByteRange(
+            static_cast<nc::ConstantValue>(ranges[0].start),
+            static_cast<nc::ConstantValue>(ranges[0].end), firstRange))
+        return;
+
     nc::gui::MainWindow* mainWindow = (nc::gui::MainWindow*)mSnowmanMainWindow;
-    duint base = Module::BaseFromAddr(ranges->start);
+    duint base = Module::BaseFromAddr(
+        static_cast<duint>(firstRange.begin));
     duint size = Module::SizeFromAddr(base);
     if(!base || !size) //we are not inside a module
-        base = DbgMemFindBaseAddr(ranges->start, &size);
+        base = DbgMemFindBaseAddr(
+            static_cast<duint>(firstRange.begin), &size);
+
+    nc::CheckedByteRange backingRange = {0, 0, 0};
+    if (!size || !nc::checkedByteRange(
+            static_cast<nc::ConstantValue>(base),
+            static_cast<nc::ConstantValue>(size), backingRange))
+        return;
+
     mainWindow->open(MakeProject(base, size));
     mainWindow->project()->setName("Snowman");
     for(duint i = 0; i < count; i++)
-        mainWindow->project()->disassemble(mainWindow->project()->image().get(), ranges[i].start, ranges[i].end + 1);
+    {
+        nc::CheckedByteRange range = {0, 0, 0};
+        if (!nc::checkedInclusiveByteRange(
+                static_cast<nc::ConstantValue>(ranges[i].start),
+                static_cast<nc::ConstantValue>(ranges[i].end), range))
+            continue;
+        if (!nc::containsByteRange(backingRange, range))
+            continue;
+        mainWindow->project()->disassemble(
+            mainWindow->project()->image().get(), range.begin, range.end);
+    }
     mainWindow->project()->decompile();
 }
 

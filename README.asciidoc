@@ -14,6 +14,11 @@ Use
 Clone the https://github.com/yegord/snowman[repository], follow the link:doc/build.asciidoc[build instructions], run the decompiler.
 Alternatively, download the http://derevenets.com/[prebuilt packages], unpack, and run.
 
+The x64dbg module can consume a generated, versioned external-function
+catalog instead of guessing API signatures from names. See
+link:doc/symbol-prototype-schema.asciidoc[the symbol prototype schema and
+deployment instructions].
+
 Contribute
 ----------
 We are not done yet.

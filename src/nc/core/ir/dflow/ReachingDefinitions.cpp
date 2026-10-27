@@ -38,6 +38,77 @@ namespace core {
 namespace ir {
 namespace dflow {
 
+bool ReachingDefinitions::hasUnknownDomainDefinition(
+        Domain domain) const {
+    if (domain >= MemoryDomain::FIRST_REGISTER &&
+        domain <= MemoryDomain::LAST_REGISTER)
+    {
+        return hasUnknownRegisterDefinition_;
+    }
+    if (domain == MemoryDomain::STACK) {
+        return hasUnknownStackDefinition_;
+    }
+    return hasUnknownOtherMemoryDefinition_;
+}
+
+bool ReachingDefinitions::hasIncomingDomainDefinition(
+        Domain domain) const {
+    if (domain >= MemoryDomain::FIRST_REGISTER &&
+        domain <= MemoryDomain::LAST_REGISTER)
+    {
+        return hasIncomingRegisterDefinition_;
+    }
+    if (domain == MemoryDomain::STACK) {
+        return hasIncomingStackDefinition_;
+    }
+    return hasIncomingOtherMemoryDefinition_;
+}
+
+void ReachingDefinitions::addUnknownDomainDefinitions(
+        bool includeRegisters, bool includeStack,
+        bool includeOtherMemory) {
+    if (!includeRegisters && !includeStack && !includeOtherMemory) {
+        return;
+    }
+
+    foreach (Chunk &chunk, chunks_) {
+        const Domain domain = chunk.location().domain();
+        const bool isRegister =
+            domain >= MemoryDomain::FIRST_REGISTER &&
+            domain <= MemoryDomain::LAST_REGISTER;
+        if ((includeRegisters && isRegister) ||
+            (includeStack && domain == MemoryDomain::STACK) ||
+            (includeOtherMemory && !isRegister &&
+             domain != MemoryDomain::STACK))
+        {
+            chunk.addUnknownDefinition();
+        }
+    }
+
+    /* These are may-writes, not definite kills.  Before the first wildcard
+     * in a domain, every unrepresented interval denotes its function-entry
+     * value. Preserve that implicit alternative for intervals which are first
+     * observed later. Without this promotion, an extent-less call/asm write
+     * would incorrectly turn such a read into unknown-only. */
+    if (includeRegisters && !hasUnknownRegisterDefinition_) {
+        hasIncomingRegisterDefinition_ = true;
+    }
+    if (includeStack && !hasUnknownStackDefinition_) {
+        hasIncomingStackDefinition_ = true;
+    }
+    if (includeOtherMemory && !hasUnknownOtherMemoryDefinition_) {
+        hasIncomingOtherMemoryDefinition_ = true;
+    }
+
+    hasUnknownRegisterDefinition_ =
+        hasUnknownRegisterDefinition_ || includeRegisters;
+    hasUnknownStackDefinition_ =
+        hasUnknownStackDefinition_ || includeStack;
+    hasUnknownOtherMemoryDefinition_ =
+        hasUnknownOtherMemoryDefinition_ || includeOtherMemory;
+    selfTest();
+}
+
 void ReachingDefinitions::addDefinition(const MemoryLocation &mloc, const Term *term) {
     assert(mloc);
 
@@ -114,18 +185,47 @@ void ReachingDefinitions::project(const MemoryLocation &mloc, ReachingDefinition
 
     result.clear();
 
+    const bool hasDomainUnknown =
+        hasUnknownDomainDefinition(mloc.domain());
+    const bool hasDomainIncoming =
+        hasIncomingDomainDefinition(mloc.domain());
+    BitAddr coveredUntil = mloc.addr();
+
     foreach (const auto &chunk, chunks_) {
         if (chunk.location().domain() == mloc.domain()) {
             auto addr = std::max(chunk.location().addr(), mloc.addr());
             auto endAddr = std::min(chunk.location().endAddr(), mloc.endAddr());
 
             if (addr < endAddr) {
+                if (hasDomainUnknown && coveredUntil < addr) {
+                    result.chunks_.push_back(Chunk(
+                        MemoryLocation(
+                            mloc.domain(), coveredUntil,
+                            addr - coveredUntil),
+                        std::vector<const Term *>(), true,
+                        hasDomainIncoming));
+                }
                 result.chunks_.push_back(Chunk(
                     MemoryLocation(mloc.domain(), addr, endAddr - addr),
-                    chunk.definitions(), chunk.hasUnknownDefinition(),
-                    chunk.hasIncomingDefinition()));
+                    chunk.definitions(),
+                    chunk.hasUnknownDefinition() ||
+                        (hasDomainUnknown &&
+                         chunk.definitions().empty()),
+                    chunk.hasIncomingDefinition() ||
+                        (hasDomainIncoming &&
+                         chunk.definitions().empty())));
+                coveredUntil = endAddr;
             }
         }
+    }
+
+    if (hasDomainUnknown && coveredUntil < mloc.endAddr()) {
+        result.chunks_.push_back(Chunk(
+            MemoryLocation(
+                mloc.domain(), coveredUntil,
+                mloc.endAddr() - coveredUntil),
+            std::vector<const Term *>(), true,
+            hasDomainIncoming));
     }
 
     result.selfTest();
@@ -167,6 +267,45 @@ void ReachingDefinitions::mergeImpl(
     auto j = those.chunks_.begin();
     auto jend = those.chunks_.end();
 
+    auto unknownFromThis = [this](Domain domain) {
+        return hasUnknownDomainDefinition(domain);
+    };
+    auto unknownFromThose = [&those](Domain domain) {
+        return those.hasUnknownDomainDefinition(domain);
+    };
+    auto incomingFromThis = [this, alternative](Domain domain) {
+        return hasIncomingDomainDefinition(domain) ||
+            (alternative && !hasUnknownDomainDefinition(domain));
+    };
+    auto incomingFromThose = [&those, alternative](Domain domain) {
+        return those.hasIncomingDomainDefinition(domain) ||
+            (alternative && !those.hasUnknownDomainDefinition(domain));
+    };
+    auto effectiveUnknownFromThis =
+        [this](const Chunk &chunk, Domain domain) {
+            return chunk.hasUnknownDefinition() ||
+                (chunk.definitions().empty() &&
+                 hasUnknownDomainDefinition(domain));
+        };
+    auto effectiveUnknownFromThose =
+        [&those](const Chunk &chunk, Domain domain) {
+            return chunk.hasUnknownDefinition() ||
+                (chunk.definitions().empty() &&
+                 those.hasUnknownDomainDefinition(domain));
+        };
+    auto effectiveIncomingFromThis =
+        [this](const Chunk &chunk, Domain domain) {
+            return chunk.hasIncomingDefinition() ||
+                (chunk.definitions().empty() &&
+                 hasIncomingDomainDefinition(domain));
+        };
+    auto effectiveIncomingFromThose =
+        [&those](const Chunk &chunk, Domain domain) {
+            return chunk.hasIncomingDefinition() ||
+                (chunk.definitions().empty() &&
+                 those.hasIncomingDomainDefinition(domain));
+        };
+
     while (i != iend || j != jend) {
         auto a = i != iend ? i->location() : MemoryLocation();
         auto b = j != jend ? j->location() : MemoryLocation();
@@ -183,42 +322,70 @@ void ReachingDefinitions::mergeImpl(
 
         if (!b) {
             result.push_back(Chunk(
-                a, i->definitions(), i->hasUnknownDefinition(),
-                i->hasIncomingDefinition() || alternative));
+                a, i->definitions(),
+                effectiveUnknownFromThis(*i, a.domain()) ||
+                    unknownFromThose(a.domain()),
+                effectiveIncomingFromThis(*i, a.domain()) ||
+                    incomingFromThose(a.domain())));
             ++i;
         } else if (!a) {
             result.push_back(Chunk(
-                b, j->definitions(), j->hasUnknownDefinition(),
-                j->hasIncomingDefinition() || alternative));
+                b, j->definitions(),
+                effectiveUnknownFromThose(*j, b.domain()) ||
+                    unknownFromThis(b.domain()),
+                effectiveIncomingFromThose(*j, b.domain()) ||
+                    incomingFromThis(b.domain())));
             ++j;
         } else if (a.domain() < b.domain()) {
             result.push_back(Chunk(
-                a, i->definitions(), i->hasUnknownDefinition(),
-                i->hasIncomingDefinition() || alternative));
+                a, i->definitions(),
+                effectiveUnknownFromThis(*i, a.domain()) ||
+                    unknownFromThose(a.domain()),
+                effectiveIncomingFromThis(*i, a.domain()) ||
+                    incomingFromThose(a.domain())));
             ++i;
         } else if (b.domain() < a.domain()) {
             result.push_back(Chunk(
-                b, j->definitions(), j->hasUnknownDefinition(),
-                j->hasIncomingDefinition() || alternative));
+                b, j->definitions(),
+                effectiveUnknownFromThose(*j, b.domain()) ||
+                    unknownFromThis(b.domain()),
+                effectiveIncomingFromThose(*j, b.domain()) ||
+                    incomingFromThis(b.domain())));
             ++j;
         } else if (a.endAddr() <= b.addr()) {
             result.push_back(Chunk(
-                a, i->definitions(), i->hasUnknownDefinition(),
-                i->hasIncomingDefinition() || alternative));
+                a, i->definitions(),
+                effectiveUnknownFromThis(*i, a.domain()) ||
+                    unknownFromThose(a.domain()),
+                effectiveIncomingFromThis(*i, a.domain()) ||
+                    incomingFromThose(a.domain())));
             ++i;
         } else if (b.endAddr() <= a.addr()) {
             result.push_back(Chunk(
-                b, j->definitions(), j->hasUnknownDefinition(),
-                j->hasIncomingDefinition() || alternative));
+                b, j->definitions(),
+                effectiveUnknownFromThose(*j, b.domain()) ||
+                    unknownFromThis(b.domain()),
+                effectiveIncomingFromThose(*j, b.domain()) ||
+                    incomingFromThis(b.domain())));
             ++j;
         } else if (a.addr() < b.addr()) {
             result.push_back(Chunk(MemoryLocation(a.domain(), a.addr(), b.addr() - a.addr()),
-                                   i->definitions(), i->hasUnknownDefinition(),
-                                   i->hasIncomingDefinition() || alternative));
+                                   i->definitions(),
+                                   effectiveUnknownFromThis(
+                                       *i, a.domain()) ||
+                                       unknownFromThose(a.domain()),
+                                   effectiveIncomingFromThis(
+                                       *i, a.domain()) ||
+                                       incomingFromThose(a.domain())));
         } else if (b.addr() < a.addr()) {
             result.push_back(Chunk(MemoryLocation(b.domain(), b.addr(), a.addr() - b.addr()),
-                                   j->definitions(), j->hasUnknownDefinition(),
-                                   j->hasIncomingDefinition() || alternative));
+                                   j->definitions(),
+                                   effectiveUnknownFromThose(
+                                       *j, b.domain()) ||
+                                       unknownFromThis(b.domain()),
+                                   effectiveIncomingFromThose(
+                                       *j, b.domain()) ||
+                                       incomingFromThis(b.domain())));
         } else {
             std::vector<const Term *> merged;
             merged.reserve(i->definitions().size() + j->definitions().size());
@@ -226,34 +393,86 @@ void ReachingDefinitions::mergeImpl(
 
             if (a.size() < b.size()) {
                 result.push_back(Chunk(a, std::move(merged),
-                    i->hasUnknownDefinition() || j->hasUnknownDefinition(),
-                    i->hasIncomingDefinition() ||
-                        j->hasIncomingDefinition()));
+                    effectiveUnknownFromThis(*i, a.domain()) ||
+                        effectiveUnknownFromThose(*j, a.domain()),
+                    effectiveIncomingFromThis(*i, a.domain()) ||
+                        effectiveIncomingFromThose(*j, a.domain())));
                 ++i;
             } else if (b.size() < a.size()) {
                 result.push_back(Chunk(b, std::move(merged),
-                    i->hasUnknownDefinition() || j->hasUnknownDefinition(),
-                    i->hasIncomingDefinition() ||
-                        j->hasIncomingDefinition()));
+                    effectiveUnknownFromThis(*i, b.domain()) ||
+                        effectiveUnknownFromThose(*j, b.domain()),
+                    effectiveIncomingFromThis(*i, b.domain()) ||
+                        effectiveIncomingFromThose(*j, b.domain())));
                 ++j;
             } else {
                 result.push_back(Chunk(a, std::move(merged),
-                    i->hasUnknownDefinition() || j->hasUnknownDefinition(),
-                    i->hasIncomingDefinition() ||
-                        j->hasIncomingDefinition()));
+                    effectiveUnknownFromThis(*i, a.domain()) ||
+                        effectiveUnknownFromThose(*j, a.domain()),
+                    effectiveIncomingFromThis(*i, a.domain()) ||
+                        effectiveIncomingFromThose(*j, a.domain())));
                 ++i;
                 ++j;
             }
         }
     }
 
+    const bool registerUnknownWasDifferent =
+        hasUnknownRegisterDefinition_ !=
+        those.hasUnknownRegisterDefinition_;
+    const bool stackUnknownWasDifferent =
+        hasUnknownStackDefinition_ !=
+        those.hasUnknownStackDefinition_;
+    const bool otherMemoryUnknownWasDifferent =
+        hasUnknownOtherMemoryDefinition_ !=
+        those.hasUnknownOtherMemoryDefinition_;
+
     chunks_ = std::move(result);
+    hasUnknownRegisterDefinition_ =
+        hasUnknownRegisterDefinition_ ||
+        those.hasUnknownRegisterDefinition_;
+    hasUnknownStackDefinition_ =
+        hasUnknownStackDefinition_ ||
+        those.hasUnknownStackDefinition_;
+    hasUnknownOtherMemoryDefinition_ =
+        hasUnknownOtherMemoryDefinition_ ||
+        those.hasUnknownOtherMemoryDefinition_;
+    hasIncomingRegisterDefinition_ =
+        hasIncomingRegisterDefinition_ ||
+        those.hasIncomingRegisterDefinition_ ||
+        (alternative && registerUnknownWasDifferent);
+    hasIncomingStackDefinition_ =
+        hasIncomingStackDefinition_ ||
+        those.hasIncomingStackDefinition_ ||
+        (alternative && stackUnknownWasDifferent);
+    hasIncomingOtherMemoryDefinition_ =
+        hasIncomingOtherMemoryDefinition_ ||
+        those.hasIncomingOtherMemoryDefinition_ ||
+        (alternative && otherMemoryUnknownWasDifferent);
 
     selfTest();
 }
 
 void ReachingDefinitions::print(QTextStream &out) const {
     out << '{';
+    if (hasUnknownRegisterDefinition_) {
+        out << " register-domain:unknown;";
+    }
+    if (hasUnknownStackDefinition_) {
+        out << " stack-domain:unknown;";
+    }
+    if (hasUnknownOtherMemoryDefinition_) {
+        out << " memory-domain:unknown;";
+    }
+    if (hasIncomingRegisterDefinition_) {
+        out << " register-domain:incoming;";
+    }
+    if (hasIncomingStackDefinition_) {
+        out << " stack-domain:incoming;";
+    }
+    if (hasIncomingOtherMemoryDefinition_) {
+        out << " memory-domain:incoming;";
+    }
     foreach (const auto &chunk, chunks_) {
         out << chunk.location() << ':';
         if (chunk.hasUnknownDefinition()) {

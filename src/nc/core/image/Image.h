@@ -58,9 +58,13 @@ class Relocation;
 class Image: public ByteSource {
     Platform platform_;
     std::vector<std::unique_ptr<Section>> sections_; ///< The list of sections.
+    std::vector<Section *> mutableSectionView_; ///< Non-owning mutable view.
+    std::vector<const Section *> sectionView_; ///< Non-owning const view.
     std::vector<std::unique_ptr<Symbol>> symbols_; ///< The list of symbols.
+    std::vector<const Symbol *> symbolView_; ///< Non-owning const view.
     boost::unordered_map<ConstantValue, Symbol *> value2symbol_; ///< Mapping from value to the symbol with this value.
     std::vector<std::unique_ptr<Relocation>> relocations_; ///< The list of relocations.
+    std::vector<const Relocation *> relocationView_; ///< Non-owning const view.
     boost::unordered_map<ByteAddr, Relocation *> address2relocation_; ///< Mapping from an address to the relocation with this address.
     std::unique_ptr<mangling::Demangler> demangler_; ///< Demangler.
     boost::optional<ByteAddr> entrypoint_; ///< Entrypoint of image.
@@ -98,14 +102,14 @@ public:
      * \return List of all sections.
      */
     const std::vector<Section *> &sections() {
-        return reinterpret_cast<const std::vector<Section *> &>(sections_);
+        return mutableSectionView_;
     }
 
     /**
      * \return List of all sections.
      */
     const std::vector<const Section *> &sections() const {
-        return reinterpret_cast<const std::vector<const Section *> &>(sections_);
+        return sectionView_;
     }
 
     /**
@@ -143,7 +147,7 @@ public:
      * \return List of all symbols.
      */
     const std::vector<const Symbol *> &symbols() const {
-        return reinterpret_cast<const std::vector<const Symbol *> &>(symbols_);
+        return symbolView_;
     }
 
     /**
@@ -170,6 +174,17 @@ public:
      * \return Pointer to a relocation for this address. Can be nullptr.
      */
     const Relocation *getRelocation(ByteAddr address) const;
+
+    /**
+     * \return All relocation records owned by this image.
+     *
+     * The pointed-to records remain owned by the image. This view is used by
+     * conservative whole-program analyses which must consider every mutable
+     * linkage slot referring to one external symbol.
+     */
+    const std::vector<const Relocation *> &relocations() const {
+        return relocationView_;
+    }
 
     /**
      * \return Valid pointer to a demangler.

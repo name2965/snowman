@@ -161,54 +161,6 @@ bool checkedBitAddress(ConstantValue address, BitSize size, BitAddr &result) {
     return true;
 }
 
-/** Adds a value-less may-definition to each existing tracked interval.
- * Keeping the intervals separate avoids inventing definitions for gaps and
- * avoids address overflow when far-apart locations are present. */
-void addPossibleUnknownDefinitions(
-        const std::vector<MemoryLocation> &locations,
-        ReachingDefinitions &definitions) {
-    ReachingDefinitions possibleWrite;
-    foreach (const auto &location, locations) {
-        possibleWrite.addUnknownDefinition(location);
-    }
-    definitions.merge(possibleWrite);
-}
-
-std::vector<MemoryLocation> getAllDefinedMemoryLocations(
-        const ReachingDefinitions &definitions) {
-    std::vector<MemoryLocation> result;
-    result.reserve(definitions.chunks().size());
-    foreach (const auto &chunk, definitions.chunks()) {
-        result.push_back(chunk.location());
-    }
-    return result;
-}
-
-bool isRegisterDomain(Domain domain) {
-    return domain >= MemoryDomain::FIRST_REGISTER &&
-        domain <= MemoryDomain::LAST_REGISTER;
-}
-
-/** Returns existing tracked memory intervals without inventing ranges across
- * gaps. Stack and other non-register domains can be selected independently so
- * an exact stack-derived pointer does not unnecessarily destroy global facts. */
-std::vector<MemoryLocation> getDefinedNonRegisterMemoryLocations(
-        const ReachingDefinitions &definitions, bool includeStack,
-        bool includeOtherMemory) {
-    std::vector<MemoryLocation> result;
-    result.reserve(definitions.chunks().size());
-    foreach (const auto &chunk, definitions.chunks()) {
-        const Domain domain = chunk.location().domain();
-        if (!isRegisterDomain(domain) &&
-            ((domain == MemoryDomain::STACK && includeStack) ||
-             (domain != MemoryDomain::STACK && includeOtherMemory)))
-        {
-            result.push_back(chunk.location());
-        }
-    }
-    return result;
-}
-
 } // anonymous namespace
 
 void DataflowAnalyzer::analyze(const CFG &cfg) {
@@ -379,8 +331,7 @@ void DataflowAnalyzer::execute(const Statement *statement, ReachingDefinitions &
              * any tracked register or frame interval.  Preserve the old
              * definitions as may-reach alternatives, but never leave one as
              * the sole concrete definition after an opaque operation. */
-            addPossibleUnknownDefinitions(
-                getAllDefinedMemoryLocations(definitions), definitions);
+            definitions.addUnknownDomainDefinitions(true, true, true);
             break;
         case Statement::ASSIGNMENT: {
             auto assignment = statement->asAssignment();
@@ -458,19 +409,13 @@ void DataflowAnalyzer::execute(const Statement *statement, ReachingDefinitions &
             }
 
             if (mayReachStack || mayReachOtherMemory) {
-                /* A boolean may-write effect carries no pointee extent.  Any
-                 * narrower interval would guess an object boundary (and can
-                 * leave stale definitions for an interior/ambiguous pointer),
-                 * so conservatively invalidate every existing interval in
-                 * each reachable non-register domain. Keep disjoint tracked
-                 * objects disjoint: filling gaps would invent state and can
-                 * overflow the address range. A future points-to/range effect
-                 * can make this precise. */
-                addPossibleUnknownDefinitions(
-                    getDefinedNonRegisterMemoryLocations(
-                        definitions, mayReachStack,
-                        mayReachOtherMemory),
-                    definitions);
+                /* A boolean may-write effect carries no pointee extent. Any
+                 * narrower interval would guess an object boundary. Record a
+                 * category-wide may-definition so a location first observed
+                 * after this call is conservative too; later exact writes
+                 * shadow the marker only over their precise byte ranges. */
+                definitions.addUnknownDomainDefinitions(
+                    false, mayReachStack, mayReachOtherMemory);
             }
             break;
         }
@@ -1005,17 +950,16 @@ AbstractValue DataflowAnalyzer::apply(const BinaryOperator *binary, const Abstra
 }
 
 void DataflowAnalyzer::handleWrite(const Term *term, const MemoryLocation &memoryLocation, ReachingDefinitions &definitions) {
-    std::vector<MemoryLocation> possibleStackWrites;
+    bool mayWriteUnresolvedStack = false;
+    bool mayWriteUnresolvedOtherMemory = false;
     if (!memoryLocation) {
         const Dereference *dereference = term->asDereference();
         const Value *addressValue = dereference ?
             dataflow().findValue(dereference->address()) : nullptr;
-        if (addressValue && addressValue->mayBeStackOffset()) {
-            /* Snapshot ranges before removing an earlier dynamic occurrence
-             * of this same write term at the dataflow fixpoint. */
-            possibleStackWrites =
-                definitions.getDefinedMemoryLocationsWithin(
-                    MemoryDomain::STACK);
+        if (addressValue) {
+            mayWriteUnresolvedStack = addressValue->mayBeStackOffset();
+            mayWriteUnresolvedOtherMemory =
+                !addressValue->isStackOffset();
         }
     }
 
@@ -1027,12 +971,16 @@ void DataflowAnalyzer::handleWrite(const Term *term, const MemoryLocation &memor
 
     if (isTracked(memoryLocation)) {
         definitions.addDefinition(memoryLocation, term);
-    } else if (!possibleStackWrites.empty()) {
-        /* An unresolved indirect write is a may-write, not a no-op.  If its
-         * address may be derived from the current frame, conservatively add
-         * an unknown alternative to every tracked stack interval.  Definite
-         * non-stack addresses leave frame state untouched. */
-        addPossibleUnknownDefinitions(possibleStackWrites, definitions);
+    } else if (mayWriteUnresolvedStack ||
+               mayWriteUnresolvedOtherMemory)
+    {
+        /* An unresolved indirect write is a may-write, not a no-op. Preserve
+         * the address lattice distinction: an exact stack offset reaches only
+         * the frame, an exact non-stack address reaches only other tracked
+         * memory, and an unknown/conflicting pointer can reach both. */
+        definitions.addUnknownDomainDefinitions(
+            false, mayWriteUnresolvedStack,
+            mayWriteUnresolvedOtherMemory);
     }
 }
 

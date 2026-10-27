@@ -41,9 +41,10 @@ namespace calling {
 
 CallHook::CallHook(const Convention *convention, const CallSignature *signature,
     const boost::optional<ByteSize> &stackCleanupSize,
-    bool unknownStackCleanup):
+    bool unknownStackCleanup, bool signatureIsInferred):
     stackPointer_(nullptr), snapshotStatement_(nullptr),
-    pointeeReadSnapshotStatement_(nullptr)
+    pointeeReadSnapshotStatement_(nullptr),
+    argumentObservation_(ArgumentObservation::NONE)
 {
     assert(convention != nullptr);
 
@@ -87,8 +88,14 @@ CallHook::CallHook(const Convention *convention, const CallSignature *signature,
         pointerCandidates.reserve(signature->arguments().size());
         const auto &prototype = signature->prototype();
         const bool completePrototype = prototype &&
+            !prototype->variadic() &&
             prototype->memoryEffectsAreComplete() &&
             prototype->parameters().size() == signature->arguments().size();
+        if (signatureIsInferred) {
+            argumentObservation_ = ArgumentObservation::ALL;
+        } else if (prototype && prototype->variadic()) {
+            argumentObservation_ = ArgumentObservation::VARIADIC_TAIL;
+        }
 
         /* An inferred signature identifies observed argument locations, but it
          * is not a complete memory-effect contract. Hidden arguments and
@@ -102,6 +109,7 @@ CallHook::CallHook(const Convention *convention, const CallSignature *signature,
         std::size_t argumentIndex = 0;
         foreach (const auto &term, signature->arguments()) {
             auto clone = term->clone();
+            const Term *clonePointer = clone.get();
             const bool mayReadMemory = !completePrototype ||
                 prototype->parameters()[argumentIndex].mayReadMemory();
             const bool mayWriteMemory = completePrototype &&
@@ -111,9 +119,26 @@ CallHook::CallHook(const Convention *convention, const CallSignature *signature,
             if (mayWriteMemory) {
                 pointerCandidates.push_back(clone->clone());
             }
-            argumentTerms_[term.get()] = clone.get();
+            argumentTerms_[term.get()] = clonePointer;
+            if (argumentObservation_ == ArgumentObservation::ALL ||
+                (argumentObservation_ == ArgumentObservation::VARIADIC_TAIL &&
+                 argumentIndex >= prototype->parameters().size()))
+            {
+                observedArgumentTerms_.insert(clonePointer);
+            }
             addArgumentRead(std::move(clone));
             ++argumentIndex;
+        }
+
+        /* A known variadic call still needs a fresh observation of its
+         * non-fixed arguments on every semantic pass. The tail reads above
+         * remain real call effects, but SignatureAnalyzer can distinguish
+         * them from unrelated uses through observedArgumentTerms_. */
+        if (argumentObservation_ != ArgumentObservation::NONE) {
+            auto snapshotStatement =
+                std::make_unique<RememberReachingDefinitions>();
+            snapshotStatement_ = snapshotStatement.get();
+            statements.push_back(std::move(snapshotStatement));
         }
 
         /*
@@ -145,12 +170,44 @@ CallHook::CallHook(const Convention *convention, const CallSignature *signature,
          * every ABI caller-saved register before defining the return value. */
         addCallClobbers();
 
-        if (signature->returnValue()) {
+        if (signatureIsInferred) {
+            /* An inferred return is evidence, not an authoritative effect.
+             * Recreate every ABI candidate so later uses can re-prove (or
+             * replace) it on each pass. Keep the old term as a mapped write
+             * for consumers during this pass, and mark it speculative only
+             * when it still belongs to the active convention. */
+            foreach (const auto &memoryLocation,
+                     convention->returnValueLocations()) {
+                auto term =
+                    std::make_unique<MemoryLocationAccess>(memoryLocation);
+                speculativeReturnValueTerms_.push_back(
+                    std::make_pair(memoryLocation, term.get()));
+                addReturnValueWrite(std::move(term));
+            }
+
+            if (signature->returnValue()) {
+                auto clone = signature->returnValue()->clone();
+                const Term *clonePointer = clone.get();
+                returnValueTerms_[signature->returnValue().get()] =
+                    clonePointer;
+                if (const auto access =
+                        signature->returnValue()->asMemoryLocationAccess())
+                {
+                    const MemoryLocation &location = access->memoryLocation();
+                    if (convention->getReturnValueLocationCovering(location)) {
+                        speculativeReturnValueTerms_.push_back(
+                            std::make_pair(location, clonePointer));
+                    }
+                }
+                addReturnValueWrite(std::move(clone));
+            }
+        } else if (signature->returnValue()) {
             auto clone = signature->returnValue()->clone();
             returnValueTerms_[signature->returnValue().get()] = clone.get();
             addReturnValueWrite(std::move(clone));
         }
     } else {
+        argumentObservation_ = ArgumentObservation::ALL;
         auto snapshotStatement = std::make_unique<RememberReachingDefinitions>();
         snapshotStatement_ = snapshotStatement.get();
         statements.push_back(std::move(snapshotStatement));

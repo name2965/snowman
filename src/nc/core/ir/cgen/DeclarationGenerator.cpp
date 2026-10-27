@@ -91,6 +91,8 @@ std::unique_ptr<likec::FunctionDeclaration> DeclarationGenerator::createDeclarat
     if (signature()->prototype() && !signature()->prototype()->preferredName().isEmpty()) {
         nameAndComment.name() = signature()->prototype()->preferredName();
     }
+    nameAndComment.name() = parent().getFunctionIdentifier(
+        signature(), nameAndComment.name());
 
     auto functionDeclaration = std::make_unique<likec::FunctionDeclaration>(tree(),
         std::move(nameAndComment.name()), makeReturnType(), signature()->variadic());
@@ -129,6 +131,7 @@ likec::ArgumentDeclaration *DeclarationGenerator::makeArgumentDeclaration(const 
             type = makePresentationType(parameter.type());
         }
     }
+    nameAndComment.name() = claimLocalIdentifier(nameAndComment.name());
 
     auto argumentDeclaration = std::make_unique<likec::ArgumentDeclaration>(
         std::move(nameAndComment.name()), type);
@@ -138,6 +141,11 @@ likec::ArgumentDeclaration *DeclarationGenerator::makeArgumentDeclaration(const 
     declaration()->addArgument(std::move(argumentDeclaration));
 
     return result;
+}
+
+QString DeclarationGenerator::claimLocalIdentifier(
+        const QString &candidate) {
+    return parent().claimLocalIdentifier(candidate, localIdentifiers_);
 }
 
 } // namespace cgen

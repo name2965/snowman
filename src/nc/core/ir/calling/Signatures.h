@@ -5,11 +5,12 @@
 
 #include <nc/config.h>
 
+#include <cstdint>
 #include <memory>
 
 #include <boost/unordered_map.hpp>
 
-#include <nc/common/Range.h>
+#include <nc/common/Types.h>
 
 #include "CallSignature.h"
 #include "FunctionSignature.h"
@@ -17,82 +18,140 @@
 namespace nc {
 namespace core {
 namespace ir {
+
+class Call;
+class Function;
+
 namespace calling {
+
+/** Origin of a signature binding. */
+enum class SignatureSource {
+    /** Contract reconstructed from program observations. */
+    INFERRED,
+
+    /** Contract supplied by trusted external metadata. */
+    EXTERNAL
+};
 
 /**
  * Signatures of functions and calls to functions.
+ *
+ * Inferred and external contracts are deliberately retained in separate
+ * layers. Consumers see an external contract when one exists, while an
+ * analysis pass can still update the inferred layer underneath it. This is
+ * required for contracts with an authoritative fixed prefix and inferred
+ * call-site details, such as the tail of a variadic argument list.
  */
 class Signatures {
-    /** Mapping from an address to the signature of the function located at this address. */
-    boost::unordered_map<ByteAddr, std::shared_ptr<FunctionSignature>> addr2signature_;
+    typedef boost::unordered_map<ByteAddr,
+        std::shared_ptr<FunctionSignature>> AddressSignatures;
+    typedef boost::unordered_map<const Function *,
+        std::shared_ptr<FunctionSignature>> FunctionSignatures;
+    typedef boost::unordered_map<const Call *,
+        std::shared_ptr<CallSignature>> CallSignatures;
 
-    /** Mapping from a function to its signature. */
-    boost::unordered_map<const Function *, std::shared_ptr<FunctionSignature>> function2signature_;
+    AddressSignatures inferredAddressSignatures_;
+    FunctionSignatures inferredFunctionSignatures_;
+    CallSignatures inferredCallSignatures_;
 
-    /** Mapping from a call to its signature. */
-    boost::unordered_map<const Call *, std::shared_ptr<CallSignature>> call2signature_;
+    AddressSignatures externalAddressSignatures_;
+    FunctionSignatures externalFunctionSignatures_;
+    CallSignatures externalCallSignatures_;
+
+    /* Snapshot used to replace, rather than accumulate, one inference pass. */
+    AddressSignatures previousAddressSignatures_;
+    FunctionSignatures previousFunctionSignatures_;
+    CallSignatures previousCallSignatures_;
+    bool inferenceUpdateInProgress_;
+
+    AddressSignatures previousExternalAddressSignatures_;
+    FunctionSignatures previousExternalFunctionSignatures_;
+    CallSignatures previousExternalCallSignatures_;
+    bool externalUpdateInProgress_;
+
+    std::uint64_t revision_;
 
 public:
-    /**
-     * \param addr Address of a function.
-     *
-     * \return Pointer to the signature of the function. Can be nullptr.
-     */
-    const std::shared_ptr<FunctionSignature> &getSignature(ByteAddr addr) const {
-        return nc::find(addr2signature_, addr);
-    }
+    Signatures();
 
     /**
-     * Sets the signature of a function at the given address.
-     *
-     * \param addr Address of the function.
-     * \param signature Pointer to the signature. Can be nullptr.
+     * Monotonically increasing semantic revision of both provenance layers.
+     * Structurally equivalent replacements do not advance the revision.
      */
-    void setSignature(ByteAddr addr, std::shared_ptr<FunctionSignature> signature) {
-        addr2signature_[addr] = std::move(signature);
-    }
+    std::uint64_t revision() const { return revision_; }
 
     /**
-     * \param function Valid pointer to a function.
+     * Starts replacement of the complete inferred layer.
      *
-     * \return Pointer to the signature of the function. Can be nullptr.
+     * Every inferred signature produced before finishInferenceUpdate() is
+     * part of the new snapshot. Entries not reproduced by the analysis are
+     * removed. External bindings are unaffected.
      */
-    const std::shared_ptr<FunctionSignature> &getSignature(const Function *function) const {
-        assert(function != nullptr);
-        return nc::find(function2signature_, function);
-    }
+    void beginInferenceUpdate();
+
+    /** Commits the inferred snapshot and advances revision() if it changed. */
+    void finishInferenceUpdate();
+
+    /** Discards a partial inferred snapshot after an analysis failure. */
+    void cancelInferenceUpdate();
 
     /**
-     * Sets the signature of a function.
+     * Starts replacement of the complete external metadata layer.
      *
-     * \param function Valid pointer to the function.
-     * \param signature Pointer to the signature. Can be nullptr.
+     * Until finishExternalUpdate(), every getter observes the previously
+     * committed external snapshot. New bindings are write-only staging data;
+     * a producer that needs a fact it just staged must retain that fact in
+     * its local record instead of reading it back through this registry.
      */
-    void setSignature(const Function *function, std::shared_ptr<FunctionSignature> signature) {
-        assert(function != nullptr);
-        function2signature_[function] = std::move(signature);
-    }
+    void beginExternalUpdate();
+
+    /** Commits the external snapshot and advances revision() if it changed. */
+    void finishExternalUpdate();
+
+    /** Discards a partial external snapshot after a metadata failure. */
+    void cancelExternalUpdate();
+
+    /** Returns the effective (external-first) signature at an address. */
+    const std::shared_ptr<FunctionSignature> &getSignature(ByteAddr addr) const;
+
+    /** Returns the signature from exactly one provenance layer. */
+    const std::shared_ptr<FunctionSignature> &getSignature(
+        ByteAddr addr, SignatureSource source) const;
 
     /**
-     * \param call Valid pointer to a call statement.
+     * Sets one provenance layer. A null signature removes that binding.
      *
-     * \return Pointer to the signature of the call. Can be nullptr.
+     * \return True if the semantic contents of the layer changed.
      */
-    const std::shared_ptr<CallSignature> &getSignature(const Call *call) const {
-        assert(call != nullptr);
-        return nc::find(call2signature_, call);
-    }
+    bool setSignature(ByteAddr addr,
+                      std::shared_ptr<FunctionSignature> signature,
+                      SignatureSource source = SignatureSource::INFERRED);
 
-    /**
-     * Sets the signature of a call.
-     *
-     * \param call Valid pointer to the call statement.
-     * \param signature Pointer to the signature. Can be nullptr.
-     */
-    void setSignature(const Call *call, std::shared_ptr<CallSignature> signature) {
-        assert(call != nullptr);
-        call2signature_[call] = std::move(signature);
-    }
+    /** Returns the effective (external-first) signature of a function. */
+    const std::shared_ptr<FunctionSignature> &getSignature(
+        const Function *function) const;
+
+    /** Returns the function signature from exactly one provenance layer. */
+    const std::shared_ptr<FunctionSignature> &getSignature(
+        const Function *function, SignatureSource source) const;
+
+    /** Sets one provenance layer for a function. */
+    bool setSignature(const Function *function,
+                      std::shared_ptr<FunctionSignature> signature,
+                      SignatureSource source = SignatureSource::INFERRED);
+
+    /** Returns the effective (external-first) signature of a call. */
+    const std::shared_ptr<CallSignature> &getSignature(
+        const Call *call) const;
+
+    /** Returns the call signature from exactly one provenance layer. */
+    const std::shared_ptr<CallSignature> &getSignature(
+        const Call *call, SignatureSource source) const;
+
+    /** Sets one provenance layer for a call. */
+    bool setSignature(const Call *call,
+                      std::shared_ptr<CallSignature> signature,
+                      SignatureSource source = SignatureSource::INFERRED);
 };
 
 } // namespace calling

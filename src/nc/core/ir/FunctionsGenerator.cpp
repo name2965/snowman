@@ -79,7 +79,17 @@ void FunctionsGenerator::makeFunctions(const Program &program, Functions &functi
 
     auto addFunction = [&](const std::vector<const BasicBlock *> basicBlocks, const BasicBlock *entry) {
         auto function = makeFunction(basicBlocks, entry);
-        if (function->isEmpty()) {
+        /* A decoded range can contain only instructions whose lowering has
+         * no semantic statements (NOPs, alignment hints, and similar
+         * instructions).  Once executable metadata or a proved callback has
+         * established that range as an entry, dropping it would lose the
+         * function boundary again.  Preserve only such explicitly known,
+         * non-empty address ranges; anonymous empty blocks are still noise. */
+        const bool isKnownInstructionOnlyEntry =
+            entry && entry->address() && entry->successorAddress() &&
+            *entry->successorAddress() > *entry->address() &&
+            program.isFunctionEntry(*entry->address());
+        if (function->isEmpty() && !isKnownInstructionOnlyEntry) {
             return;
         }
 

@@ -146,9 +146,11 @@ public:
 class FunctionPrototype {
     TypeDescription returnType_;
     std::vector<ParameterDescription> parameters_;
-    QString callingConvention_;
+    QString callingConvention_; ///< Optional source-level declaration spelling.
     QString preferredName_;
     bool memoryEffectsAreComplete_;
+    QString abiConventionName_; ///< Internal Architecture ABI id for callbacks.
+    bool variadic_;
 
 public:
     /**
@@ -163,12 +165,16 @@ public:
                       std::vector<ParameterDescription> parameters = std::vector<ParameterDescription>(),
                       QString callingConvention = QString(),
                       QString preferredName = QString(),
-                      bool memoryEffectsAreComplete = false):
+                      bool memoryEffectsAreComplete = false,
+                      QString abiConventionName = QString(),
+                      bool variadic = false):
         returnType_(std::move(returnType)),
         parameters_(std::move(parameters)),
         callingConvention_(std::move(callingConvention)),
         preferredName_(std::move(preferredName)),
-        memoryEffectsAreComplete_(memoryEffectsAreComplete)
+        memoryEffectsAreComplete_(memoryEffectsAreComplete),
+        abiConventionName_(std::move(abiConventionName)),
+        variadic_(variadic)
     {}
 
     const TypeDescription &returnType() const { return returnType_; }
@@ -176,11 +182,24 @@ public:
     const QString &callingConvention() const { return callingConvention_; }
     const QString &preferredName() const { return preferredName_; }
 
+    /** Internal target Architecture convention identifier for callbacks. */
+    const QString &abiConventionName() const { return abiConventionName_; }
+
+    /** Whether calls can carry arguments beyond the fixed parameter prefix. */
+    bool variadic() const { return variadic_; }
+
     /** Whether parameter effects exclude all other caller-memory accesses. */
     bool memoryEffectsAreComplete() const {
         return memoryEffectsAreComplete_;
     }
 };
+
+/**
+ * Compares every semantic and presentation field of two prototypes,
+ * including nested callback contracts.
+ */
+bool areFunctionPrototypesEquivalent(
+    const FunctionPrototype &left, const FunctionPrototype &right);
 
 } // namespace calling
 } // namespace ir

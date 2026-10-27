@@ -21,9 +21,20 @@ namespace calling {
  * Signature of a function: arguments, return value, name.
  */
 class CallSignature {
+public:
+    enum class ArgumentEvidence {
+        /** Arguments reconstructed without excluding a fixed prototype. */
+        ALL_OBSERVED,
+
+        /** Only arguments beyond an authoritative variadic fixed prefix. */
+        VARIADIC_TAIL
+    };
+
+private:
     std::vector<std::shared_ptr<const Term>> arguments_; ///< Terms representing the arguments.
     std::shared_ptr<const Term> returnValue_; ///< Terms representing the return value.
     std::shared_ptr<const FunctionPrototype> prototype_; ///< Optional source-level prototype metadata.
+    ArgumentEvidence argumentEvidence_ = ArgumentEvidence::ALL_OBSERVED;
 
 public:
     /**
@@ -35,6 +46,11 @@ public:
      * \return List of terms representing the arguments.
      */
     const std::vector<std::shared_ptr<const Term>> &arguments() const { return arguments_; }
+
+    ArgumentEvidence argumentEvidence() const { return argumentEvidence_; }
+    void setArgumentEvidence(ArgumentEvidence evidence) {
+        argumentEvidence_ = evidence;
+    }
 
     /**
      * \return Pointer to the term containing the return value. Can be nullptr.

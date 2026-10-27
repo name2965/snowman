@@ -56,6 +56,60 @@ namespace core {
 namespace ir {
 namespace cgen {
 
+QString CodeGenerator::claimGlobalIdentifier(const QString &candidate) {
+    const QString base = candidate.isEmpty() ?
+        QLatin1String("unnamed") : candidate;
+    QString result = base;
+    std::size_t serial = 2;
+    while (globalIdentifiers_.count(result) != 0 ||
+           localIdentifiers_.count(result) != 0) {
+        result = QString("%1_%2").arg(base).arg(serial++);
+    }
+    globalIdentifiers_.insert(result);
+    return result;
+}
+
+QString CodeGenerator::claimLocalIdentifier(
+        const QString &candidate,
+        std::set<QString> &scopeIdentifiers) {
+    const QString base = candidate.isEmpty() ?
+        QLatin1String("unnamed") : candidate;
+    QString result = base;
+    std::size_t serial = 2;
+    while (scopeIdentifiers.count(result) != 0 ||
+           globalIdentifiers_.count(result) != 0) {
+        result = QString("%1_%2").arg(base).arg(serial++);
+    }
+    scopeIdentifiers.insert(result);
+    localIdentifiers_.insert(result);
+    return result;
+}
+
+QString CodeGenerator::getFunctionIdentifier(
+        const calling::FunctionSignature *signature,
+        const QString &candidate) {
+    assert(signature != nullptr);
+    const auto existing = signature2identifier_.find(signature);
+    if (existing != signature2identifier_.end()) {
+        return existing->second;
+    }
+    const QString identifier = claimGlobalIdentifier(candidate);
+    signature2identifier_[signature] = identifier;
+    return identifier;
+}
+
+QString CodeGenerator::getVariableIdentifier(
+        const vars::Variable *variable, const QString &candidate) {
+    assert(variable != nullptr);
+    const auto existing = variable2identifier_.find(variable);
+    if (existing != variable2identifier_.end()) {
+        return existing->second;
+    }
+    const QString identifier = claimGlobalIdentifier(candidate);
+    variable2identifier_[variable] = identifier;
+    return identifier;
+}
+
 void CodeGenerator::makeCompilationUnit() {
     tree().setPointerSize(image().platform().architecture()->bitness());
     tree().setIntSize(image().platform().intSize());
@@ -183,6 +237,8 @@ likec::VariableDeclaration *CodeGenerator::makeGlobalVariableDeclaration(const v
         auto type = makeVariableType(variable);
         auto initialValue = makeInitialValue(variable->memoryLocation(), type);
         auto nameAndComment = nameGenerator().getGlobalVariableName(variable->memoryLocation());
+        nameAndComment.name() = getVariableIdentifier(
+            variable, nameAndComment.name());
 
         auto declaration = std::make_unique<likec::VariableDeclaration>(
             std::move(nameAndComment.name()),

@@ -36,6 +36,7 @@ set(SOURCES
     common/ByteOrder.h
     common/CancellationToken.cpp
     common/CancellationToken.h
+    common/CheckedAddress.h
     common/CheckedCast.h
     common/DisjointSet.h
     common/Escaping.cpp
@@ -135,21 +136,30 @@ set(SOURCES
     core/ir/Terms.h
     core/ir/calling/CallHook.cpp
     core/ir/calling/CallHook.h
+    core/ir/calling/CallFrameAnalyzer.cpp
+    core/ir/calling/CallFrameAnalyzer.h
     core/ir/calling/CalleeId.h
     core/ir/calling/Convention.cpp
     core/ir/calling/Convention.h
+    core/ir/calling/DeclarativeSymbolPrototypeProvider.cpp
+    core/ir/calling/DeclarativeSymbolPrototypeProvider.h
     core/ir/calling/EntryHook.cpp
     core/ir/calling/EntryHook.h
     core/ir/calling/FunctionPrototype.h
     core/ir/calling/FunctionSignature.h
     core/ir/calling/Hooks.cpp
     core/ir/calling/Hooks.h
+    core/ir/calling/ImageImportedFunctionResolver.cpp
+    core/ir/calling/ImportedFunctionResolver.cpp
+    core/ir/calling/ImportedFunctionResolver.h
     core/ir/calling/Patch.cpp
     core/ir/calling/Patch.h
     core/ir/calling/ReturnHook.cpp
     core/ir/calling/ReturnHook.h
     core/ir/calling/SignatureAnalyzer.cpp
     core/ir/calling/SignatureAnalyzer.h
+    core/ir/calling/Signatures.cpp
+    core/ir/calling/Signatures.h
     core/ir/calling/SymbolPrototypeRegistry.cpp
     core/ir/calling/SymbolPrototypeRegistry.h
     core/ir/cflow/BasicNode.cpp

@@ -27,8 +27,8 @@
 
 #include <cassert>
 #include <climits>
-
-#include <nc/common/CheckedCast.h>
+#include <cstdint>
+#include <type_traits>
 
 namespace nc {
 
@@ -37,11 +37,19 @@ namespace nc {
  *
  * \return Value of type T with bits [0..nbits-1] set.
  * In case T is narrower than nbits, returned value has all bits set.
+ * Nonpositive counts produce zero.
  */
 template<class T, class U>
 T bitMask(U nbits) {
-    if (nbits < checked_cast<U>(sizeof(T) * CHAR_BIT)) {
-        return (T(1) << nbits) - 1;
+    if (nbits <= 0) {
+        return 0;
+    }
+
+    const std::uintmax_t count = static_cast<std::uintmax_t>(nbits);
+    if (count < sizeof(T) * CHAR_BIT) {
+        typedef typename std::make_unsigned<T>::type UnsignedValue;
+        return static_cast<T>(
+            (UnsignedValue(1) << count) - UnsignedValue(1));
     } else {
         return T(-1);
     }
@@ -52,10 +60,13 @@ T bitMask(U nbits) {
  * \param[in] nbits Number of bits.
  *
  * \return Value shifted to the left by the given number of bits.
+ * Negative counts and counts not smaller than the width of T produce zero.
  */
 template<class T, class U>
 T shiftLeft(T value, U nbits) {
-    if (nbits < checked_cast<U>(sizeof(T) * CHAR_BIT)) {
+    if (nbits >= 0 &&
+        static_cast<std::uintmax_t>(nbits) < sizeof(T) * CHAR_BIT)
+    {
         return value << nbits;
     } else {
         return 0;
@@ -67,10 +78,13 @@ T shiftLeft(T value, U nbits) {
  * \param[in] nbits Number of bits.
  *
  * \return Value shifted to the right by the given number of bits.
+ * Negative counts and counts not smaller than the width of T produce zero.
  */
 template<class T, class U>
 T shiftRight(T value, U nbits) {
-    if (nbits < checked_cast<U>(sizeof(T) * CHAR_BIT)) {
+    if (nbits >= 0 &&
+        static_cast<std::uintmax_t>(nbits) < sizeof(T) * CHAR_BIT)
+    {
         return value >> nbits;
     } else {
         return 0;
@@ -90,7 +104,10 @@ T bitShift(T value, I nbits) {
     if (nbits > 0) {
         return shiftLeft(value, nbits);
     } else if (nbits < 0) {
-        return shiftRight(value, nbits);
+        typedef typename std::make_unsigned<I>::type UnsignedCount;
+        const UnsignedCount magnitude =
+            UnsignedCount(0) - static_cast<UnsignedCount>(nbits);
+        return shiftRight(value, magnitude);
     } else {
         return value;
     }

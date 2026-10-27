@@ -25,6 +25,8 @@
 
 #include <nc/config.h>
 
+#include <set>
+
 #include <boost/noncopyable.hpp>
 
 #include <nc/core/ir/calling/CalleeId.h>
@@ -60,6 +62,7 @@ class DeclarationGenerator: boost::noncopyable {
     const calling::FunctionSignature *signature_;
     bool usePrototypeTypes_;
     likec::FunctionDeclaration *declaration_;
+    std::set<QString> localIdentifiers_;
 
 public:
     /**
@@ -141,6 +144,9 @@ protected:
      * \return Created declaration of function's argument.
      */
     likec::ArgumentDeclaration *makeArgumentDeclaration(const Term *term);
+
+    /** Claims a collision-free identifier in the current function scope. */
+    QString claimLocalIdentifier(const QString &candidate);
 };
 
 } // namespace cgen

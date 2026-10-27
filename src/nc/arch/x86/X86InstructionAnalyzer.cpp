@@ -272,8 +272,18 @@ public:
                 auto ip = architecture_->instructionPointer();
 
                 _[
-                    regizter(sp) ^= regizter(sp) - constant(ip->size() / CHAR_BIT),
-                    *regizter(sp) ^= constant(instr->endAddr(), ip->size()),
+                    regizter(sp) ^= regizter(sp) - constant(ip->size() / CHAR_BIT)
+                ];
+                _[
+                    *regizter(sp) ^= constant(instr->endAddr(), ip->size())
+                ];
+                auto returnAddressWrite =
+                    _.basicBlock()->statements().back()->
+                        as<core::ir::Assignment>();
+                assert(returnAddressWrite != nullptr);
+                returnAddressWrite->setPurpose(
+                    core::ir::Assignment::CONTROL_FLOW_STATE);
+                _[
                     call(operand(0)),
                     regizter(sp) ^= regizter(sp) + constant(ip->size() / CHAR_BIT)
                 ];

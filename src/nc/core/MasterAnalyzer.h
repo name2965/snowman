@@ -114,6 +114,39 @@ public:
     virtual void reconstructSignatures(Context &context) const;
 
     /**
+     * Applies authoritative external signatures after the ordinary signature
+     * analysis has converged.
+     *
+     * External contracts can refine the stable Program after dataflow.  For
+     * example, a concrete callback can prove a new function entry, while a
+     * relocation-proved indirect call can prove that a fallthrough edge is
+     * unreachable.  Every analysis keyed by Function or Statement pointers
+     * then has to be rebuilt from the Program. Implementations may mutate
+     * the Program only when \p allowProgramRefinement is true. MasterAnalyzer
+     * grants that permission only after a non-mutating dry pass and a second
+     * complete semantic pass under unchanged contract revisions.
+     *
+     * Implementations must publish externally supplied contracts through the
+     * EXTERNAL provenance layers of Signatures and Conventions. Their
+     * semantic revisions are used to repeat dataflow, liveness, inference,
+     * and external application until the retained contracts reach a fixed
+     * point. Both layers are replaced as one snapshot on every application.
+     * Registry getters expose the previously committed snapshot while this
+     * method stages its replacement; implementations must use their local
+     * provider records for facts written during the current application.
+     * A mutating confirmation pass must reproduce the same external snapshot
+     * as its preceding dry pass; changing contracts only when mutation is
+     * enabled violates the refinement protocol.
+     *
+     * \return True only when the Program was refined and another rebuild is
+     *         required, or when the same refinement would be required but
+     *         \p allowProgramRefinement is false.  The disabled case must not
+     *         mutate the Program.
+     */
+    virtual bool applyExternalSignatures(
+        Context &context, bool allowProgramRefinement) const;
+
+    /**
      * Reconstructs local and global variables.
      *
      * \param context Context.

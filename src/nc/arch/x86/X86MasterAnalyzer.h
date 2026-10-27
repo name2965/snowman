@@ -36,7 +36,9 @@ public:
     void createProgram(core::Context &context) const override;
     void detectCallingConventions(core::Context &context) const override;
     void detectCallingConvention(core::Context &context, const core::ir::calling::CalleeId &calleeId) const override;
-    void reconstructSignatures(core::Context &context) const override;
+    bool applyExternalSignatures(
+        core::Context &context,
+        bool allowProgramRefinement) const override;
 };
 
 } // namespace x86

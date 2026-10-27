@@ -38,7 +38,9 @@ namespace core {
 namespace ir {
 namespace calling {
 
-EntryHook::EntryHook(const Convention *convention, const FunctionSignature *signature) {
+EntryHook::EntryHook(const Convention *convention,
+                     const FunctionSignature *signature,
+                     bool signatureIsInferred) {
     assert(convention != nullptr);
 
     auto &statements = patch_.statements();
@@ -56,7 +58,11 @@ EntryHook::EntryHook(const Convention *convention, const FunctionSignature *sign
 
     auto createArgument = [&](const Term *term) {
         auto clone = term->clone();
-        argumentTerms_[term] = clone.get();
+        const Term *clonePointer = clone.get();
+        argumentTerms_[term] = clonePointer;
+        if (signatureIsInferred) {
+            observedArgumentTerms_.insert(clonePointer);
+        }
 
         statements.push_back(std::make_unique<Assignment>(
             std::move(clone),

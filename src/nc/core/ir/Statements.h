@@ -51,8 +51,19 @@ protected:
  * Assignment statement.
  */
 class Assignment: public Statement {
+public:
+    /** Semantic role of an assignment in the lifted IR. */
+    enum Purpose {
+        SOURCE_VALUE,
+        /** Machine control state represented as an ordinary location only
+         * for low-level dataflow (for example, CALL's stack return slot). */
+        CONTROL_FLOW_STATE
+    };
+
+private:
     std::unique_ptr<Term> left_; ///< Term being the left-hand side.
     std::unique_ptr<Term> right_; ///< Term being the right-hand side.
+    Purpose purpose_;
 
 public:
     /**
@@ -61,7 +72,12 @@ public:
      *
      * Arguments have to have the same size. Use UnaryOperator for size conversions.
      */
-    Assignment(std::unique_ptr<Term> left, std::unique_ptr<Term> right);
+    Assignment(std::unique_ptr<Term> left, std::unique_ptr<Term> right,
+               Purpose purpose = SOURCE_VALUE);
+
+    Purpose purpose() const { return purpose_; }
+
+    void setPurpose(Purpose purpose) { purpose_ = purpose; }
 
     /**
      * \return Valid pointer to the term being the left-hand side.

@@ -33,11 +33,13 @@
 
 #include <nc/common/CancellationToken.h>
 #include <nc/common/LogToken.h>
+#include <nc/common/Types.h>
 
 namespace nc {
 namespace core {
 
 namespace arch {
+    class Architecture;
     class Instructions;
 }
 
@@ -55,6 +57,7 @@ namespace ir {
         class Hooks;
         class Signatures;
         class SymbolPrototypeProvider;
+        class SymbolPrototypeRegistry;
     }
     namespace cflow {
         class Graphs;
@@ -91,10 +94,19 @@ class Context: public QObject {
     std::unique_ptr<ir::Program> program_; ///< Program.
     std::unique_ptr<ir::Functions> functions_; ///< Functions.
     std::unique_ptr<ir::calling::Conventions> conventions_; ///< Assigned calling conventions.
-    std::unique_ptr<ir::calling::Hooks> hooks_; ///< Hooks manager.
     std::unique_ptr<ir::calling::Signatures> signatures_; ///< Signatures.
+    /* Declared after the registries it references so destruction runs first. */
+    std::unique_ptr<ir::calling::Hooks> hooks_; ///< Hooks manager.
     std::vector<std::shared_ptr<const ir::calling::SymbolPrototypeProvider>>
         symbolPrototypeProviders_; ///< User/plugin external symbol metadata.
+    std::unique_ptr<ir::calling::SymbolPrototypeRegistry>
+        symbolPrototypeRegistry_; ///< Target-resolved external metadata cache.
+    const arch::Architecture *symbolPrototypeRegistryArchitecture_;
+        ///< Architecture for which the external metadata cache was built.
+    int symbolPrototypeRegistryOperatingSystem_;
+        ///< Operating system for which the external metadata cache was built.
+    SmallBitSize symbolPrototypeRegistryBitness_;
+        ///< Pointer bitness for which the external metadata cache was built.
     std::unique_ptr<ir::dflow::Dataflows> dataflows_; ///< Dataflows.
     std::unique_ptr<ir::vars::Variables> variables_; ///< Reconstructed variables.
     std::unique_ptr<ir::cflow::Graphs> graphs_; ///< Structured graphs.
@@ -104,6 +116,12 @@ class Context: public QObject {
     std::unique_ptr<likec::Tree> tree_; ///< Abstract syntax tree of the LikeC program.
     LogToken logToken_; ///< Log token.
     CancellationToken cancellationToken_; ///< Cancellation token.
+
+    /** Clears both the target-resolved registry and its target snapshot. */
+    void clearSymbolPrototypeRegistry();
+
+    /** Whether the cached registry still describes the image's target. */
+    bool symbolPrototypeRegistryMatchesImage() const;
 
 public:
     /**
@@ -146,6 +164,11 @@ public:
      * \param program Pointer to the program IR. Can be nullptr.
      */
     void setProgram(std::unique_ptr<ir::Program> program);
+
+    /**
+     * \return Pointer to the program. Can be nullptr.
+     */
+    ir::Program *program() { return program_.get(); }
 
     /**
      * \return Pointer to the program. Can be nullptr.
@@ -223,17 +246,22 @@ public:
      * contracts from a short built-in name list.
      */
     void addSymbolPrototypeProvider(
-        std::shared_ptr<const ir::calling::SymbolPrototypeProvider> provider) {
-        if (provider) {
-            symbolPrototypeProviders_.push_back(std::move(provider));
-        }
-    }
+        std::shared_ptr<const ir::calling::SymbolPrototypeProvider> provider);
 
     const std::vector<std::shared_ptr<
         const ir::calling::SymbolPrototypeProvider>> &
     symbolPrototypeProviders() const {
         return symbolPrototypeProviders_;
     }
+
+    /** Replaces the target-resolved prototype cache. */
+    void setSymbolPrototypeRegistry(
+        std::unique_ptr<ir::calling::SymbolPrototypeRegistry> registry);
+
+    ir::calling::SymbolPrototypeRegistry *symbolPrototypeRegistry();
+
+    const ir::calling::SymbolPrototypeRegistry *
+    symbolPrototypeRegistry() const;
 
     /**
      * Sets the dataflow information for all functions.

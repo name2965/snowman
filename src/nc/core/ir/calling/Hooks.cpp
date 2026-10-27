@@ -25,6 +25,7 @@
 #include "Hooks.h"
 
 #include <cassert>
+#include <stdexcept>
 
 #include <nc/common/Foreach.h>
 #include <nc/common/Range.h>
@@ -143,28 +144,69 @@ void Hooks::instrument(Function *function, const dflow::Dataflow *dataflow) {
 
     deinstrument(function);
 
-    if (function->entry()) {
-        function2callback_[function] = function->entry()->pushFront(std::make_unique<Callback>([=](){
-            instrumentEntry(function);
-        }));
-    }
-
-    foreach (auto basicBlock, function->basicBlocks()) {
-        foreach (auto statement, basicBlock->statements()) {
-            if (auto call = statement->as<Call>()) {
-                call2callback_[call] = basicBlock->insertAfter(call, std::make_unique<Callback>([=](){
-                    instrumentCall(call, *dataflow, true);
-                }));
-            } else if (auto jump = statement->as<Jump>()) {
-                jump2callback_[jump] = basicBlock->insertBefore(jump, std::make_unique<Callback>([=](){
-                    if (isProvisionalReturn(jump, *dataflow)) {
-                        instrumentReturn(jump);
-                    } else {
-                        deinstrumentReturn(jump);
-                    }
-                }));
+    try {
+        if (function->entry()) {
+            auto insertion = function2callback_.emplace(function, nullptr);
+            if (!insertion.second) {
+                throw std::logic_error(
+                    "function hook callback remained after deinstrumentation");
+            }
+            try {
+                insertion.first->second = function->entry()->pushFront(
+                    std::make_unique<Callback>([=](){
+                        instrumentEntry(function);
+                    }));
+            } catch (...) {
+                function2callback_.erase(insertion.first);
+                throw;
             }
         }
+
+        foreach (auto basicBlock, function->basicBlocks()) {
+            foreach (auto statement, basicBlock->statements()) {
+                if (auto call = statement->as<Call>()) {
+                    auto insertion = call2callback_.emplace(call, nullptr);
+                    if (!insertion.second) {
+                        throw std::logic_error(
+                            "call hook callback remained after deinstrumentation");
+                    }
+                    try {
+                        insertion.first->second = basicBlock->insertAfter(
+                            call, std::make_unique<Callback>([=](){
+                                instrumentCall(call, *dataflow, true);
+                            }));
+                    } catch (...) {
+                        call2callback_.erase(insertion.first);
+                        throw;
+                    }
+                } else if (auto jump = statement->as<Jump>()) {
+                    auto insertion = jump2callback_.emplace(jump, nullptr);
+                    if (!insertion.second) {
+                        throw std::logic_error(
+                            "return hook callback remained after deinstrumentation");
+                    }
+                    try {
+                        insertion.first->second = basicBlock->insertBefore(
+                            jump, std::make_unique<Callback>([=](){
+                                if (isProvisionalReturn(jump, *dataflow)) {
+                                    instrumentReturn(jump);
+                                } else {
+                                    deinstrumentReturn(jump);
+                                }
+                            }));
+                    } catch (...) {
+                        jump2callback_.erase(insertion.first);
+                        throw;
+                    }
+                }
+            }
+        }
+    } catch (...) {
+        /* No callback capturing dataflow may survive a partial pass.  Map
+         * entries are installed before their statements, so deinstrument()
+         * can remove every successfully published callback. */
+        deinstrument(function);
+        throw;
     }
 }
 
@@ -241,11 +283,20 @@ void Hooks::deinstrument(Function *function) {
 
 void Hooks::instrumentEntry(Function *function) {
     auto convention = getConvention(getCalleeId(function));
-    auto signature = signatures_.getSignature(function).get();
-    auto &entryHook = entryHooks_[std::make_tuple(function, convention, signature)];
+    const auto externalSignature = signatures_.getSignature(
+        function, SignatureSource::EXTERNAL);
+    const auto inferredSignature = signatures_.getSignature(
+        function, SignatureSource::INFERRED);
+    const auto signature = externalSignature ?
+        externalSignature : inferredSignature;
+    const bool signatureIsInferred =
+        !externalSignature && static_cast<bool>(inferredSignature);
+    auto &entryHook = entryHooks_[std::make_tuple(
+        function, convention, signature, signatureIsInferred)];
 
     if (!entryHook) {
-        entryHook = std::make_unique<EntryHook>(convention, signature);
+        entryHook = std::make_unique<EntryHook>(
+            convention, signature.get(), signatureIsInferred);
     }
 
     auto &lastEntryHook = lastEntryHooks_[function];
@@ -263,11 +314,12 @@ void Hooks::instrumentEntry(Function *function) {
 }
 
 void Hooks::deinstrumentEntry(Function *function) {
-    auto &lastEntryHook = lastEntryHooks_[function];
-
-    if (lastEntryHook) {
-        lastEntryHook->patch().remove();
-        lastEntryHook = nullptr;
+    const auto position = lastEntryHooks_.find(function);
+    if (position != lastEntryHooks_.end()) {
+        if (position->second) {
+            position->second->patch().remove();
+        }
+        lastEntryHooks_.erase(position);
     }
 }
 
@@ -288,17 +340,30 @@ void Hooks::instrumentCall(Call *call, const dflow::Dataflow &dataflow,
      * address (for example, an IAT entry forwarded to a shared implementation
      * address). Never let that per-call fact leak to another call which
      * happens to resolve to the same address. */
-    const Convention *convention = callSiteId ?
+    const Convention *callSiteConvention = callSiteId ?
         conventions_.getConvention(callSiteId) : nullptr;
-    const bool hasCallSiteConvention = convention != nullptr;
+    const bool hasCallSiteConvention = callSiteConvention != nullptr &&
+        !conventions_.isFallbackConvention(callSiteId);
+    const Convention *convention = hasCallSiteConvention ?
+        callSiteConvention : nullptr;
     if (!convention) {
         convention = getConvention(calleeId);
+    }
+    if (!convention) {
+        convention = callSiteConvention;
     }
     if (!convention) {
         deinstrumentCall(call);
         return;
     }
-    auto signature = signatures_.getSignature(call).get();
+    const auto externalSignature = signatures_.getSignature(
+        call, SignatureSource::EXTERNAL);
+    const auto inferredSignature = signatures_.getSignature(
+        call, SignatureSource::INFERRED);
+    const auto signature = externalSignature ?
+        externalSignature : inferredSignature;
+    const bool signatureIsInferred =
+        !externalSignature && static_cast<bool>(inferredSignature);
     auto stackArgumentsSize = hasCallSiteConvention ?
         conventions_.getStackArgumentsSize(callSiteId) :
         conventions_.getStackArgumentsSize(calleeId);
@@ -312,14 +377,24 @@ void Hooks::instrumentCall(Call *call, const dflow::Dataflow &dataflow,
     } else if (returnCleanup.isConflicting()) {
         unknownStackCleanup = true;
     } else if (convention->calleeCleanup()) {
-        stackCleanupSize = stackArgumentsSize;
+        if (stackArgumentsSize) {
+            stackCleanupSize = stackArgumentsSize;
+        } else {
+            /* A callee-cleanup ABI promises that the call changes SP, but an
+             * unknown argument extent does not prove which post-call value it
+             * produces. Keeping the incoming SP would manufacture an exact
+             * frame offset and make later stack accesses unsound. */
+            unknownStackCleanup = true;
+        }
     }
     auto &callHook = callHooks_[std::make_tuple(
-        call, convention, signature, stackCleanupSize, unknownStackCleanup)];
+        call, convention, signature, stackCleanupSize, unknownStackCleanup,
+        signatureIsInferred)];
 
     if (!callHook) {
         callHook = std::make_unique<CallHook>(
-            convention, signature, stackCleanupSize, unknownStackCleanup);
+            convention, signature.get(), stackCleanupSize,
+            unknownStackCleanup, signatureIsInferred);
     }
 
     auto &lastCallHook = lastCallHooks_[call];
@@ -339,11 +414,12 @@ void Hooks::instrumentCall(Call *call, const dflow::Dataflow &dataflow,
 }
 
 void Hooks::deinstrumentCall(Call *call) {
-    auto &lastCallHook = lastCallHooks_[call];
-
-    if (lastCallHook) {
-        lastCallHook->patch().remove();
-        lastCallHook = nullptr;
+    const auto position = lastCallHooks_.find(call);
+    if (position != lastCallHooks_.end()) {
+        if (position->second) {
+            position->second->patch().remove();
+        }
+        lastCallHooks_.erase(position);
     }
     provisionalCallHooks_.erase(call);
 }
@@ -355,11 +431,20 @@ void Hooks::instrumentReturn(Jump *jump) {
         deinstrumentReturn(jump);
         return;
     }
-    auto signature = signatures_.getSignature(function).get();
-    auto &returnHook = returnHooks_[std::make_tuple(jump, convention, signature)];
+    const auto externalSignature = signatures_.getSignature(
+        function, SignatureSource::EXTERNAL);
+    const auto inferredSignature = signatures_.getSignature(
+        function, SignatureSource::INFERRED);
+    const auto signature = externalSignature ?
+        externalSignature : inferredSignature;
+    const bool signatureIsInferred =
+        !externalSignature && static_cast<bool>(inferredSignature);
+    auto &returnHook = returnHooks_[std::make_tuple(
+        jump, convention, signature, signatureIsInferred)];
 
     if (!returnHook) {
-        returnHook = std::make_unique<ReturnHook>(convention, signature);
+        returnHook = std::make_unique<ReturnHook>(
+            convention, signature.get(), signatureIsInferred);
     }
 
     auto &lastReturnHook = lastReturnHooks_[jump];
@@ -377,11 +462,12 @@ void Hooks::instrumentReturn(Jump *jump) {
 }
 
 void Hooks::deinstrumentReturn(Jump *jump) {
-    auto &lastReturnHook = lastReturnHooks_[jump];
-
-    if (lastReturnHook) {
-        lastReturnHook->patch().remove();
-        lastReturnHook = nullptr;
+    const auto position = lastReturnHooks_.find(jump);
+    if (position != lastReturnHooks_.end()) {
+        if (position->second) {
+            position->second->patch().remove();
+        }
+        lastReturnHooks_.erase(position);
     }
 }
 

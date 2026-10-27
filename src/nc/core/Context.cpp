@@ -34,6 +34,7 @@
 #include <nc/core/ir/calling/Conventions.h>
 #include <nc/core/ir/calling/Hooks.h>
 #include <nc/core/ir/calling/Signatures.h>
+#include <nc/core/ir/calling/SymbolPrototypeRegistry.h>
 #include <nc/core/ir/cflow/Graphs.h>
 #include <nc/core/ir/dflow/Dataflows.h>
 #include <nc/core/ir/idiom/Idioms.h>
@@ -47,13 +48,18 @@ namespace core {
 
 Context::Context():
     image_(std::make_shared<image::Image>()),
-    instructions_(std::make_shared<arch::Instructions>())
+    instructions_(std::make_shared<arch::Instructions>()),
+    symbolPrototypeRegistryArchitecture_(nullptr),
+    symbolPrototypeRegistryOperatingSystem_(
+        static_cast<int>(image::Platform::UnknownOS)),
+    symbolPrototypeRegistryBitness_(0)
 {}
 
 Context::~Context() {}
 
 void Context::setImage(const std::shared_ptr<image::Image> &image) {
     image_ = image;
+    clearSymbolPrototypeRegistry();
 }
 
 void Context::setInstructions(const std::shared_ptr<const arch::Instructions> &instructions) {
@@ -79,6 +85,70 @@ void Context::setHooks(std::unique_ptr<ir::calling::Hooks> hooks) {
 
 void Context::setSignatures(std::unique_ptr<ir::calling::Signatures> signatures) {
     signatures_ = std::move(signatures);
+}
+
+void Context::addSymbolPrototypeProvider(
+        std::shared_ptr<const ir::calling::SymbolPrototypeProvider> provider) {
+    if (provider) {
+        symbolPrototypeProviders_.push_back(std::move(provider));
+        clearSymbolPrototypeRegistry();
+    }
+}
+
+void Context::setSymbolPrototypeRegistry(
+        std::unique_ptr<ir::calling::SymbolPrototypeRegistry> registry) {
+    symbolPrototypeRegistry_ = std::move(registry);
+    if (!symbolPrototypeRegistry_) {
+        clearSymbolPrototypeRegistry();
+        return;
+    }
+
+    const arch::Architecture *architecture = image_ ?
+        image_->platform().architecture() : nullptr;
+    symbolPrototypeRegistryArchitecture_ = architecture;
+    symbolPrototypeRegistryOperatingSystem_ = image_ ?
+        static_cast<int>(image_->platform().operatingSystem()) :
+        static_cast<int>(image::Platform::UnknownOS);
+    symbolPrototypeRegistryBitness_ = architecture ?
+        architecture->bitness() : 0;
+}
+
+ir::calling::SymbolPrototypeRegistry *Context::symbolPrototypeRegistry() {
+    if (!symbolPrototypeRegistryMatchesImage()) {
+        clearSymbolPrototypeRegistry();
+    }
+    return symbolPrototypeRegistry_.get();
+}
+
+const ir::calling::SymbolPrototypeRegistry *
+Context::symbolPrototypeRegistry() const {
+    return symbolPrototypeRegistryMatchesImage() ?
+        symbolPrototypeRegistry_.get() : nullptr;
+}
+
+void Context::clearSymbolPrototypeRegistry() {
+    symbolPrototypeRegistry_.reset();
+    symbolPrototypeRegistryArchitecture_ = nullptr;
+    symbolPrototypeRegistryOperatingSystem_ =
+        static_cast<int>(image::Platform::UnknownOS);
+    symbolPrototypeRegistryBitness_ = 0;
+}
+
+bool Context::symbolPrototypeRegistryMatchesImage() const {
+    if (!symbolPrototypeRegistry_) {
+        return false;
+    }
+
+    const arch::Architecture *architecture = image_ ?
+        image_->platform().architecture() : nullptr;
+    const int operatingSystem = image_ ?
+        static_cast<int>(image_->platform().operatingSystem()) :
+        static_cast<int>(image::Platform::UnknownOS);
+    const SmallBitSize bitness = architecture ? architecture->bitness() : 0;
+
+    return symbolPrototypeRegistryArchitecture_ == architecture &&
+           symbolPrototypeRegistryOperatingSystem_ == operatingSystem &&
+           symbolPrototypeRegistryBitness_ == bitness;
 }
 
 void Context::setDataflows(std::unique_ptr<ir::dflow::Dataflows> dataflows) {

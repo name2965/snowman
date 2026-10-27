@@ -25,6 +25,7 @@
 
 #include <nc/config.h>
 
+#include <set>
 #include <vector>
 
 #include <boost/noncopyable.hpp>
@@ -95,6 +96,8 @@ namespace vars {
 
 namespace cgen {
 
+class DeclarationGenerator;
+
 /**
  * LikeC code generator.
  */
@@ -124,6 +127,23 @@ class CodeGenerator: boost::noncopyable {
 
     /** Mapping of functions to their declarations. */
     boost::unordered_map<const calling::FunctionSignature *, likec::FunctionDeclaration *> signature2declaration_;
+
+    /** Stable, collision-free identifiers in C's ordinary global namespace. */
+    std::set<QString> globalIdentifiers_;
+    /**
+     * Identifiers used by any function scope.
+     *
+     * C permits a block-scope declaration to shadow a global declaration,
+     * but doing so is not semantics preserving for generated calls and
+     * global-variable accesses.  Global declarations are emitted lazily, so
+     * keep the union as well as each generator's per-function set: whichever
+     * side is named first makes the other choose a suffix.
+     */
+    std::set<QString> localIdentifiers_;
+    boost::unordered_map<const calling::FunctionSignature *, QString>
+        signature2identifier_;
+    boost::unordered_map<const vars::Variable *, QString>
+        variable2identifier_;
 
 public:
 
@@ -216,6 +236,15 @@ public:
 
     const NameGenerator &nameGenerator() const { return nameGenerator_; }
 
+    /** Returns one stable global identifier for a function signature. */
+    QString getFunctionIdentifier(
+        const calling::FunctionSignature *signature,
+        const QString &candidate);
+
+    /** Returns one stable global identifier for a reconstructed variable. */
+    QString getVariableIdentifier(
+        const vars::Variable *variable, const QString &candidate);
+
     /**
      * Translates input program into LikeC compilation unit.
      */
@@ -291,6 +320,13 @@ public:
      * its own declaration, CodeGenerator already knows about it.
      */
     void setFunctionDeclaration(const calling::FunctionSignature *signature, likec::FunctionDeclaration *declaration);
+
+private:
+    QString claimGlobalIdentifier(const QString &candidate);
+    QString claimLocalIdentifier(
+        const QString &candidate, std::set<QString> &scopeIdentifiers);
+
+    friend class DeclarationGenerator;
 };
 
 } // namespace cgen

@@ -9,34 +9,47 @@
 #include <string>
 #include <vector>
 
+#include <nc/common/BitTwiddling.h>
 #include <nc/common/CancellationToken.h>
+#include <nc/common/CheckedAddress.h>
 #include <nc/common/Foreach.h>
 #include <nc/common/LogToken.h>
 #include <nc/common/SizedValue.h>
 #include <nc/core/arch/Architecture.h>
 #include <nc/core/arch/Disassembler.h>
 #include <nc/core/arch/Instruction.h>
+#include <nc/core/image/ByteSource.h>
+#include <nc/core/image/Image.h>
+#include <nc/core/image/Relocation.h>
+#include <nc/core/image/Symbol.h>
 #include <nc/core/ir/BasicBlock.h>
 #include <nc/core/ir/CFG.h>
 #include <nc/core/ir/Dominators.h>
 #include <nc/core/ir/Function.h>
+#include <nc/core/ir/Functions.h>
+#include <nc/core/ir/FunctionsGenerator.h>
 #include <nc/core/ir/Jump.h>
 #include <nc/core/ir/PostDominators.h>
+#include <nc/core/ir/Program.h>
 #include <nc/core/ir/Statements.h>
 #include <nc/core/ir/Terms.h>
 #include <nc/core/ir/calling/CallSignature.h>
+#include <nc/core/ir/calling/CallFrameAnalyzer.h>
 #include <nc/core/ir/calling/CallHook.h>
 #include <nc/core/ir/calling/CalleeId.h>
 #include <nc/core/ir/calling/Convention.h>
 #include <nc/core/ir/calling/Conventions.h>
 #include <nc/core/ir/calling/Hooks.h>
 #include <nc/core/ir/calling/EntryHook.h>
+#include <nc/core/ir/calling/FunctionPrototype.h>
 #include <nc/core/ir/calling/ReturnHook.h>
+#include <nc/core/ir/calling/SignatureAnalyzer.h>
 #include <nc/core/ir/calling/Signatures.h>
 #include <nc/core/ir/cgen/Utils.h>
 #include <nc/core/ir/dflow/AbstractValue.h>
 #include <nc/core/ir/dflow/Dataflow.h>
 #include <nc/core/ir/dflow/DataflowAnalyzer.h>
+#include <nc/core/ir/dflow/Dataflows.h>
 #include <nc/core/ir/dflow/DefUseGraph.h>
 #include <nc/core/ir/dflow/ExpressionIdentity.h>
 #include <nc/core/ir/dflow/ReachingDefinitions.h>
@@ -45,6 +58,7 @@
 #include <nc/core/ir/dflow/ValueProvenance.h>
 #include <nc/core/ir/liveness/Liveness.h>
 #include <nc/core/ir/liveness/LivenessAnalyzer.h>
+#include <nc/core/ir/liveness/Livenesses.h>
 #include <nc/core/irgen/InstructionAnalyzer.h>
 
 using namespace nc;
@@ -140,6 +154,66 @@ public:
     void print(QTextStream &) const override {}
 };
 
+class TestDisassemblyArchitecture: public TestArchitecture {
+public:
+    TestDisassemblyArchitecture() {
+        setBitness(64);
+        setMaxInstructionSize(4);
+    }
+};
+
+class TopAddressByteSource: public image::ByteSource {
+    ByteAddr begin_;
+    ByteAddr end_;
+    bool overreport_;
+
+public:
+    TopAddressByteSource(ByteAddr begin, ByteAddr end,
+                         bool overreport = false):
+        begin_(begin), end_(end), overreport_(overreport)
+    {}
+
+    ByteSize readBytes(ByteAddr address, void *buffer,
+                       ByteSize size) const override {
+        if (address < begin_ || address >= end_ || size <= 0) {
+            return 0;
+        }
+
+        const ByteSize remaining = end_ - address;
+        const ByteSize count = size < remaining ? size : remaining;
+        char *bytes = static_cast<char *>(buffer);
+        for (ByteSize i = 0; i < count; ++i) {
+            bytes[i] = static_cast<char>(0x90);
+        }
+        return overreport_ ? size + 1 : count;
+    }
+};
+
+class TestDisassembler: public arch::Disassembler {
+    SmallByteSize decodedSize_;
+    std::vector<ByteAddr> attemptedAddresses_;
+
+public:
+    TestDisassembler(const arch::Architecture *architecture,
+                     SmallByteSize decodedSize):
+        arch::Disassembler(architecture), decodedSize_(decodedSize)
+    {}
+
+    std::shared_ptr<arch::Instruction> disassembleSingleInstruction(
+            ByteAddr address, const void *, ByteSize size) override {
+        attemptedAddresses_.push_back(address);
+        if (size <= 0) {
+            return std::shared_ptr<arch::Instruction>();
+        }
+        return std::shared_ptr<arch::Instruction>(
+            new TestInstruction(address, decodedSize_));
+    }
+
+    const std::vector<ByteAddr> &attemptedAddresses() const {
+        return attemptedAddresses_;
+    }
+};
+
 class TestConvention: public calling::Convention {
 public:
     MemoryLocation volatileLocation;
@@ -157,6 +231,1157 @@ public:
         addReturnValueLocation(returnLocation);
     }
 };
+
+class TestStackConvention: public calling::Convention {
+public:
+    MemoryLocation stackPointerLocation;
+
+    explicit TestStackConvention(bool calleeCleanup = false):
+        calling::Convention(QLatin1String("test-stack")),
+        stackPointerLocation(
+            MemoryDomain::FIRST_REGISTER + 44, 0, 32)
+    {
+        setStackPointer(stackPointerLocation);
+        setFirstArgumentOffset(32);
+        setArgumentAlignment(32);
+        setCalleeCleanup(calleeCleanup);
+    }
+};
+
+class TestRegisterInferenceConvention: public calling::Convention {
+public:
+    MemoryLocation argumentLocation;
+    MemoryLocation returnLocation;
+
+    TestRegisterInferenceConvention():
+        calling::Convention(QLatin1String("test-register-inference")),
+        argumentLocation(MemoryDomain::FIRST_REGISTER + 46, 0, 32),
+        returnLocation(MemoryDomain::FIRST_REGISTER + 47, 0, 32)
+    {
+        addArgumentGroup(
+            std::vector<MemoryLocation>(1, argumentLocation));
+        addReturnValueLocation(returnLocation);
+    }
+};
+
+void testLateFunctionEntryPreservesFallthrough() {
+    Program program;
+    TestInstruction firstInstruction(0x1000, 1);
+    TestInstruction entryInstruction(0x1001, 1);
+
+    BasicBlock *block = program.getBasicBlockForInstruction(
+        &firstInstruction);
+    std::unique_ptr<Statement> firstStatement(new Assignment(
+        std::unique_ptr<Term>(new MemoryLocationAccess(
+            MemoryLocation(MemoryDomain::FIRST_REGISTER + 50, 0, 32))),
+        constant(32, 1)));
+    firstStatement->setInstruction(&firstInstruction);
+    block->pushBack(std::move(firstStatement));
+
+    check(program.getBasicBlockForInstruction(&entryInstruction) == block,
+          "fixture instructions must initially share one basic block");
+    std::unique_ptr<Statement> entryStatement(new Assignment(
+        std::unique_ptr<Term>(new MemoryLocationAccess(
+            MemoryLocation(MemoryDomain::FIRST_REGISTER + 51, 0, 32))),
+        constant(32, 2)));
+    entryStatement->setInstruction(&entryInstruction);
+    block->pushBack(std::move(entryStatement));
+
+    BasicBlock *oldSuccessor = program.createBasicBlock(0x1002);
+    block->pushBack(std::unique_ptr<Statement>(
+        new Jump(JumpTarget(oldSuccessor))));
+
+    BasicBlock *entry = program.refineFunctionEntry(0x1001);
+    check(entry != nullptr && entry != block &&
+              program.isFunctionEntry(0x1001),
+          "late function evidence must create a distinct entry block");
+    check(block->getJump() &&
+              block->getJump()->thenTarget().basicBlock() == entry,
+          "splitting finalized IR must preserve predecessor fall-through");
+    check(entry->getJump() &&
+              entry->getJump()->thenTarget().basicBlock() == oldSuccessor,
+          "the split entry must retain the original outgoing edge");
+
+    CFG cfg(program.basicBlocks());
+    check(cfg.getSuccessors(block).size() == 1 &&
+              cfg.getSuccessors(block).front() == entry,
+          "the refined Program CFG must contain the materialized edge");
+}
+
+void testLateEntryInsideIrlessTailPreservesFallthrough() {
+    Program program;
+    TestInstruction materialInstruction(0x2000, 1);
+    TestInstruction irlessInstruction(0x2001, 1);
+
+    BasicBlock *block = program.getBasicBlockForInstruction(
+        &materialInstruction);
+    std::unique_ptr<Statement> statement(new Assignment(
+        std::unique_ptr<Term>(new MemoryLocationAccess(
+            MemoryLocation(MemoryDomain::FIRST_REGISTER + 52, 0, 32))),
+        constant(32, 1)));
+    statement->setInstruction(&materialInstruction);
+    block->pushBack(std::move(statement));
+
+    check(program.getBasicBlockForInstruction(
+              &irlessInstruction) == block,
+          "an IR-less instruction must still extend its containing range");
+    BasicBlock *successor = program.createBasicBlock(0x2002);
+    block->pushBack(std::unique_ptr<Statement>(
+        new Jump(JumpTarget(successor))));
+
+    BasicBlock *entry = program.refineFunctionEntry(0x2001);
+    check(entry && entry != block &&
+              program.isFunctionEntry(0x2001),
+          "an entry in an IR-less tail must create a distinct block");
+    check(block->getJump() &&
+              block->getJump()->thenTarget().basicBlock() == entry,
+          "the material predecessor must fall through to the IR-less entry");
+    check(entry->getJump() &&
+              entry->getJump()->thenTarget().basicBlock() == successor,
+          "the synthetic successor edge must move with the IR-less tail");
+
+    CFG cfg(program.basicBlocks());
+    check(cfg.getSuccessors(block).size() == 1 &&
+              cfg.getSuccessors(block).front() == entry &&
+              cfg.getSuccessors(entry).size() == 1 &&
+              cfg.getSuccessors(entry).front() == successor,
+          "an IR-less late entry must remain connected on both sides");
+}
+
+void testKnownIrlessFunctionEntryIsPreserved() {
+    Program program;
+    TestInstruction firstNop(0x2100, 1);
+    TestInstruction secondNop(0x2101, 1);
+
+    BasicBlock *entry = program.getBasicBlockForInstruction(&firstNop);
+    check(program.getBasicBlockForInstruction(&secondNop) == entry &&
+              entry->statements().empty(),
+          "the fixture must contain a decoded range with no semantic IR");
+    program.addFunctionEntry(0x2100);
+
+    Functions functions;
+    FunctionsGenerator().makeFunctions(program, functions);
+    check(functions.list().size() == 1 &&
+              functions.list().front()->entry() &&
+              functions.list().front()->entry()->address() &&
+              *functions.list().front()->entry()->address() == 0x2100,
+          "a proved entry made only of IR-less instructions must survive function generation");
+
+    Program anonymousProgram;
+    anonymousProgram.getBasicBlockForInstruction(&firstNop);
+    Functions anonymousFunctions;
+    FunctionsGenerator().makeFunctions(
+        anonymousProgram, anonymousFunctions);
+    check(anonymousFunctions.list().empty(),
+          "an anonymous IR-less range must not manufacture a function");
+}
+
+void testDirectCallBoundaryPreventsFunctionMerging() {
+    Program program;
+    TestInstruction callerInstruction(0x2200, 1);
+    TestInstruction calleeInstruction(0x2201, 1);
+
+    BasicBlock *caller = program.getBasicBlockForInstruction(
+        &callerInstruction);
+    std::unique_ptr<Statement> callerStatement(new Assignment(
+        std::unique_ptr<Term>(new MemoryLocationAccess(
+            MemoryLocation(MemoryDomain::FIRST_REGISTER + 53, 0, 32))),
+        constant(32, 1)));
+    callerStatement->setInstruction(&callerInstruction);
+    caller->pushBack(std::move(callerStatement));
+
+    BasicBlock *callee = program.createBasicBlock(0x2201);
+    program.getBasicBlockForInstruction(&calleeInstruction);
+    std::unique_ptr<Statement> calleeStatement(new Assignment(
+        std::unique_ptr<Term>(new MemoryLocationAccess(
+            MemoryLocation(MemoryDomain::FIRST_REGISTER + 54, 0, 32))),
+        constant(32, 2)));
+    calleeStatement->setInstruction(&calleeInstruction);
+    callee->pushBack(std::move(calleeStatement));
+    caller->pushBack(std::unique_ptr<Statement>(
+        new Jump(JumpTarget(callee))));
+
+    program.addFunctionEntry(0x2200);
+    program.addCalledAddress(0x2201);
+    check(program.isFunctionEntry(0x2201),
+          "a proved direct call target must become a function entry");
+
+    Functions functions;
+    FunctionsGenerator().makeFunctions(program, functions);
+    check(functions.list().size() == 2,
+          "a CFG edge must not merge two proved function entries");
+    for (const Function *function : functions.list()) {
+        check(function->basicBlocks().size() == 1,
+              "each proved entry must own only its side of the boundary");
+    }
+}
+
+Statement *addStackAdjustment(
+        BasicBlock *block, const MemoryLocation &stackPointer,
+        ConstantValue amount, bool subtract,
+        const arch::Instruction *instruction) {
+    std::unique_ptr<Statement> statement(new Assignment(
+        std::unique_ptr<Term>(new MemoryLocationAccess(stackPointer)),
+        std::unique_ptr<Term>(new BinaryOperator(
+            subtract ? BinaryOperator::SUB : BinaryOperator::ADD,
+            std::unique_ptr<Term>(new MemoryLocationAccess(stackPointer)),
+            constant(stackPointer.size<SmallBitSize>(), amount),
+            stackPointer.size<SmallBitSize>()))));
+    statement->setInstruction(instruction);
+    return block->pushBack(std::move(statement));
+}
+
+Term *addStackStore(
+        BasicBlock *block, const MemoryLocation &stackPointer,
+        ByteSize byteOffset, ConstantValue value,
+        const arch::Instruction *instruction) {
+    std::unique_ptr<Term> address(new MemoryLocationAccess(stackPointer));
+    if (byteOffset != 0) {
+        address.reset(new BinaryOperator(
+            BinaryOperator::ADD, std::move(address),
+            constant(stackPointer.size<SmallBitSize>(), byteOffset),
+            stackPointer.size<SmallBitSize>()));
+    }
+    std::unique_ptr<Term> destination(new Dereference(
+        std::move(address), MemoryDomain::MEMORY, 32));
+    Term *result = destination.get();
+    std::unique_ptr<Statement> statement(new Assignment(
+        std::move(destination), constant(32, value)));
+    statement->setInstruction(instruction);
+    block->pushBack(std::move(statement));
+    return result;
+}
+
+void addSemanticPush(
+        BasicBlock *block, const MemoryLocation &stackPointer,
+        ConstantValue value, const arch::Instruction *instruction) {
+    addStackAdjustment(block, stackPointer, 4, true, instruction);
+    addStackStore(block, stackPointer, 0, value, instruction);
+}
+
+enum CallFrameFixtureKind {
+    COMPLETE_PUSH_FRAME,
+    FOLDED_FRAME_TEARDOWN,
+    GAPPED_PUSH_FRAME,
+    PREALLOCATED_OUTGOING_FRAME,
+    DELAYED_CALLER_CLEANUP
+};
+
+boost::optional<ByteSize> analyzeCallFrameFixture(
+        CallFrameFixtureKind kind,
+        std::size_t *recoveredArgumentCount = nullptr,
+        bool addExternalStub = false,
+        bool markExternalStubOpaque = false) {
+    const ConstantValue targetAddress = 0x7700;
+    TestArchitecture architecture;
+    TestStackConvention convention;
+    Function function;
+    BasicBlock *block = addBlock(function);
+    function.setEntry(block);
+
+    Function externalStub;
+    if (addExternalStub) {
+        std::unique_ptr<BasicBlock> stubBlockStorage(
+            new BasicBlock(static_cast<ByteAddr>(targetAddress)));
+        BasicBlock *stubBlock = stubBlockStorage.get();
+        externalStub.addBasicBlock(std::move(stubBlockStorage));
+        externalStub.setEntry(stubBlock);
+        stubBlock->pushBack(std::unique_ptr<Statement>(new Halt()));
+    }
+
+    TestInstruction firstSetupInstruction(0x1000, 1);
+    TestInstruction secondSetupInstruction(0x1001, 1);
+    TestInstruction callInstruction(0x1002, 5);
+    TestInstruction interveningInstruction(0x1007, 1);
+    TestInstruction cleanupInstruction(0x1008, 3);
+
+    if (kind == PREALLOCATED_OUTGOING_FRAME) {
+        addStackAdjustment(
+            block, convention.stackPointerLocation, 8, true,
+            &firstSetupInstruction);
+        addStackStore(
+            block, convention.stackPointerLocation, 0, 0x11,
+            &secondSetupInstruction);
+        addStackStore(
+            block, convention.stackPointerLocation, 4, 0x22,
+            &secondSetupInstruction);
+    } else if (kind == GAPPED_PUSH_FRAME) {
+        /* Reserve the high slot without defining it, then push only the low
+         * slot. The cleanup size alone must not fill this evidence gap. */
+        addStackAdjustment(
+            block, convention.stackPointerLocation, 4, true,
+            &firstSetupInstruction);
+        addSemanticPush(
+            block, convention.stackPointerLocation, 0x22,
+            &secondSetupInstruction);
+    } else {
+        addSemanticPush(
+            block, convention.stackPointerLocation, 0x11,
+            &firstSetupInstruction);
+        if (kind != FOLDED_FRAME_TEARDOWN) {
+            addSemanticPush(
+                block, convention.stackPointerLocation, 0x22,
+                &secondSetupInstruction);
+        }
+    }
+
+    /* Model the architecture's call sequence: push return address, execute
+     * the call, then remove the return-address slot. */
+    addStackAdjustment(
+        block, convention.stackPointerLocation, 4, true,
+        &callInstruction);
+    {
+        std::unique_ptr<Term> destination(new Dereference(
+            std::unique_ptr<Term>(new MemoryLocationAccess(
+                convention.stackPointerLocation)),
+            MemoryDomain::MEMORY, 32));
+        std::unique_ptr<Statement> statement(new Assignment(
+            std::move(destination),
+            std::unique_ptr<Term>(new Intrinsic(
+                Intrinsic::RETURN_ADDRESS, 32))));
+        statement->setInstruction(&callInstruction);
+        block->pushBack(std::move(statement));
+    }
+    std::unique_ptr<Call> callStorage(new Call(
+        constant(32, targetAddress)));
+    Call *call = callStorage.get();
+    callStorage->setInstruction(&callInstruction);
+    block->pushBack(std::move(callStorage));
+    addStackAdjustment(
+        block, convention.stackPointerLocation, 4, false,
+        &callInstruction);
+
+    if (kind == DELAYED_CALLER_CLEANUP) {
+        std::unique_ptr<Statement> intervening(new Assignment(
+            std::unique_ptr<Term>(new MemoryLocationAccess(
+                MemoryLocation(
+                    MemoryDomain::FIRST_REGISTER + 45, 0, 32))),
+            constant(32, 7)));
+        intervening->setInstruction(&interveningInstruction);
+        block->pushBack(std::move(intervening));
+    }
+    addStackAdjustment(
+        block, convention.stackPointerLocation, 8, false,
+        &cleanupInstruction);
+    block->pushBack(std::unique_ptr<Statement>(new Halt()));
+
+    calling::Conventions conventions;
+    conventions.setConvention(
+        calling::CalleeId(&function), &convention);
+    conventions.setConvention(
+        calling::CalleeId(calling::EntryAddress(targetAddress)),
+        &convention);
+    if (markExternalStubOpaque) {
+        /* Model the conflicting fact produced when a tail-jump-only thunk is
+         * analyzed before its relocation-backed external identity is known. */
+        conventions.setConflictingReturnStackCleanup(
+            calling::CalleeId(calling::EntryAddress(targetAddress)));
+        conventions.setExternalBodyOpaque(
+            calling::CalleeId(calling::EntryAddress(targetAddress)));
+        /* Re-analysis must not reintroduce body evidence for an opaque
+         * forwarding boundary. */
+        conventions.setConflictingReturnStackCleanup(
+            calling::CalleeId(calling::EntryAddress(targetAddress)));
+    }
+    calling::Signatures signatures;
+    calling::Hooks hooks(conventions, signatures);
+    std::unique_ptr<Dataflow> dataflow(new Dataflow());
+    hooks.instrument(&function, dataflow.get());
+
+    CFG cfg(function.basicBlocks());
+    CancellationToken canceled;
+    LogToken log;
+    DataflowAnalyzer(
+        *dataflow, &architecture, canceled, log).analyze(cfg);
+    check(dataflow->converged(),
+          "the call-frame fixture must reach a dataflow fixpoint");
+
+    const calling::CallHook *hook = hooks.getCallHook(call);
+    check(hook != nullptr && hook->snapshotStatement() != nullptr,
+          "the unknown external call must retain an inference snapshot");
+    const boost::optional<ByteSize> result =
+        calling::CallFrameAnalyzer::inferCallerCleanupArgumentSize(
+            call, &convention, hook, *dataflow);
+
+    if (recoveredArgumentCount) {
+        std::unique_ptr<liveness::Liveness> liveness(
+            new liveness::Liveness());
+        liveness::LivenessAnalyzer(
+            *liveness, &function, *dataflow, &architecture, nullptr,
+            hooks, &signatures, log).analyze();
+
+        dflow::Dataflows dataflows;
+        dataflows.emplace(
+            &function,
+            std::unique_ptr<const Dataflow>(std::move(dataflow)));
+        liveness::Livenesses livenesses;
+        livenesses.emplace(
+            &function,
+            std::unique_ptr<const liveness::Liveness>(
+                std::move(liveness)));
+
+        if (addExternalStub) {
+            std::unique_ptr<Dataflow> stubDataflow(new Dataflow());
+            hooks.instrument(&externalStub, stubDataflow.get());
+            CFG stubCfg(externalStub.basicBlocks());
+            DataflowAnalyzer(
+                *stubDataflow, &architecture, canceled, log).analyze(
+                    stubCfg);
+            check(stubDataflow->converged(),
+                  "the external-stub fixture must reach a dataflow fixpoint");
+
+            std::unique_ptr<liveness::Liveness> stubLiveness(
+                new liveness::Liveness());
+            liveness::LivenessAnalyzer(
+                *stubLiveness, &externalStub, *stubDataflow,
+                &architecture, nullptr, hooks, &signatures,
+                log).analyze();
+            dataflows.emplace(
+                &externalStub,
+                std::unique_ptr<const Dataflow>(
+                    std::move(stubDataflow)));
+            livenesses.emplace(
+                &externalStub,
+                std::unique_ptr<const liveness::Liveness>(
+                    std::move(stubLiveness)));
+        }
+        calling::SignatureAnalyzer(
+            signatures, dataflows, hooks, livenesses,
+            canceled, log).analyze();
+
+        const auto &signature = signatures.getSignature(
+            static_cast<ByteAddr>(targetAddress));
+        *recoveredArgumentCount =
+            signature ? signature->arguments().size() : 0;
+    }
+    return result;
+}
+
+void testCallerCleanupCallFrameInference() {
+    std::size_t recoveredArgumentCount = 0;
+    const boost::optional<ByteSize> complete =
+        analyzeCallFrameFixture(
+            COMPLETE_PUSH_FRAME, &recoveredArgumentCount);
+    check(complete && *complete == 8,
+          "a fully covered semantic push/restore frame must expose its exact extent");
+    check(recoveredArgumentCount == 2,
+          "signature reconstruction must consume the proved call-frame extent");
+
+    recoveredArgumentCount = 1;
+    analyzeCallFrameFixture(
+        COMPLETE_PUSH_FRAME, &recoveredArgumentCount, true, false);
+    check(recoveredArgumentCount == 0,
+          "an ordinary local body must suppress caller-only ABI inference");
+    analyzeCallFrameFixture(
+        COMPLETE_PUSH_FRAME, &recoveredArgumentCount, true, true);
+    check(recoveredArgumentCount == 2,
+          "an explicitly opaque external thunk must not suppress call-site evidence");
+    check(!analyzeCallFrameFixture(FOLDED_FRAME_TEARDOWN),
+          "cleanup larger than the pushed range must not absorb caller locals");
+    recoveredArgumentCount = 1;
+    check(!analyzeCallFrameFixture(
+              GAPPED_PUSH_FRAME, &recoveredArgumentCount),
+          "an undefined slot inside the restored range must reject the extent");
+    check(recoveredArgumentCount == 0,
+          "a rejected extent must not leak stack arguments into the signature");
+    check(!analyzeCallFrameFixture(PREALLOCATED_OUTGOING_FRAME),
+          "preallocated outgoing storage must not be guessed to contain arguments");
+    check(!analyzeCallFrameFixture(DELAYED_CALLER_CLEANUP),
+          "a later epilogue-style SP update must not be treated as immediate call cleanup");
+}
+
+void runSignatureInferencePass(
+        Function &function, const TestArchitecture &architecture,
+        calling::Hooks &hooks, calling::Signatures &signatures) {
+    std::unique_ptr<Dataflow> dataflow(new Dataflow());
+    hooks.instrument(&function, dataflow.get());
+
+    CancellationToken canceled;
+    LogToken log;
+    DataflowAnalyzer(
+        *dataflow, &architecture, canceled, log).analyze(
+            CFG(function.basicBlocks()));
+    hooks.finalizeInstrumentation(&function, *dataflow);
+    check(dataflow->converged(),
+          "the repeated signature pass must reach a dataflow fixpoint");
+
+    std::unique_ptr<liveness::Liveness> liveness(
+        new liveness::Liveness());
+    liveness::LivenessAnalyzer(
+        *liveness, &function, *dataflow, &architecture, nullptr,
+        hooks, &signatures, log).analyze();
+
+    dflow::Dataflows dataflows;
+    dataflows.emplace(
+        &function,
+        std::unique_ptr<const Dataflow>(std::move(dataflow)));
+    liveness::Livenesses livenesses;
+    livenesses.emplace(
+        &function,
+        std::unique_ptr<const liveness::Liveness>(
+            std::move(liveness)));
+
+    signatures.beginInferenceUpdate();
+    try {
+        calling::SignatureAnalyzer(
+            signatures, dataflows, hooks, livenesses,
+            canceled, log).analyze();
+        signatures.finishInferenceUpdate();
+    } catch (...) {
+        signatures.cancelInferenceUpdate();
+        throw;
+    }
+}
+
+bool hasOnlyRegisterArgument(
+        const std::shared_ptr<calling::FunctionSignature> &signature,
+        const MemoryLocation &location) {
+    if (!signature || signature->arguments().size() != 1) {
+        return false;
+    }
+    const auto access =
+        signature->arguments().front()->asMemoryLocationAccess();
+    return access && access->memoryLocation() == location;
+}
+
+void testInferredFunctionSignatureIsRevalidatedAcrossPasses() {
+    TestArchitecture architecture;
+    TestRegisterInferenceConvention convention;
+    Function function;
+    BasicBlock *block = addBlock(function);
+    function.setEntry(block);
+
+    std::unique_ptr<Statement> argumentReadStorage(new Touch(
+        std::unique_ptr<Term>(new MemoryLocationAccess(
+            convention.argumentLocation)), Term::READ));
+    Statement *argumentRead = argumentReadStorage.get();
+    block->pushBack(std::move(argumentReadStorage));
+
+    std::unique_ptr<Statement> returnDefinitionStorage(new Assignment(
+        std::unique_ptr<Term>(new MemoryLocationAccess(
+            convention.returnLocation)), constant(32, 0x41)));
+    Statement *returnDefinition = returnDefinitionStorage.get();
+    block->pushBack(std::move(returnDefinitionStorage));
+    block->pushBack(std::unique_ptr<Statement>(new Jump(JumpTarget(
+        std::unique_ptr<Term>(new Intrinsic(
+            Intrinsic::RETURN_ADDRESS, 32))))));
+
+    calling::Conventions conventions;
+    conventions.setConvention(
+        calling::CalleeId(&function), &convention);
+    calling::Signatures signatures;
+    calling::Hooks hooks(conventions, signatures);
+
+    for (int pass = 0; pass < 3; ++pass) {
+        runSignatureInferencePass(
+            function, architecture, hooks, signatures);
+        const auto &signature = signatures.getSignature(
+            &function, calling::SignatureSource::INFERRED);
+        check(hasOnlyRegisterArgument(
+                  signature, convention.argumentLocation),
+              "an inferred formal argument disappeared on a later semantic pass");
+        const auto returnAccess = signature && signature->returnValue() ?
+            signature->returnValue()->asMemoryLocationAccess() : nullptr;
+        check(returnAccess &&
+                  returnAccess->memoryLocation() == convention.returnLocation,
+              "an inferred body return disappeared on a later semantic pass");
+    }
+
+    block->erase(argumentRead);
+    block->erase(returnDefinition);
+    runSignatureInferencePass(
+        function, architecture, hooks, signatures);
+    const auto &withoutEvidence = signatures.getSignature(
+        &function, calling::SignatureSource::INFERRED);
+    check(withoutEvidence && withoutEvidence->arguments().empty() &&
+              !withoutEvidence->returnValue(),
+          "synthetic entry/return hooks kept a stale inferred signature alive");
+
+    runSignatureInferencePass(
+        function, architecture, hooks, signatures);
+    const auto &stableEmpty = signatures.getSignature(
+        &function, calling::SignatureSource::INFERRED);
+    check(stableEmpty && stableEmpty->arguments().empty() &&
+              !stableEmpty->returnValue(),
+          "removed function evidence was recreated by a later hook pass");
+}
+
+void testWideReturnDefinitionKeepsUnusedLowHalfAcrossPasses() {
+    TestArchitecture architecture;
+    TestRegisterInferenceConvention convention;
+    Function function;
+    BasicBlock *block = addBlock(function);
+    function.setEntry(block);
+
+    const MemoryLocation wideReturn(
+        convention.returnLocation.domain(),
+        convention.returnLocation.addr(), 64);
+    const MemoryLocation highHalf(
+        convention.returnLocation.domain(),
+        convention.returnLocation.endAddr(), 32);
+    const MemoryLocation globalSink(
+        MemoryDomain::MEMORY, 0xb000, 32);
+    addDefinition(
+        block, wideReturn,
+        constant(64, 0x5152535455565758ULL));
+    addReadDefinition(block, highHalf, globalSink);
+    block->pushBack(std::unique_ptr<Statement>(new Jump(JumpTarget(
+        std::unique_ptr<Term>(new Intrinsic(
+            Intrinsic::RETURN_ADDRESS, 32))))));
+
+    calling::Conventions conventions;
+    conventions.setConvention(
+        calling::CalleeId(&function), &convention);
+    calling::Signatures signatures;
+    calling::Hooks hooks(conventions, signatures);
+
+    for (int pass = 0; pass < 3; ++pass) {
+        runSignatureInferencePass(
+            function, architecture, hooks, signatures);
+        const auto &signature = signatures.getSignature(
+            &function, calling::SignatureSource::INFERRED);
+        const auto returnAccess = signature && signature->returnValue() ?
+            signature->returnValue()->asMemoryLocationAccess() : nullptr;
+        check(returnAccess &&
+                  returnAccess->memoryLocation() ==
+                      convention.returnLocation,
+              "a live high-half consumer suppressed the unused low-half return");
+    }
+}
+
+void testSharedReturnDefinitionAcrossTwoReturnsIsStable() {
+    TestArchitecture architecture;
+    TestRegisterInferenceConvention convention;
+    Function function;
+    BasicBlock *entry = addBlock(function);
+    BasicBlock *leftReturn = addBlock(function);
+    BasicBlock *rightReturn = addBlock(function);
+    function.setEntry(entry);
+
+    addDefinition(
+        entry, convention.returnLocation, constant(32, 0x41));
+    entry->pushBack(std::unique_ptr<Statement>(new Jump(
+        constant(1, 1), JumpTarget(leftReturn), JumpTarget(rightReturn))));
+    leftReturn->pushBack(std::unique_ptr<Statement>(new Jump(JumpTarget(
+        std::unique_ptr<Term>(new Intrinsic(
+            Intrinsic::RETURN_ADDRESS, 32))))));
+    rightReturn->pushBack(std::unique_ptr<Statement>(new Jump(JumpTarget(
+        std::unique_ptr<Term>(new Intrinsic(
+            Intrinsic::RETURN_ADDRESS, 32))))));
+
+    calling::Conventions conventions;
+    conventions.setConvention(
+        calling::CalleeId(&function), &convention);
+    calling::Signatures signatures;
+    calling::Hooks hooks(conventions, signatures);
+
+    for (int pass = 0; pass < 3; ++pass) {
+        runSignatureInferencePass(
+            function, architecture, hooks, signatures);
+        const auto &signature = signatures.getSignature(
+            &function, calling::SignatureSource::INFERRED);
+        const auto returnAccess = signature && signature->returnValue() ?
+            signature->returnValue()->asMemoryLocationAccess() : nullptr;
+        check(returnAccess &&
+                  returnAccess->memoryLocation() ==
+                      convention.returnLocation,
+              "one return hook treated another return's observation as a real use");
+    }
+}
+
+void testInferredCallReturnIsRevalidatedAcrossPasses() {
+    const ByteAddr targetAddress = 0x7850;
+    TestArchitecture architecture;
+    TestRegisterInferenceConvention convention;
+    Function function;
+    BasicBlock *block = addBlock(function);
+    function.setEntry(block);
+
+    std::unique_ptr<Call> callStorage(new Call(
+        constant(32, targetAddress)));
+    Call *call = callStorage.get();
+    block->pushBack(std::move(callStorage));
+    std::unique_ptr<Statement> returnReadStorage(new Touch(
+        std::unique_ptr<Term>(new MemoryLocationAccess(
+            convention.returnLocation)), Term::READ));
+    Statement *returnRead = returnReadStorage.get();
+    block->pushBack(std::move(returnReadStorage));
+    block->pushBack(std::unique_ptr<Statement>(new Halt()));
+
+    calling::Conventions conventions;
+    conventions.setConvention(
+        calling::CalleeId(&function), &convention);
+    conventions.setConvention(
+        calling::CalleeId(calling::EntryAddress(targetAddress)),
+        &convention);
+    calling::Signatures signatures;
+    calling::Hooks hooks(conventions, signatures);
+
+    for (int pass = 0; pass < 3; ++pass) {
+        runSignatureInferencePass(
+            function, architecture, hooks, signatures);
+        const auto &callSignature = signatures.getSignature(
+            call, calling::SignatureSource::INFERRED);
+        const auto &targetSignature = signatures.getSignature(
+            targetAddress, calling::SignatureSource::INFERRED);
+        const auto callReturn =
+            callSignature && callSignature->returnValue() ?
+                callSignature->returnValue()->asMemoryLocationAccess() :
+                nullptr;
+        const auto targetReturn =
+            targetSignature && targetSignature->returnValue() ?
+                targetSignature->returnValue()->asMemoryLocationAccess() :
+                nullptr;
+        check(callReturn && targetReturn &&
+                  callReturn->memoryLocation() ==
+                      convention.returnLocation &&
+                  targetReturn->memoryLocation() ==
+                      convention.returnLocation,
+              "an inferred call return disappeared on a later semantic pass");
+    }
+
+    block->erase(returnRead);
+    runSignatureInferencePass(
+        function, architecture, hooks, signatures);
+    const auto &withoutUse = signatures.getSignature(
+        call, calling::SignatureSource::INFERRED);
+    check(withoutUse && !withoutUse->returnValue(),
+          "a synthetic call return kept stale result evidence alive");
+
+    runSignatureInferencePass(
+        function, architecture, hooks, signatures);
+    const auto &stableWithoutUse = signatures.getSignature(
+        call, calling::SignatureSource::INFERRED);
+    check(stableWithoutUse && !stableWithoutUse->returnValue(),
+          "a removed call-result use was recreated by a later hook pass");
+}
+
+std::shared_ptr<Term> stackArgumentTerm(
+        const MemoryLocation &stackPointer, ByteSize byteOffset) {
+    return std::shared_ptr<Term>(new Dereference(
+        std::unique_ptr<Term>(new BinaryOperator(
+            BinaryOperator::ADD,
+            std::unique_ptr<Term>(new MemoryLocationAccess(stackPointer)),
+            constant(stackPointer.size<SmallBitSize>(), byteOffset),
+            stackPointer.size<SmallBitSize>())),
+        MemoryDomain::MEMORY, 32));
+}
+
+bool isStackArgumentAt(
+        const std::shared_ptr<const Term> &term,
+        const MemoryLocation &stackPointer, ByteSize byteOffset) {
+    const Dereference *dereference = term ? term->asDereference() : nullptr;
+    const BinaryOperator *address = dereference ?
+        dereference->address()->asBinaryOperator() : nullptr;
+    const MemoryLocationAccess *base = address ?
+        address->left()->asMemoryLocationAccess() : nullptr;
+    const Constant *offset = address ?
+        address->right()->asConstant() : nullptr;
+    return dereference && dereference->domain() == MemoryDomain::MEMORY &&
+        base && base->memoryLocation() == stackPointer && offset &&
+        offset->value().value() ==
+            static_cast<ConstantValue>(byteOffset);
+}
+
+std::shared_ptr<calling::CallSignature> makeVariadicStackCallSignature(
+        const MemoryLocation &stackPointer) {
+    std::vector<calling::ParameterDescription> parameters;
+    parameters.push_back(calling::ParameterDescription(
+        QLatin1String("fixed"),
+        calling::TypeDescription(
+            calling::TypeDescription::INTEGER, 32, false),
+        calling::ParameterDescription::PointeeAccess::NONE));
+    const auto prototype =
+        std::make_shared<const calling::FunctionPrototype>(
+            calling::TypeDescription(
+                calling::TypeDescription::VOID, 0, false),
+            std::move(parameters), QString(), QString(), true,
+            QString(), true);
+    std::shared_ptr<calling::CallSignature> signature(
+        new calling::CallSignature());
+    signature->arguments().push_back(stackArgumentTerm(stackPointer, 4));
+    signature->arguments().push_back(stackArgumentTerm(stackPointer, 8));
+    signature->setPrototype(prototype);
+    return signature;
+}
+
+void testVariadicStackTailWithoutExtentIsRevalidated() {
+    const ConstantValue targetAddress = 0x7900;
+    TestArchitecture architecture;
+    TestStackConvention convention;
+    Function function;
+    BasicBlock *block = addBlock(function);
+    function.setEntry(block);
+
+    TestInstruction setupInstruction(0x1200, 1);
+    TestInstruction callInstruction(0x1201, 5);
+    addStackStore(
+        block, convention.stackPointerLocation, 4, 0x51,
+        &setupInstruction);
+    std::unique_ptr<Term> wideTailAddress(new BinaryOperator(
+        BinaryOperator::ADD,
+        std::unique_ptr<Term>(new MemoryLocationAccess(
+            convention.stackPointerLocation)),
+        constant(convention.stackPointerLocation.size<SmallBitSize>(), 8),
+        convention.stackPointerLocation.size<SmallBitSize>()));
+    std::unique_ptr<Statement> tailDefinitionStorage(new Assignment(
+        std::unique_ptr<Term>(new Dereference(
+            std::move(wideTailAddress), MemoryDomain::MEMORY, 64)),
+        constant(64, 0x52535455)));
+    Statement *tailDefinition = tailDefinitionStorage.get();
+    tailDefinitionStorage->setInstruction(&setupInstruction);
+    block->pushBack(std::move(tailDefinitionStorage));
+
+    std::unique_ptr<Call> callStorage(new Call(
+        constant(32, targetAddress)));
+    Call *call = callStorage.get();
+    callStorage->setInstruction(&callInstruction);
+    block->pushBack(std::move(callStorage));
+    block->pushBack(std::unique_ptr<Statement>(new Halt()));
+
+    calling::Conventions conventions;
+    conventions.setConvention(
+        calling::CalleeId(&function), &convention);
+    const calling::CalleeId callSiteId(
+        calling::CallAddress(callInstruction.addr()));
+    conventions.setExternalConvention(callSiteId, &convention);
+    check(!conventions.hasExternalStackArgumentsSizeBinding(callSiteId),
+          "the variadic stack-tail fixture must not have an argument extent");
+
+    std::vector<calling::ParameterDescription> parameters;
+    parameters.push_back(calling::ParameterDescription(
+        QLatin1String("fixed"),
+        calling::TypeDescription(
+            calling::TypeDescription::INTEGER, 32, false),
+        calling::ParameterDescription::PointeeAccess::NONE));
+    const auto prototype =
+        std::make_shared<const calling::FunctionPrototype>(
+            calling::TypeDescription(
+                calling::TypeDescription::VOID, 0, false),
+            std::move(parameters), QString(), QString(), true,
+            QString(), true);
+    std::shared_ptr<calling::CallSignature> externalSignature(
+        new calling::CallSignature());
+    externalSignature->arguments().push_back(stackArgumentTerm(
+        convention.stackPointerLocation, 4));
+    externalSignature->arguments().push_back(stackArgumentTerm(
+        convention.stackPointerLocation, 8));
+    externalSignature->setPrototype(prototype);
+
+    calling::Signatures signatures;
+    signatures.setSignature(
+        call, externalSignature, calling::SignatureSource::EXTERNAL);
+    calling::Hooks hooks(conventions, signatures);
+
+    for (int pass = 0; pass < 3; ++pass) {
+        runSignatureInferencePass(
+            function, architecture, hooks, signatures);
+        const auto &inferred = signatures.getSignature(
+            call, calling::SignatureSource::INFERRED);
+        check(inferred != nullptr,
+              "variadic stack-tail inference produced no call signature");
+        check(inferred->argumentEvidence() ==
+                  calling::CallSignature::ArgumentEvidence::VARIADIC_TAIL,
+              "variadic stack-tail inference lost its evidence provenance");
+        check(!inferred->arguments().empty(),
+              "a proved variadic stack tail without a declared extent was lost");
+        check(inferred->arguments().size() == 1,
+              "variadic tail inference retained an unrelated stack slot");
+        check(isStackArgumentAt(
+                  inferred->arguments().front(),
+                  convention.stackPointerLocation, 8),
+              "a variadic stack tail was normalized to the wrong slot");
+    }
+
+    block->erase(tailDefinition);
+    runSignatureInferencePass(
+        function, architecture, hooks, signatures);
+    const auto &withoutTail = signatures.getSignature(
+        call, calling::SignatureSource::INFERRED);
+    check(withoutTail && withoutTail->arguments().empty() &&
+              withoutTail->argumentEvidence() ==
+                  calling::CallSignature::ArgumentEvidence::VARIADIC_TAIL,
+          "a removed variadic stack tail remained self-sustaining");
+
+    runSignatureInferencePass(
+        function, architecture, hooks, signatures);
+    const auto &stableWithoutTail = signatures.getSignature(
+        call, calling::SignatureSource::INFERRED);
+    check(stableWithoutTail && stableWithoutTail->arguments().empty(),
+          "a synthetic tail read recreated removed stack evidence");
+}
+
+void testWideFixedAndVariadicStoreIsRevalidatedAcrossPasses() {
+    const ConstantValue targetAddress = 0x7910;
+    TestArchitecture architecture;
+    TestStackConvention convention;
+    Function function;
+    BasicBlock *block = addBlock(function);
+    function.setEntry(block);
+
+    TestInstruction setupInstruction(0x1210, 1);
+    TestInstruction callInstruction(0x1211, 5);
+    std::unique_ptr<Term> wideAddress(new BinaryOperator(
+        BinaryOperator::ADD,
+        std::unique_ptr<Term>(new MemoryLocationAccess(
+            convention.stackPointerLocation)),
+        constant(convention.stackPointerLocation.size<SmallBitSize>(), 4),
+        convention.stackPointerLocation.size<SmallBitSize>()));
+    std::unique_ptr<Statement> wideDefinitionStorage(new Assignment(
+        std::unique_ptr<Term>(new Dereference(
+            std::move(wideAddress), MemoryDomain::MEMORY, 64)),
+        constant(64, 0x5152535455565758ULL)));
+    Statement *wideDefinition = wideDefinitionStorage.get();
+    wideDefinitionStorage->setInstruction(&setupInstruction);
+    block->pushBack(std::move(wideDefinitionStorage));
+
+    std::unique_ptr<Call> callStorage(new Call(
+        constant(32, targetAddress)));
+    Call *call = callStorage.get();
+    callStorage->setInstruction(&callInstruction);
+    block->pushBack(std::move(callStorage));
+    block->pushBack(std::unique_ptr<Statement>(new Halt()));
+
+    calling::Conventions conventions;
+    conventions.setConvention(
+        calling::CalleeId(&function), &convention);
+    const calling::CalleeId callSiteId(
+        calling::CallAddress(callInstruction.addr()));
+    conventions.setExternalConvention(callSiteId, &convention);
+    check(!conventions.hasExternalStackArgumentsSizeBinding(callSiteId),
+          "the spanning variadic fixture must not have an argument extent");
+
+    calling::Signatures signatures;
+    signatures.setSignature(
+        call, makeVariadicStackCallSignature(
+                  convention.stackPointerLocation),
+        calling::SignatureSource::EXTERNAL);
+    calling::Hooks hooks(conventions, signatures);
+
+    for (int pass = 0; pass < 3; ++pass) {
+        runSignatureInferencePass(
+            function, architecture, hooks, signatures);
+        const auto &inferred = signatures.getSignature(
+            call, calling::SignatureSource::INFERRED);
+        check(inferred &&
+                  inferred->argumentEvidence() ==
+                      calling::CallSignature::ArgumentEvidence::VARIADIC_TAIL &&
+                  inferred->arguments().size() == 1 &&
+                  isStackArgumentAt(
+                      inferred->arguments().front(),
+                      convention.stackPointerLocation, 8),
+              "a wide fixed-and-tail store lost its variadic subrange");
+    }
+
+    block->erase(wideDefinition);
+    runSignatureInferencePass(
+        function, architecture, hooks, signatures);
+    const auto &withoutDefinition = signatures.getSignature(
+        call, calling::SignatureSource::INFERRED);
+    check(withoutDefinition && withoutDefinition->arguments().empty() &&
+              withoutDefinition->argumentEvidence() ==
+                  calling::CallSignature::ArgumentEvidence::VARIADIC_TAIL,
+          "a deleted wide store left stale variadic-tail evidence");
+
+    runSignatureInferencePass(
+        function, architecture, hooks, signatures);
+    const auto &stableWithoutDefinition = signatures.getSignature(
+        call, calling::SignatureSource::INFERRED);
+    check(stableWithoutDefinition &&
+              stableWithoutDefinition->arguments().empty(),
+          "a synthetic tail observation recreated a deleted wide store");
+}
+
+void testSharedVariadicDefinitionAcrossTwoCallsIsStable() {
+    const ConstantValue targetAddress = 0x7920;
+    TestArchitecture architecture;
+    TestStackConvention convention;
+    Function function;
+    BasicBlock *entry = addBlock(function);
+    BasicBlock *leftCallBlock = addBlock(function);
+    BasicBlock *rightCallBlock = addBlock(function);
+    function.setEntry(entry);
+
+    TestInstruction setupInstruction(0x1220, 1);
+    TestInstruction leftCallInstruction(0x1221, 5);
+    TestInstruction rightCallInstruction(0x1226, 5);
+    addStackStore(
+        entry, convention.stackPointerLocation, 8, 0x61,
+        &setupInstruction);
+    entry->pushBack(std::unique_ptr<Statement>(new Jump(
+        constant(1, 1), JumpTarget(leftCallBlock),
+        JumpTarget(rightCallBlock))));
+
+    auto appendCall = [&](BasicBlock *block,
+                          const TestInstruction *instruction) -> Call * {
+        std::unique_ptr<Call> storage(new Call(
+            constant(32, targetAddress)));
+        Call *call = storage.get();
+        storage->setInstruction(instruction);
+        block->pushBack(std::move(storage));
+        block->pushBack(std::unique_ptr<Statement>(new Halt()));
+        return call;
+    };
+    Call *leftCall = appendCall(
+        leftCallBlock, &leftCallInstruction);
+    Call *rightCall = appendCall(
+        rightCallBlock, &rightCallInstruction);
+
+    calling::Conventions conventions;
+    conventions.setConvention(
+        calling::CalleeId(&function), &convention);
+    conventions.setExternalConvention(
+        calling::CalleeId(calling::CallAddress(
+            leftCallInstruction.addr())), &convention);
+    conventions.setExternalConvention(
+        calling::CalleeId(calling::CallAddress(
+            rightCallInstruction.addr())), &convention);
+
+    calling::Signatures signatures;
+    signatures.setSignature(
+        leftCall, makeVariadicStackCallSignature(
+                      convention.stackPointerLocation),
+        calling::SignatureSource::EXTERNAL);
+    signatures.setSignature(
+        rightCall, makeVariadicStackCallSignature(
+                       convention.stackPointerLocation),
+        calling::SignatureSource::EXTERNAL);
+    calling::Hooks hooks(conventions, signatures);
+
+    const Call *calls[] = { leftCall, rightCall };
+    for (int pass = 0; pass < 3; ++pass) {
+        runSignatureInferencePass(
+            function, architecture, hooks, signatures);
+        foreach (const Call *call, calls) {
+            const auto &inferred = signatures.getSignature(
+                call, calling::SignatureSource::INFERRED);
+            check(inferred &&
+                      inferred->argumentEvidence() ==
+                          calling::CallSignature::ArgumentEvidence::VARIADIC_TAIL &&
+                      inferred->arguments().size() == 1 &&
+                      isStackArgumentAt(
+                          inferred->arguments().front(),
+                          convention.stackPointerLocation, 8),
+                  "one call hook treated another call's observation as a real use");
+        }
+    }
+}
+
+void testCallSpecificVariadicArguments() {
+    const ConstantValue targetAddress = 0x7800;
+    TestArchitecture architecture;
+    TestStackConvention convention;
+    Function function;
+    BasicBlock *block = addBlock(function);
+    function.setEntry(block);
+
+    TestInstruction shortSetupInstruction(0x1100, 1);
+    TestInstruction shortCallInstruction(0x1101, 5);
+    TestInstruction shortCleanupInstruction(0x1106, 3);
+    TestInstruction longFirstSetupInstruction(0x1109, 1);
+    TestInstruction longSecondSetupInstruction(0x110a, 1);
+    TestInstruction longCallInstruction(0x110b, 5);
+    TestInstruction longCleanupInstruction(0x1110, 3);
+
+    auto appendCall = [&](const arch::Instruction *instruction) -> Call * {
+        addStackAdjustment(
+            block, convention.stackPointerLocation, 4, true,
+            instruction);
+        std::unique_ptr<Term> returnAddressDestination(new Dereference(
+            std::unique_ptr<Term>(new MemoryLocationAccess(
+                convention.stackPointerLocation)),
+            MemoryDomain::MEMORY, 32));
+        std::unique_ptr<Statement> returnAddressWrite(new Assignment(
+            std::move(returnAddressDestination),
+            std::unique_ptr<Term>(new Intrinsic(
+                Intrinsic::RETURN_ADDRESS, 32)),
+            Assignment::CONTROL_FLOW_STATE));
+        returnAddressWrite->setInstruction(instruction);
+        block->pushBack(std::move(returnAddressWrite));
+
+        std::unique_ptr<Call> callStorage(new Call(
+            constant(32, targetAddress)));
+        Call *call = callStorage.get();
+        callStorage->setInstruction(instruction);
+        block->pushBack(std::move(callStorage));
+        addStackAdjustment(
+            block, convention.stackPointerLocation, 4, false,
+            instruction);
+        return call;
+    };
+
+    addSemanticPush(
+        block, convention.stackPointerLocation, 0x11,
+        &shortSetupInstruction);
+    Call *shortCall = appendCall(&shortCallInstruction);
+    addStackAdjustment(
+        block, convention.stackPointerLocation, 4, false,
+        &shortCleanupInstruction);
+
+    addSemanticPush(
+        block, convention.stackPointerLocation, 0x21,
+        &longFirstSetupInstruction);
+    addSemanticPush(
+        block, convention.stackPointerLocation, 0x22,
+        &longSecondSetupInstruction);
+    Call *longCall = appendCall(&longCallInstruction);
+    addStackAdjustment(
+        block, convention.stackPointerLocation, 8, false,
+        &longCleanupInstruction);
+    block->pushBack(std::unique_ptr<Statement>(new Halt()));
+
+    calling::Conventions conventions;
+    conventions.setConvention(
+        calling::CalleeId(&function), &convention);
+    conventions.setConvention(
+        calling::CalleeId(calling::EntryAddress(targetAddress)),
+        &convention);
+    calling::Signatures signatures;
+    calling::Hooks hooks(conventions, signatures);
+    std::unique_ptr<Dataflow> dataflow(new Dataflow());
+    hooks.instrument(&function, dataflow.get());
+
+    CFG cfg(function.basicBlocks());
+    CancellationToken canceled;
+    LogToken log;
+    DataflowAnalyzer(
+        *dataflow, &architecture, canceled, log).analyze(cfg);
+    check(dataflow->converged(),
+          "the mixed-arity fixture must reach a dataflow fixpoint");
+
+    std::unique_ptr<liveness::Liveness> liveness(
+        new liveness::Liveness());
+    liveness::LivenessAnalyzer(
+        *liveness, &function, *dataflow, &architecture, nullptr,
+        hooks, &signatures, log).analyze();
+
+    dflow::Dataflows dataflows;
+    dataflows.emplace(
+        &function, std::unique_ptr<const Dataflow>(std::move(dataflow)));
+    liveness::Livenesses livenesses;
+    livenesses.emplace(
+        &function,
+        std::unique_ptr<const liveness::Liveness>(
+            std::move(liveness)));
+    calling::SignatureAnalyzer(
+        signatures, dataflows, hooks, livenesses,
+        canceled, log).analyze();
+
+    const auto &functionSignature = signatures.getSignature(
+        static_cast<ByteAddr>(targetAddress));
+    const auto &shortSignature = signatures.getSignature(shortCall);
+    const auto &longSignature = signatures.getSignature(longCall);
+    check(functionSignature &&
+              functionSignature->arguments().size() == 1 &&
+              functionSignature->variadic(),
+          "only the argument present at every call may become the common variadic prefix");
+    check(shortSignature &&
+              shortSignature->arguments().size() == 1,
+          "a short variadic call must not inherit arguments from a longer call");
+    check(longSignature &&
+              longSignature->arguments().size() == 2,
+          "a long variadic call must retain its proved call-specific suffix");
+}
 
 void testCallClobberContract() {
     TestConvention convention;
@@ -196,6 +1421,165 @@ void testCallClobberContract() {
           "an unknown signature must still model candidate return registers");
     check(volatileWrite < returnWrite,
           "the return definition must follow the general caller-saved kill");
+}
+
+struct StackCleanupEffect {
+    bool isExactStackOffset;
+    bool mayBeStackOffset;
+    SignedConstantValue stackOffset;
+};
+
+StackCleanupEffect analyzeStackCleanupEffect(
+        bool calleeCleanup,
+        const boost::optional<ByteSize> &stackArgumentsSize,
+        const boost::optional<ByteSize> &exactReturnCleanup) {
+    const ConstantValue targetAddress = 0x7a00;
+    TestArchitecture architecture;
+    TestStackConvention convention(calleeCleanup);
+
+    Function function;
+    BasicBlock *block = addBlock(function);
+    function.setEntry(block);
+
+    std::unique_ptr<Call> call(new Call(constant(32, targetAddress)));
+    block->pushBack(std::move(call));
+
+    std::unique_ptr<Term> stackRead(
+        new MemoryLocationAccess(convention.stackPointerLocation));
+    Term *stackReadTerm = stackRead.get();
+    block->pushBack(std::unique_ptr<Statement>(
+        new Touch(std::move(stackRead), Term::READ)));
+    block->pushBack(std::unique_ptr<Statement>(new Halt()));
+
+    const calling::CalleeId targetId{
+        calling::EntryAddress(targetAddress)};
+    calling::Conventions conventions;
+    conventions.setConvention(calling::CalleeId(&function), &convention);
+    conventions.setConvention(targetId, &convention);
+    conventions.setStackArgumentsSize(targetId, stackArgumentsSize);
+    if (exactReturnCleanup) {
+        conventions.setReturnStackCleanupSize(
+            targetId, *exactReturnCleanup);
+    }
+
+    calling::Signatures signatures;
+    calling::Hooks hooks(conventions, signatures);
+    Dataflow dataflow;
+    hooks.instrument(&function, &dataflow);
+
+    CFG cfg(function.basicBlocks());
+    CancellationToken canceled;
+    LogToken log;
+    DataflowAnalyzer(
+        dataflow, &architecture, canceled, log).analyze(cfg);
+    check(dataflow.converged(),
+          "the stack-cleanup fixture must reach a dataflow fixpoint");
+
+    const Value *value = dataflow.findValue(stackReadTerm);
+    check(value != nullptr,
+          "the post-call stack-pointer read must be analyzed");
+    return StackCleanupEffect{
+        value->isStackOffset(), value->mayBeStackOffset(),
+        value->isStackOffset() ? value->stackOffset() : 0};
+}
+
+void testCallStackCleanupSoundness() {
+    const StackCleanupEffect unknownCalleeCleanup =
+        analyzeStackCleanupEffect(true, boost::none, boost::none);
+    check(!unknownCalleeCleanup.isExactStackOffset &&
+              unknownCalleeCleanup.mayBeStackOffset,
+          "callee cleanup with unknown extent must make the post-call SP undefined");
+
+    const StackCleanupEffect callerCleanup =
+        analyzeStackCleanupEffect(false, boost::none, boost::none);
+    check(callerCleanup.isExactStackOffset &&
+              callerCleanup.stackOffset == 0,
+          "caller-cleanup ABI must preserve SP when no immediate cleanup is known");
+
+    const StackCleanupEffect knownCalleeCleanup =
+        analyzeStackCleanupEffect(true, ByteSize(8), boost::none);
+    check(knownCalleeCleanup.isExactStackOffset &&
+              knownCalleeCleanup.stackOffset == 8,
+          "known callee-cleanup extent must advance SP exactly");
+
+    const StackCleanupEffect exactReturnCleanup =
+        analyzeStackCleanupEffect(true, ByteSize(4), ByteSize(12));
+    check(exactReturnCleanup.isExactStackOffset &&
+              exactReturnCleanup.stackOffset == 12,
+          "exact return cleanup must override an argument-size estimate");
+}
+
+void testResolvedTargetOverridesCallSiteFallback() {
+    const ConstantValue targetAddress = 0x7900;
+
+    auto analyze = [&](bool authoritativeCallSite) {
+        TestArchitecture architecture;
+        TestConvention targetConvention;
+        TestStackConvention callSiteConvention;
+        Function function;
+        BasicBlock *block = addBlock(function);
+        function.setEntry(block);
+        TestInstruction callInstruction(0x1200, 5);
+
+        std::unique_ptr<Call> callStorage(new Call(
+            constant(32, targetAddress)));
+        Call *call = callStorage.get();
+        callStorage->setInstruction(&callInstruction);
+        block->pushBack(std::move(callStorage));
+        block->pushBack(std::unique_ptr<Statement>(new Halt()));
+
+        const calling::CalleeId callSiteId(
+            calling::CallAddress(callInstruction.addr()));
+        calling::Conventions conventions;
+        conventions.setConvention(
+            calling::CalleeId(&function), &targetConvention);
+        conventions.setConvention(
+            calling::CalleeId(
+                calling::EntryAddress(targetAddress)),
+            &targetConvention);
+        if (authoritativeCallSite) {
+            conventions.setConvention(
+                callSiteId, &callSiteConvention);
+        } else {
+            conventions.setFallbackConvention(
+                callSiteId, &callSiteConvention);
+            check(conventions.isFallbackConvention(callSiteId),
+                  "an unresolved call-site default must retain fallback provenance");
+        }
+
+        calling::Signatures signatures;
+        calling::Hooks hooks(conventions, signatures);
+        Dataflow dataflow;
+        hooks.instrument(&function, &dataflow);
+        CFG cfg(function.basicBlocks());
+        CancellationToken canceled;
+        LogToken log;
+        DataflowAnalyzer(
+            dataflow, &architecture, canceled, log).analyze(cfg);
+        check(dataflow.converged(),
+              "the call-site provenance fixture must converge");
+
+        const calling::CallHook *hook = hooks.getCallHook(call);
+        check(hook && hook->stackPointer(),
+              "the resolved call must install a stack-aware hook");
+        return dataflow.getMemoryLocation(hook->stackPointer());
+    };
+
+    check(analyze(false) == TestConvention().stackPointer(),
+          "a resolved target convention must override an unresolved call-site fallback");
+    check(analyze(true) == TestStackConvention().stackPointerLocation,
+          "authoritative call-site metadata must override the resolved target");
+
+    calling::Conventions conventions;
+    TestConvention fallback;
+    TestStackConvention authoritative;
+    const calling::CalleeId id(calling::CallAddress(0x1234));
+    conventions.setFallbackConvention(id, &fallback);
+    conventions.setConvention(id, &authoritative);
+    conventions.setFallbackConvention(id, &fallback);
+    check(conventions.getConvention(id) == &authoritative &&
+              !conventions.isFallbackConvention(id),
+          "strong convention evidence must clear and resist later fallback defaults");
 }
 
 enum CallContractKind {
@@ -319,7 +1703,11 @@ CallEffectResult analyzeCallEffect(bool passStackAddress,
 
     calling::Signatures signatures;
     if (contractKind != NO_CALL_SIGNATURE) {
-        signatures.setSignature(call, signature);
+        signatures.setSignature(
+            call, signature,
+            contractKind == INFERRED_CALL_CONTRACT ?
+                calling::SignatureSource::INFERRED :
+                calling::SignatureSource::EXTERNAL);
     }
 
     Dataflow dataflow;
@@ -337,8 +1725,9 @@ CallEffectResult analyzeCallEffect(bool passStackAddress,
     check(callHook != nullptr,
           "a call must have a call hook after dataflow analysis");
     check((callHook->snapshotStatement() != nullptr) ==
-              (contractKind == NO_CALL_SIGNATURE),
-          "only a call without a signature must use the inference snapshot");
+              (contractKind == NO_CALL_SIGNATURE ||
+               contractKind == INFERRED_CALL_CONTRACT),
+          "only an unknown or inferred call must use the inference snapshot");
     const bool needsPointeeSnapshot =
         contractKind != NO_CALL_SIGNATURE &&
         (contractKind != EXACT_CALL_CONTRACT || mayReadMemory);
@@ -531,6 +1920,66 @@ void testCallPointeeWriteInvalidation() {
               !mismatchedCall.postOtherMemoryReadIsConcrete &&
               mismatchedCall.postOtherMemoryReadHasUnknownDefinition,
           "a parameter-count mismatch must use the conservative incomplete-contract fallback");
+}
+
+void testCallSnapshotDoesNotMaterializeControlReturnAddress() {
+    const ConstantValue targetAddress = 0x7100;
+    const MemoryLocation returnAddressSlot(
+        MemoryDomain::STACK, -32, 32);
+    const MemoryLocation sourceStackSlot(
+        MemoryDomain::STACK, -64, 32);
+
+    TestArchitecture architecture;
+    TestConvention convention;
+    Function function;
+    BasicBlock *block = addBlock(function);
+    function.setEntry(block);
+
+    std::unique_ptr<Term> returnAddressDestination(
+        new MemoryLocationAccess(returnAddressSlot));
+    Term *returnAddressDefinition = returnAddressDestination.get();
+    block->pushBack(std::unique_ptr<Statement>(new Assignment(
+        std::move(returnAddressDestination),
+        constant(32, 0x401005),
+        Assignment::CONTROL_FLOW_STATE)));
+    Term *sourceStackDefinition = addDefinition(
+        block, sourceStackSlot, constant(32, 0x12345678));
+    std::unique_ptr<Call> callStorage(new Call(
+        constant(32, targetAddress)));
+    Call *call = callStorage.get();
+    block->pushBack(std::move(callStorage));
+    block->pushBack(std::unique_ptr<Statement>(new Halt()));
+
+    calling::Conventions conventions;
+    conventions.setConvention(calling::CalleeId(&function), &convention);
+    conventions.setConvention(
+        calling::CalleeId(calling::EntryAddress(targetAddress)),
+        &convention);
+    calling::Signatures signatures;
+    Dataflow dataflow;
+    calling::Hooks hooks(conventions, signatures);
+    hooks.instrument(&function, &dataflow);
+
+    CFG cfg(function.basicBlocks());
+    CancellationToken canceled;
+    LogToken log;
+    DataflowAnalyzer(dataflow, &architecture, canceled, log).analyze(cfg);
+    check(dataflow.converged(),
+          "the control-stack liveness fixture must converge");
+    check(hooks.getCallHook(call) != nullptr &&
+              hooks.getCallHook(call)->snapshotStatement() != nullptr,
+          "an unknown call must retain its conservative snapshot");
+    liveness::Liveness liveness;
+    liveness::LivenessAnalyzer(
+        liveness, &function, dataflow, &architecture, nullptr,
+        hooks, &signatures, log).analyze();
+
+    check(!liveness.isLive(returnAddressDefinition) &&
+              !liveness.mustBeMaterialized(returnAddressDefinition),
+          "a call snapshot must not expose synthetic CALL/RET state as source memory");
+    check(liveness.isLive(sourceStackDefinition) &&
+              liveness.mustBeMaterialized(sourceStackDefinition),
+          "excluding control state must preserve conservative source-memory observations");
 }
 
 void testDominanceAndPostDominance() {
@@ -894,6 +2343,23 @@ void testOpaqueMayWriteInvalidation() {
             findChunk(definitions, lowStack);
         check(chunk && chunk->hasUnknownDefinition(),
               "an unresolved possibly stack-derived write must contaminate tracked frame storage");
+
+        const MemoryLocation unseenCustomMemory(
+            MemoryDomain::USER + 8, 0x2c0, 32);
+        std::unique_ptr<Term> readStorage(
+            new MemoryLocationAccess(unseenCustomMemory));
+        Term *read = readStorage.get();
+        Touch readStatement(std::move(readStorage), Term::READ);
+        analyzer.execute(&readStatement, definitions);
+        const ReachingDefinitions &readDefinitions =
+            dataflow.getDefinitions(read);
+        const ReachingDefinitions::Chunk *readChunk =
+            findChunk(readDefinitions, unseenCustomMemory);
+        check(readDefinitions.chunks().size() == 1 && readChunk &&
+                  readChunk->hasUnknownDefinition() &&
+                  readChunk->hasIncomingDefinition() &&
+                  readChunk->definitions().empty(),
+              "a fully unresolved indirect write must preserve and contaminate newly observed non-stack memory");
     }
 
     {
@@ -910,8 +2376,10 @@ void testOpaqueMayWriteInvalidation() {
             dataflow, &architecture, canceled, log);
         analyzer.execute(&recurringWrite, definitions);
 
+        const ReachingDefinitions observedDefinitions =
+            definitions.projected(lowStack);
         const ReachingDefinitions::Chunk *chunk =
-            findChunk(definitions, lowStack);
+            findChunk(observedDefinitions, lowStack);
         check(chunk && chunk->hasUnknownDefinition(),
               "an unresolved recurring write must retain and contaminate its previously resolved range");
     }
@@ -936,6 +2404,253 @@ void testOpaqueMayWriteInvalidation() {
                   chunk->definitions().size() == 1 &&
                   chunk->definitions().front() == lowDefinition,
               "an unresolved definite non-stack write must preserve frame definitions");
+    }
+
+    /* An extent-less may-write through an exact frame pointer applies to
+     * stack storage first observed after the call, while preserving the
+     * pre-call entry value as the alternative where no write occurred. */
+    {
+        const MemoryLocation unseenStack(
+            MemoryDomain::STACK, 0, 32);
+        ReachingDefinitions definitions;
+        std::vector<std::unique_ptr<Term>> candidates;
+        candidates.push_back(std::unique_ptr<Term>(new Intrinsic(
+            Intrinsic::ZERO_STACK_OFFSET, 64)));
+        TrackedMemoryInvalidation invalidation(std::move(candidates));
+        Dataflow dataflow;
+        DataflowAnalyzer analyzer(
+            dataflow, &architecture, canceled, log);
+        analyzer.execute(&invalidation, definitions);
+
+        std::unique_ptr<Term> readStorage(
+            new MemoryLocationAccess(unseenStack));
+        Term *read = readStorage.get();
+        Touch readStatement(std::move(readStorage), Term::READ);
+        analyzer.execute(&readStatement, definitions);
+
+        const ReachingDefinitions &readDefinitions =
+            dataflow.getDefinitions(read);
+        const ReachingDefinitions::Chunk *chunk =
+            findChunk(readDefinitions, unseenStack);
+        check(readDefinitions.chunks().size() == 1 && chunk &&
+                  chunk->hasUnknownDefinition() &&
+                  chunk->hasIncomingDefinition() &&
+                  chunk->definitions().empty(),
+              "an exact stack-pointer may-write must preserve and contaminate a newly observed frame interval");
+    }
+
+    /* An incomplete call can modify any tracked non-register domain, even
+     * when that domain had no represented intervals at invalidation time. */
+    {
+        const MemoryLocation unseenCustomMemory(
+            MemoryDomain::USER + 7, 0x240, 64);
+        ReachingDefinitions definitions;
+        TrackedMemoryInvalidation invalidation(
+            TrackedMemoryInvalidation::ALL_TRACKED_MEMORY);
+        Dataflow dataflow;
+        DataflowAnalyzer analyzer(
+            dataflow, &architecture, canceled, log);
+        analyzer.execute(&invalidation, definitions);
+
+        std::unique_ptr<Term> readStorage(
+            new MemoryLocationAccess(unseenCustomMemory));
+        Term *read = readStorage.get();
+        Touch readStatement(std::move(readStorage), Term::READ);
+        analyzer.execute(&readStatement, definitions);
+
+        const ReachingDefinitions &readDefinitions =
+            dataflow.getDefinitions(read);
+        const ReachingDefinitions::Chunk *chunk =
+            findChunk(readDefinitions, unseenCustomMemory);
+        check(readDefinitions.chunks().size() == 1 && chunk &&
+                  chunk->hasUnknownDefinition() &&
+                  chunk->hasIncomingDefinition() &&
+                  chunk->definitions().empty(),
+              "all-tracked-memory invalidation must preserve and affect a newly observed non-stack interval");
+    }
+
+    /* A subsequent definite store establishes the current value for exactly
+     * its written range.  It must shadow the older domain-wide may-write
+     * there without making untouched ranges look definite. */
+    {
+        const MemoryLocation overwrittenStack(
+            MemoryDomain::STACK, 64, 32);
+        const MemoryLocation adjacentStack(
+            MemoryDomain::STACK, 96, 32);
+        ReachingDefinitions definitions;
+        std::vector<std::unique_ptr<Term>> candidates;
+        candidates.push_back(std::unique_ptr<Term>(new Intrinsic(
+            Intrinsic::ZERO_STACK_OFFSET, 64)));
+        TrackedMemoryInvalidation invalidation(std::move(candidates));
+        Dataflow dataflow;
+        DataflowAnalyzer analyzer(
+            dataflow, &architecture, canceled, log);
+        analyzer.execute(&invalidation, definitions);
+
+        Assignment definiteWrite(
+            std::unique_ptr<Term>(new MemoryLocationAccess(
+                overwrittenStack)),
+            constant(32, 0x31415926));
+        Term *write = definiteWrite.left();
+        analyzer.execute(&definiteWrite, definitions);
+
+        std::unique_ptr<Term> overwrittenReadStorage(
+            new MemoryLocationAccess(overwrittenStack));
+        Term *overwrittenRead = overwrittenReadStorage.get();
+        Touch overwrittenReadStatement(
+            std::move(overwrittenReadStorage), Term::READ);
+        analyzer.execute(&overwrittenReadStatement, definitions);
+
+        const ReachingDefinitions &overwrittenDefinitions =
+            dataflow.getDefinitions(overwrittenRead);
+        const ReachingDefinitions::Chunk *overwrittenChunk =
+            findChunk(overwrittenDefinitions, overwrittenStack);
+        check(overwrittenDefinitions.chunks().size() == 1 &&
+                  overwrittenChunk &&
+                  !overwrittenChunk->hasUnknownDefinition() &&
+                  !overwrittenChunk->hasIncomingDefinition() &&
+                  overwrittenChunk->definitions().size() == 1 &&
+                  overwrittenChunk->definitions().front() == write,
+              "a definite store must shadow an older domain-wide invalidation for its exact range");
+
+        std::unique_ptr<Term> adjacentReadStorage(
+            new MemoryLocationAccess(adjacentStack));
+        Term *adjacentRead = adjacentReadStorage.get();
+        Touch adjacentReadStatement(
+            std::move(adjacentReadStorage), Term::READ);
+        analyzer.execute(&adjacentReadStatement, definitions);
+
+        const ReachingDefinitions &adjacentDefinitions =
+            dataflow.getDefinitions(adjacentRead);
+        const ReachingDefinitions::Chunk *adjacentChunk =
+            findChunk(adjacentDefinitions, adjacentStack);
+        check(adjacentDefinitions.chunks().size() == 1 && adjacentChunk &&
+                  adjacentChunk->hasUnknownDefinition() &&
+                  adjacentChunk->hasIncomingDefinition() &&
+                  adjacentChunk->definitions().empty(),
+              "a definite store must not shadow either alternative of a domain-wide invalidation outside its range");
+    }
+}
+
+void testUnseenOpaqueWriteAcrossAlternatives() {
+    const MemoryLocation unseenStack(
+        MemoryDomain::STACK, 0x180, 32);
+
+    for (int invalidatingPredecessorFirst = 0;
+         invalidatingPredecessorFirst < 2;
+         ++invalidatingPredecessorFirst)
+    {
+        Function function;
+        BasicBlock *entry = addBlock(function);
+        BasicBlock *firstPredecessor = addBlock(function);
+        BasicBlock *secondPredecessor = addBlock(function);
+        BasicBlock *join = addBlock(function);
+        BasicBlock *invalidatingPredecessor =
+            invalidatingPredecessorFirst ?
+                firstPredecessor : secondPredecessor;
+        BasicBlock *bypassPredecessor =
+            invalidatingPredecessorFirst ?
+                secondPredecessor : firstPredecessor;
+        function.setEntry(entry);
+
+        entry->pushBack(std::unique_ptr<Statement>(new Jump(
+            std::unique_ptr<Term>(new Intrinsic(Intrinsic::UNKNOWN, 1)),
+            JumpTarget(invalidatingPredecessor),
+            JumpTarget(bypassPredecessor))));
+        invalidatingPredecessor->pushBack(std::unique_ptr<Statement>(
+            new TrackedMemoryInvalidation(
+                TrackedMemoryInvalidation::ALL_TRACKED_MEMORY)));
+        invalidatingPredecessor->pushBack(std::unique_ptr<Statement>(
+            new Jump(JumpTarget(join))));
+        bypassPredecessor->pushBack(std::unique_ptr<Statement>(
+            new Jump(JumpTarget(join))));
+
+        std::unique_ptr<Term> readStorage(
+            new MemoryLocationAccess(unseenStack));
+        Term *read = readStorage.get();
+        join->pushBack(std::unique_ptr<Statement>(
+            new Touch(std::move(readStorage), Term::READ)));
+        join->pushBack(std::unique_ptr<Statement>(new Halt()));
+
+        TestArchitecture architecture;
+        CancellationToken canceled;
+        LogToken log;
+        Dataflow dataflow;
+        CFG cfg(function.basicBlocks());
+        DataflowAnalyzer(
+            dataflow, &architecture, canceled, log).analyze(cfg);
+
+        const ReachingDefinitions &readDefinitions =
+            dataflow.getDefinitions(read);
+        const ReachingDefinitions::Chunk *chunk =
+            findChunk(readDefinitions, unseenStack);
+        check(dataflow.converged() &&
+                  readDefinitions.chunks().size() == 1 && chunk &&
+                  chunk->hasUnknownDefinition() &&
+                  chunk->hasIncomingDefinition() &&
+                  chunk->definitions().empty(),
+              "an opaque write on one CFG alternative must join with a bypass as unknown plus incoming regardless of predecessor order");
+    }
+}
+
+void testWildcardAlternativesSurviveDefinitionFiltering() {
+    const MemoryLocation location(
+        MemoryDomain::STACK, 0x200, 32);
+    MemoryLocationAccess disappearingDefinition(location);
+    MemoryLocationAccess survivingDefinition(location);
+
+    for (int wildcardIsReceiver = 0;
+         wildcardIsReceiver < 2;
+         ++wildcardIsReceiver)
+    {
+        for (int accumulatedStateIsReceiver = 0;
+             accumulatedStateIsReceiver < 2;
+             ++accumulatedStateIsReceiver)
+        {
+            ReachingDefinitions wildcard;
+            wildcard.addUnknownDomainDefinitions(false, true, false);
+            ReachingDefinitions firstExact;
+            firstExact.addDefinition(
+                location, &disappearingDefinition);
+
+            ReachingDefinitions accumulated;
+            if (wildcardIsReceiver) {
+                accumulated = wildcard;
+                accumulated.joinAlternative(firstExact);
+            } else {
+                accumulated = firstExact;
+                accumulated.joinAlternative(wildcard);
+            }
+            accumulated.filterOut(
+                [&disappearingDefinition](
+                    const MemoryLocation &, const Term *term) {
+                    return term == &disappearingDefinition;
+                });
+
+            ReachingDefinitions secondExact;
+            secondExact.addDefinition(
+                location, &survivingDefinition);
+            ReachingDefinitions joined;
+            if (accumulatedStateIsReceiver) {
+                joined = accumulated;
+                joined.joinAlternative(secondExact);
+            } else {
+                joined = secondExact;
+                joined.joinAlternative(accumulated);
+            }
+
+            const ReachingDefinitions projected =
+                joined.projected(location);
+            const ReachingDefinitions::Chunk *chunk =
+                findChunk(projected, location);
+            check(projected.chunks().size() == 1 && chunk &&
+                      chunk->hasUnknownDefinition() &&
+                      chunk->hasIncomingDefinition() &&
+                      chunk->definitions().size() == 1 &&
+                      chunk->definitions().front() ==
+                          &survivingDefinition,
+                  "filtered exact alternatives must retain wildcard and incoming domain defaults in either join order");
+        }
     }
 }
 
@@ -1451,6 +3166,196 @@ void testPointerAndAddressWidthSafety() {
     }
 }
 
+void testCheckedByteAddressBoundaries() {
+    const ConstantValue maximumAddress = static_cast<ConstantValue>(
+        (std::numeric_limits<ByteAddr>::max)());
+    const ConstantValue maximumUnsigned =
+        (std::numeric_limits<ConstantValue>::max)();
+
+    CheckedByteRange range = {-3, -2, 1};
+    check(checkedByteRange(maximumAddress, 0, range) &&
+              range.begin == (std::numeric_limits<ByteAddr>::max)() &&
+              range.end == (std::numeric_limits<ByteAddr>::max)() &&
+              range.size == 0,
+          "an empty range at the maximum signed byte address must remain representable");
+
+    check(checkedByteRange(maximumAddress - 1, 1, range) &&
+              range.begin == (std::numeric_limits<ByteAddr>::max)() - 1 &&
+              range.end == (std::numeric_limits<ByteAddr>::max)() &&
+              range.size == 1,
+          "a one-byte range ending at the maximum signed byte address must be accepted");
+
+    const CheckedByteRange unchangedRange = {-7, -5, 2};
+    range = unchangedRange;
+    check(!checkedByteRange(maximumAddress - 1, 2, range) &&
+              range.begin == unchangedRange.begin &&
+              range.end == unchangedRange.end &&
+              range.size == unchangedRange.size,
+          "a range whose exclusive end exceeds ByteAddr must be rejected without changing the result");
+
+    range = unchangedRange;
+    check(!checkedByteRange(maximumUnsigned, 1, range) &&
+              range.begin == unchangedRange.begin &&
+              range.end == unchangedRange.end &&
+              range.size == unchangedRange.size,
+          "an unsigned range that would wrap and narrow to a signed address must be rejected");
+
+    check(checkedInclusiveByteRange(
+              maximumAddress - 1, maximumAddress - 1, range) &&
+              range.begin == (std::numeric_limits<ByteAddr>::max)() - 1 &&
+              range.end == (std::numeric_limits<ByteAddr>::max)() &&
+              range.size == 1,
+          "a one-byte inclusive range below the maximum signed address must be accepted");
+
+    range = unchangedRange;
+    check(!checkedInclusiveByteRange(
+              maximumAddress, maximumAddress, range) &&
+              range.begin == unchangedRange.begin &&
+              range.end == unchangedRange.end &&
+              range.size == unchangedRange.size,
+          "an inclusive maximum address must be rejected when its exclusive end is unrepresentable");
+
+    ByteAddr address = -7;
+    check(checkedByteAddressAdd(maximumAddress - 1, 1, address) &&
+              address == (std::numeric_limits<ByteAddr>::max)(),
+          "checked byte-address addition must accept an exactly representable sum");
+
+    address = -7;
+    check(!checkedByteAddressAdd(maximumAddress, 1, address) &&
+              address == -7,
+          "checked byte-address addition must reject signed overflow without changing the result");
+
+    address = -7;
+    check(!checkedByteAddressAdd(maximumUnsigned, 1, address) &&
+              address == -7,
+          "checked byte-address addition must reject unsigned wrap without changing the result");
+
+    const ByteAddr maximum = (std::numeric_limits<ByteAddr>::max)();
+    const CheckedByteRange outer = {maximum - 3, maximum, 3};
+    const CheckedByteRange lastByte = {maximum - 1, maximum, 1};
+    const CheckedByteRange emptyAtEnd = {maximum, maximum, 0};
+    check(containsByteRange(outer, lastByte) &&
+              containsByteRange(outer, emptyAtEnd),
+          "well-formed ranges at the maximum representable endpoint must be contained");
+
+    const CheckedByteRange negative = {-1, 0, 1};
+    const CheckedByteRange reversed = {maximum - 1, maximum - 2, -1};
+    const CheckedByteRange mismatchedSize = {
+        maximum - 1, maximum, 2};
+    const CheckedByteRange escaping = {
+        maximum - 4, maximum - 2, 2};
+    check(!containsByteRange(outer, negative) &&
+              !containsByteRange(outer, reversed) &&
+              !containsByteRange(outer, mismatchedSize) &&
+              !containsByteRange(outer, escaping),
+          "negative, reversed, size-inconsistent, and escaping ranges must not be contained");
+}
+
+void testDisassemblerAtMaximumByteAddress() {
+    const ByteAddr maximum = (std::numeric_limits<ByteAddr>::max)();
+    const ByteAddr begin = maximum - 3;
+    TestDisassemblyArchitecture architecture;
+    TopAddressByteSource source(begin, maximum);
+    image::Image image;
+    CancellationToken canceled;
+
+    TestDisassembler disassembler(&architecture, 1);
+    std::vector<ByteAddr> decodedAddresses;
+    disassembler.disassemble(
+        &image, &source, begin, maximum,
+        [&decodedAddresses](std::shared_ptr<arch::Instruction> instruction) {
+            decodedAddresses.push_back(instruction->addr());
+        }, canceled);
+    check(decodedAddresses.size() == 3 &&
+              decodedAddresses[0] == begin &&
+              decodedAddresses[1] == begin + 1 &&
+              decodedAddresses[2] == maximum - 1,
+          "disassembly must reach the final byte below the maximum exclusive endpoint");
+
+    TopAddressByteSource overreportingSource(begin, maximum, true);
+    TestDisassembler overreported(&architecture, 1);
+    decodedAddresses.clear();
+    overreported.disassemble(
+        &image, &overreportingSource, begin, maximum,
+        [&decodedAddresses](std::shared_ptr<arch::Instruction> instruction) {
+            decodedAddresses.push_back(instruction->addr());
+        }, canceled);
+    check(decodedAddresses.empty() &&
+              overreported.attemptedAddresses().size() == 3,
+          "an overreported ByteSource result must not expose invalid bytes or prevent progress");
+
+    TestDisassembler oversizedInstruction(&architecture, 4);
+    decodedAddresses.clear();
+    oversizedInstruction.disassemble(
+        &image, &source, maximum - 2, maximum,
+        [&decodedAddresses](std::shared_ptr<arch::Instruction> instruction) {
+            decodedAddresses.push_back(instruction->addr());
+        }, canceled);
+    check(decodedAddresses.empty() &&
+              oversizedInstruction.attemptedAddresses().size() == 2,
+          "a decoded instruction larger than the remaining range must be rejected while making progress");
+
+    image::Image relocatedImage;
+    const image::Symbol *symbol = relocatedImage.addSymbol(
+        std::unique_ptr<image::Symbol>(new image::Symbol(
+            image::SymbolType::OBJECT, QLatin1String("top-relocation"),
+            boost::none)));
+    relocatedImage.addRelocation(std::unique_ptr<image::Relocation>(
+        new image::Relocation(maximum - 1, symbol, 4)));
+    TestDisassembler relocated(&architecture, 1);
+    decodedAddresses.clear();
+    relocated.disassemble(
+        &relocatedImage, &source, maximum - 2, maximum,
+        [&decodedAddresses](std::shared_ptr<arch::Instruction> instruction) {
+            decodedAddresses.push_back(instruction->addr());
+        }, canceled);
+    check(decodedAddresses.size() == 1 &&
+              decodedAddresses[0] == maximum - 2 &&
+              relocated.attemptedAddresses().size() == 1,
+          "a relocation larger than the remaining top-address range must terminate at the checked endpoint");
+}
+
+void testSafeBitShifts() {
+    const ConstantValue pattern = UINT64_C(0x0123456789abcdef);
+    const int width = std::numeric_limits<ConstantValue>::digits;
+    const ConstantValue allBits =
+        (std::numeric_limits<ConstantValue>::max)();
+
+    check(bitMask<ConstantValue>(0) == 0 &&
+              bitMask<ConstantValue>(-1) == 0 &&
+              bitMask<ConstantValue>(
+                  (std::numeric_limits<int>::min)()) == 0 &&
+              bitMask<ConstantValue>(1) == 1 &&
+              bitMask<ConstantValue>(width) == allBits &&
+              bitMask<ConstantValue>(width + 1) == allBits,
+          "bit masks must handle nonpositive and over-width counts without undefined shifts");
+
+    check(shiftLeft(pattern, 4) == (pattern << 4) &&
+              shiftRight(pattern, 4) == (pattern >> 4),
+          "in-range bit shifts must preserve their ordinary integer semantics");
+    check(shiftLeft(pattern, width) == 0 &&
+              shiftLeft(pattern, width + 1) == 0 &&
+              shiftRight(pattern, width) == 0 &&
+              shiftRight(pattern, width + 1) == 0,
+          "left and right shifts at or beyond the storage width must produce zero");
+    check(shiftLeft(pattern, -1) == 0 &&
+              shiftRight(pattern, -1) == 0,
+          "direction-specific shift helpers must reject negative counts without undefined behavior");
+
+    check(bitShift(pattern, 4) == (pattern << 4) &&
+              bitShift(pattern, -4) == (pattern >> 4) &&
+              bitShift(pattern, width) == 0 &&
+              bitShift(pattern, -width) == 0 &&
+              bitShift(pattern, (std::numeric_limits<int>::min)()) == 0,
+          "signed-direction shifting must use a safe magnitude for both over-width directions");
+
+    AbstractValue upperHalf(SizedValue(64, pattern));
+    upperHalf.shift(-32);
+    check(upperHalf.size() == 32 && upperHalf.isConcrete() &&
+              upperHalf.asConcrete().value() == UINT64_C(0x01234567),
+          "aligning a wider definition to its upper subrange must shift right by the absolute offset");
+}
+
 } // anonymous namespace
 
 int main() {
@@ -1461,13 +3366,34 @@ int main() {
         testIncompleteInstrumentationFinalization();
         testDominanceAndPostDominance();
         testAlternativeReachingDefinitions();
+        testLateFunctionEntryPreservesFallthrough();
+        testLateEntryInsideIrlessTailPreservesFallthrough();
+        testKnownIrlessFunctionEntryIsPreserved();
+        testDirectCallBoundaryPreventsFunctionMerging();
         testOpaqueMayWriteInvalidation();
+        testUnseenOpaqueWriteAcrossAlternatives();
+        testWildcardAlternativesSurviveDefinitionFiltering();
         testCallClobberContract();
+        testCallStackCleanupSoundness();
+        testResolvedTargetOverridesCallSiteFallback();
+        testCallerCleanupCallFrameInference();
+        testInferredFunctionSignatureIsRevalidatedAcrossPasses();
+        testWideReturnDefinitionKeepsUnusedLowHalfAcrossPasses();
+        testSharedReturnDefinitionAcrossTwoReturnsIsStable();
+        testInferredCallReturnIsRevalidatedAcrossPasses();
+        testVariadicStackTailWithoutExtentIsRevalidated();
+        testWideFixedAndVariadicStoreIsRevalidatedAcrossPasses();
+        testSharedVariadicDefinitionAcrossTwoCallsIsStable();
+        testCallSpecificVariadicArguments();
         testCallPointeeReadLiveness();
         testCallPointeeWriteInvalidation();
+        testCallSnapshotDoesNotMaterializeControlReturnAddress();
         testPathCompleteProvenance();
         testExpressionIdentityAndWidths();
         testPointerAndAddressWidthSafety();
+        testCheckedByteAddressBoundaries();
+        testDisassemblerAtMaximumByteAddress();
+        testSafeBitShifts();
     } catch (const std::exception &exception) {
         std::cerr << "analysis regression test failed: "
                   << exception.what() << std::endl;

@@ -28,6 +28,7 @@
 #include <vector>
 
 #include <boost/unordered_map.hpp>
+#include <boost/unordered_set.hpp>
 
 #include <nc/common/Range.h>
 #include <nc/core/ir/MemoryLocation.h>
@@ -55,6 +56,9 @@ class ReturnHook {
     /** Mapping from memory locations that can be used for returning values to terms. */
     std::vector<std::pair<MemoryLocation, const Term *>> speculativeReturnValueTerms_;
 
+    /** Synthetic reads used only to revalidate inferred return evidence. */
+    boost::unordered_set<const Term *> observedReturnValueTerms_;
+
     Patch patch_;
 
 public:
@@ -64,7 +68,9 @@ public:
      * \param[in] convention Valid pointer to the calling convention.
      * \param[in] signature Pointer to the function's signature. Can be nullptr.
      */
-    ReturnHook(const Convention *convention, const FunctionSignature *signature);
+    ReturnHook(const Convention *convention,
+               const FunctionSignature *signature,
+               bool signatureIsInferred = false);
 
     /**
      * Destructor.
@@ -101,6 +107,16 @@ public:
      *         to terms representing writes to these locations.
      */
     const std::vector<std::pair<MemoryLocation, const Term *>> &speculativeReturnValueTerms() const { return speculativeReturnValueTerms_; }
+
+    bool isObservedReturnValueTerm(const Term *term) const {
+        return observedReturnValueTerms_.find(term) !=
+            observedReturnValueTerms_.end();
+    }
+
+    /** Synthetic return reads owned by this hook. */
+    const boost::unordered_set<const Term *> &observedReturnValueTerms() const {
+        return observedReturnValueTerms_;
+    }
 };
 
 } // namespace calling

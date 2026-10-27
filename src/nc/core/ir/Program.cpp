@@ -26,6 +26,7 @@
 
 #include <algorithm> /* std::find_if */
 #include <cassert>
+#include <limits>
 
 #include <QTextStream>
 
@@ -36,7 +37,9 @@
 #include <nc/core/arch/Instruction.h>
 
 #include "CFG.h"
+#include "Jump.h"
 #include "Statement.h"
+#include "Term.h"
 
 namespace nc {
 namespace core {
@@ -63,6 +66,12 @@ BasicBlock *Program::getBasicBlockStartingAt(ByteAddr address) const {
 }
 
 BasicBlock *Program::getBasicBlockCovering(ByteAddr address) const {
+    if (address == (std::numeric_limits<ByteAddr>::max)()) {
+        /* AddrRange is half-open and address + 1 is not representable. A
+         * memory-bound block ending beyond ByteAddr cannot be represented
+         * either, so no valid stored range can cover this byte. */
+        return nullptr;
+    }
     return nc::find(range2basicBlock_, AddrRange(address, address + 1));
 }
 
@@ -77,8 +86,24 @@ BasicBlock *Program::createBasicBlock(ByteAddr address) {
         removeRange(basicBlock);
 
         auto iterator = std::find_if(basicBlock->statements().begin(), basicBlock->statements().end(), [address](const Statement *statement) {
-            return statement->instruction()->addr() >= address;
+            return statement->instruction() &&
+                statement->instruction()->addr() >= address;
         });
+
+        /* IR-less instructions (most notably trailing NOPs) have no
+         * statement at which to cut. The synthetic direct-successor jump
+         * nevertheless belongs after those bytes. Move it to the new block
+         * so the split remains connected and the new entry is not empty. */
+        if (iterator == basicBlock->statements().end()) {
+            Jump *fallthrough = basicBlock->getJump();
+            if (fallthrough && !fallthrough->instruction() &&
+                fallthrough->isUnconditional() &&
+                fallthrough->thenTarget().basicBlock())
+            {
+                iterator = basicBlock->statements().get_iterator(
+                    fallthrough);
+            }
+        }
 
         BasicBlock *result = takeOwnership(basicBlock->split(iterator, address));
 
@@ -91,6 +116,26 @@ BasicBlock *Program::createBasicBlock(ByteAddr address) {
         addRange(result);
         return result;
     }
+}
+
+BasicBlock *Program::refineFunctionEntry(ByteAddr address) {
+    addFunctionEntry(address);
+
+    BasicBlock *predecessor = getBasicBlockCovering(address);
+    if (predecessor && predecessor->address() &&
+        *predecessor->address() == address)
+    {
+        predecessor = nullptr;
+    }
+
+    BasicBlock *entry = createBasicBlock(address);
+    if (predecessor && predecessor != entry &&
+        !predecessor->getTerminator())
+    {
+        predecessor->pushBack(
+            std::make_unique<Jump>(JumpTarget(entry)));
+    }
+    return entry;
 }
 
 BasicBlock *Program::getBasicBlockForInstruction(const arch::Instruction *instruction) {

@@ -1,0 +1,192 @@
+= Declarative symbol prototype schema
+
+Snowman can load external function contracts through
+`DeclarativeSymbolPrototypeProvider`. The input is UTF-8 JSON with schema name
+`snowman.symbol-prototypes` and schema version `1`.
+
+The parser is strict and atomic. Unknown or duplicate members, JSON values of
+the wrong type, unsupported versions, invalid ABI shapes, duplicate target
+selectors, and duplicate module/name pairs reject the complete document. No
+record from a rejected document is returned.
+
+== Document shape
+
+[source,json]
+----
+{
+  "schema": "snowman.symbol-prototypes",
+  "schema_version": 1,
+  "provider": {
+    "id": "stable-generator-id",
+    "priority": 100
+  },
+  "targets": [
+    {
+      "architecture": "x86",
+      "operating_system": "windows",
+      "bitness": 32,
+      "symbols": [
+        {
+          "module": "example.dll",
+          "name": "ExampleExport",
+          "convention": "stdcall32",
+          "stack_arguments_size": 4,
+          "noreturn": false,
+          "prototype": {
+            "return_type": {
+              "kind": "integer",
+              "size": 32,
+              "unsigned": false,
+              "display_name": "result_type"
+            },
+            "parameters": [
+              {
+                "name": "value",
+                "type": {
+                  "kind": "pointer",
+                  "size": 32,
+                  "unsigned": true,
+                  "display_name": "value_pointer"
+                },
+                "pointee_access": "read"
+              }
+            ],
+            "variadic": false,
+            "source_calling_convention": "__stdcall",
+            "preferred_name": "example_operation",
+            "memory_effects_complete": false
+          }
+        }
+      ]
+    }
+  ]
+}
+----
+
+`architecture`, `operating_system`, and `bitness` are matched exactly against
+`SymbolPrototypeTarget`. A provider does not fall back between targets.
+
+`module` and `name` are exact registry keys. A metadata generator must apply
+the same platform-specific canonicalization as the lookup path. In particular,
+Windows metadata must use the lower-case import-descriptor module name,
+including its suffix. The parser never folds case, strips decoration, removes
+suffixes, trims surrounding whitespace, or creates aliases. Empty keys and
+keys with surrounding whitespace reject the complete document.
+
+`convention` is Snowman's internal calling-convention identifier.
+`stack_arguments_size` is optional and is a non-negative byte count.
+`noreturn` is optional and defaults to `false`.
+
+For schema version 1, Snowman derives the stack extent from the scalar
+parameter count and the selected convention. If `stack_arguments_size` is
+present, it is an integrity assertion and must exactly match that derived
+extent; a mismatch rejects that symbol contract at the architecture boundary.
+
+== Types and effects
+
+Version 1 supports only `void`, `integer`, and `pointer` scalar types. `void`
+has size zero and is not unsigned. Integer types must fit in one target ABI
+slot. Pointer size must equal target bitness and pointers are unsigned. A
+parameter cannot be `void`.
+
+Names copied into generated source are validated at the metadata boundary.
+Parameter and `preferred_name` values must be non-keyword ASCII C/C++
+identifiers, parameter names must be unique within their prototype, and
+`source_calling_convention` must be one identifier token. A `display_name` is
+limited to one typedef-style identifier or a built-in integer/void spelling
+whose kind, width, and signedness agree with the structural type; arbitrary or
+contradictory source fragments are rejected instead of being printed verbatim.
+
+Pointer parameters can set `pointee_access` to `none`, `read`, `write`, or
+`read_write`. Omitting it is conservative and means `read_write`. Non-pointer
+parameters have `none` and cannot declare another mode.
+
+`memory_effects_complete` is optional and defaults to `false`. Setting it to
+`true` asserts that the parameter effects completely describe caller-visible
+memory access, including the absence of access through globals, captured
+callbacks, or escaped pointers. Generated metadata should leave it false
+unless that stronger property is known.
+
+`variadic` is optional and defaults to `false`. When true, `parameters`
+describes only the fixed prefix; call-site analysis may retain additional
+proved arguments. A variadic symbol must omit `stack_arguments_size`, because
+its total outgoing stack extent is call-specific. Its selected ABI must also
+be caller-cleanup; a target convention which requires a fixed callee cleanup
+causes the contract to be rejected at the architecture boundary.
+
+A pointer parameter can contain a nested `callback` object with the same
+prototype shape. Every nested callback must include `abi_convention`, the exact
+internal convention identifier registered by the selected target architecture
+(for example `cdecl32`, `stdcall32`, `thiscall32`, or `microsoft64`). This is
+separate from optional `source_calling_convention`, which is only the spelling
+emitted in source declarations. A top-level prototype cannot repeat
+`abi_convention`; its ABI is the enclosing symbol record's `convention`.
+Callback nesting is bounded and malformed nesting rejects the document.
+
+== x64dbg module loading
+
+The x64dbg module loads one immutable document when the first decompilation is
+started. By default it looks for `snowman-symbol-prototypes.json` beside the
+loaded `snowman.dp32` or `snowman.dp64` module. Set the
+`SNOWMAN_SYMBOL_PROTOTYPES` environment variable to select another file. An
+explicit path must be absolute; the loader rejects relative paths because
+x64dbg's working directory is not part of the metadata identity.
+
+The file is parsed once per x64dbg process and is limited to 32 MiB. A missing
+file leaves external contracts unknown. Missing files, I/O failures, and
+rejected documents are reported in the x64dbg log. The loader never falls back
+to a built-in list of API names.
+
+Set the CMake cache path `SNOWMAN_SYMBOL_PROTOTYPES_PATH` when a generated
+catalog is available. The x64dbg target then copies it beside `snowman.dp32` or
+`snowman.dp64` as `snowman-symbol-prototypes.json` and installs the same file.
+If that cache path is omitted, CMake also checks the
+`SNOWMAN_SYMBOL_PROTOTYPES` environment variable. This is the same override
+understood by the runtime loader, so one absolute path can drive both build
+deployment and an installed plug-in.
+
+For builds which are expected to carry authoritative SDK contracts, set
+`SNOWMAN_REQUIRE_SYMBOL_PROTOTYPES=ON`. Configuration then fails instead of
+silently producing a module without a catalog. Without this option CMake emits
+a warning, and the runtime deliberately keeps unproved external parameter
+lists and types conservative.
+
+[source,shell]
+----
+cmake -S path/to/snowman/src -B path/to/build -DSNOWMAN_SYMBOL_PROTOTYPES_PATH=C:/metadata/snowman-symbol-prototypes.json -DSNOWMAN_REQUIRE_SYMBOL_PROTOTYPES=ON
+----
+
+The repository does not contain a hand-written WinAPI table. Merely recovering
+an import name such as `SomeImportedFunction` proves neither its parameter
+types nor, for undecorated 32-bit exports, even its complete stack contract.
+Consequently, a named declaration with an empty parameter list is expected
+when no matching target/module/name record was deployed. Check the CMake
+configuration warning and the x64dbg log (`Loaded symbol prototype provider`
+with a matching record count, `has no records for`, or
+`No symbol prototype database found`) before treating such output as an
+analysis regression.
+
+== Generating catalogs
+
+The current repository defines the ingestion and deployment contract; it does
+not ship a Windows-SDK-to-JSON generator or a generated Windows catalog.
+Supplying such a generated artifact is therefore a separate build input, not a
+capability implied by enabling the provider.
+
+External ABI facts are intentionally generated rather than hand-maintained in
+the decompiler. For the Windows SDK, a catalog generator should consume
+https://github.com/microsoft/win32metadata[Microsoft win32metadata] (or another
+versioned authoritative SDK source), resolve typedefs and callback signatures,
+and emit one target record per architecture/bitness pair. Import-library and
+API-set aliases must be expanded by the generator as explicit module/name
+records; the runtime lookup does not guess aliases.
+
+Facts which the source does not prove must remain conservative. In particular,
+omit `stack_arguments_size` when it is not fixed, keep
+`memory_effects_complete` false unless all caller-visible effects are known,
+and do not infer `noreturn` from a suggestive function name. Version 1 cannot
+represent floating-point, aggregate, or multi-slot scalar ABI classification;
+a generator must omit an unsupported function record completely rather than
+emit a truncated authoritative prototype.
+
+/* vim:set et sts=4 sw=4: */

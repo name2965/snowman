@@ -48,8 +48,10 @@ void InlineAssembly::print(QTextStream &out) const {
     out << " }" << endl;
 }
 
-Assignment::Assignment(std::unique_ptr<Term> left, std::unique_ptr<Term> right):
-    Statement(ASSIGNMENT), left_(std::move(left)), right_(std::move(right))
+Assignment::Assignment(std::unique_ptr<Term> left, std::unique_ptr<Term> right,
+                       Purpose purpose):
+    Statement(ASSIGNMENT), left_(std::move(left)), right_(std::move(right)),
+    purpose_(purpose)
 {
     assert(left_);
     assert(right_);
@@ -60,7 +62,8 @@ Assignment::Assignment(std::unique_ptr<Term> left, std::unique_ptr<Term> right):
 }
 
 std::unique_ptr<Statement> Assignment::doClone() const {
-    return std::make_unique<Assignment>(left()->clone(), right()->clone());
+    return std::make_unique<Assignment>(
+        left()->clone(), right()->clone(), purpose());
 }
 
 void Assignment::print(QTextStream &out) const {

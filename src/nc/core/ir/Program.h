@@ -169,6 +169,16 @@ public:
     bool isFunctionEntry(ByteAddr addr) const { return nc::contains(functionEntries_, addr); }
 
     /**
+     * Adds a function entry to an already generated Program and materializes
+     * its block boundary without losing an existing implicit fall-through.
+     *
+     * Unlike createBasicBlock(), this operation is for post-IR refinement.
+     * If it splits a straight-line block, it installs the explicit edge which
+     * IRGenerator would have created had the boundary been known initially.
+     */
+    BasicBlock *refineFunctionEntry(ByteAddr addr);
+
+    /**
      * Prints the graph into a stream in DOT format.
      *
      * \param out Output stream.

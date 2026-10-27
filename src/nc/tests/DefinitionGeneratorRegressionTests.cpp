@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include <nc/arch/x86/X86Architecture.h>
 #include <nc/common/CancellationToken.h>
 #include <nc/common/SizedValue.h>
 #include <nc/core/image/Image.h>
@@ -64,9 +65,11 @@ bool generateAndFindSourceWrite(bool addOrdinaryUse,
     std::unique_ptr<Term> destination(
         new MemoryLocationAccess(sourceLocation));
     Term *write = destination.get();
+    std::unique_ptr<Term> source(
+        new Constant(SizedValue(32, 0x2a)));
+    Term *sourceRead = source.get();
     std::unique_ptr<Statement> assignmentStorage(new Assignment(
-        std::move(destination),
-        std::unique_ptr<Term>(new Constant(SizedValue(32, 0x2a)))));
+        std::move(destination), std::move(source)));
     const Statement *assignment = assignmentStorage.get();
     block->pushBack(std::move(assignmentStorage));
 
@@ -95,6 +98,7 @@ bool generateAndFindSourceWrite(bool addOrdinaryUse,
     std::unique_ptr<liveness::Liveness> liveness(
         new liveness::Liveness());
     liveness->makeLive(write);
+    liveness->makeLive(sourceRead);
     if (requireMaterialization) {
         liveness->requireMaterialization(write);
     }
@@ -149,7 +153,10 @@ bool generateAndFindSourceWrite(bool addOrdinaryUse,
     calling::Hooks hooks(conventions, signatures);
 
     likec::Tree tree;
+    nc::arch::x86::X86Architecture architecture(
+        nc::arch::x86::X86Architecture::PROTECTED_MODE);
     image::Image image;
+    image.platform().setArchitecture(&architecture);
     Functions functions;
     types::Types types;
     CancellationToken canceled;

@@ -6,6 +6,7 @@
 #include <nc/config.h>
 
 #include <boost/unordered_map.hpp>
+#include <boost/unordered_set.hpp>
 
 #include <nc/common/Range.h>
 
@@ -29,6 +30,9 @@ class EntryHook {
     /** Mapping from argument terms to their clones. */
     boost::unordered_map<const Term *, const Term *> argumentTerms_;
 
+    /** Definitions synthesized from inferred, rather than external, args. */
+    boost::unordered_set<const Term *> observedArgumentTerms_;
+
     Patch patch_;
 
 public:
@@ -38,7 +42,8 @@ public:
      * \param[in] convention    Valid pointer to the calling convention.
      * \param[in] signature     Pointer to the function's signature. Can be nullptr.
      */
-    EntryHook(const Convention *convention, const FunctionSignature *signature);
+    EntryHook(const Convention *convention, const FunctionSignature *signature,
+              bool signatureIsInferred = false);
 
     /**
      * \return Patch to be inserted in the beginning of the function's entry.
@@ -64,6 +69,11 @@ public:
      * \return Mapping from argument terms to their clones.
      */
     const boost::unordered_map<const Term *, const Term *> &argumentTerms() const { return argumentTerms_; }
+
+    bool isObservedArgumentTerm(const Term *term) const {
+        return observedArgumentTerms_.find(term) !=
+            observedArgumentTerms_.end();
+    }
 };
 
 } // namespace calling

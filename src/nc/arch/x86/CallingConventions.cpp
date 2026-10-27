@@ -121,7 +121,8 @@ AMD64CallingConvention::AMD64CallingConvention(const X86Architecture *architectu
 
     addEnterStatement(std::make_unique<core::ir::Assignment>(
         std::make_unique<core::ir::MemoryLocationAccess>(core::ir::MemoryLocation(core::ir::MemoryDomain::STACK, 0, architecture->bitness())),
-        std::make_unique<core::ir::Intrinsic>(core::ir::Intrinsic::RETURN_ADDRESS, architecture->bitness())
+        std::make_unique<core::ir::Intrinsic>(core::ir::Intrinsic::RETURN_ADDRESS, architecture->bitness()),
+        core::ir::Assignment::CONTROL_FLOW_STATE
     ));
     addEnterStatement(std::make_unique<core::ir::Assignment>(
         std::make_unique<core::ir::MemoryLocationAccess>(X86Registers::df()->memoryLocation()),
@@ -164,7 +165,8 @@ Microsoft64CallingConvention::Microsoft64CallingConvention(const X86Architecture
 
     addEnterStatement(std::make_unique<core::ir::Assignment>(
         std::make_unique<core::ir::MemoryLocationAccess>(core::ir::MemoryLocation(core::ir::MemoryDomain::STACK, 0, architecture->bitness())),
-        std::make_unique<core::ir::Intrinsic>(core::ir::Intrinsic::RETURN_ADDRESS, architecture->bitness())
+        std::make_unique<core::ir::Intrinsic>(core::ir::Intrinsic::RETURN_ADDRESS, architecture->bitness()),
+        core::ir::Assignment::CONTROL_FLOW_STATE
     ));
     addEnterStatement(std::make_unique<core::ir::Assignment>(
         std::make_unique<core::ir::MemoryLocationAccess>(X86Registers::df()->memoryLocation()),
@@ -188,7 +190,8 @@ Cdecl32CallingConvention::Cdecl32CallingConvention(const X86Architecture *archit
 
     addEnterStatement(std::make_unique<core::ir::Assignment>(
         std::make_unique<core::ir::MemoryLocationAccess>(core::ir::MemoryLocation(core::ir::MemoryDomain::STACK, 0, architecture->bitness())),
-        std::make_unique<core::ir::Intrinsic>(core::ir::Intrinsic::RETURN_ADDRESS, architecture->bitness())
+        std::make_unique<core::ir::Intrinsic>(core::ir::Intrinsic::RETURN_ADDRESS, architecture->bitness()),
+        core::ir::Assignment::CONTROL_FLOW_STATE
     ));
     addEnterStatement(std::make_unique<core::ir::Assignment>(
         std::make_unique<core::ir::MemoryLocationAccess>(X86Registers::df()->memoryLocation()),
@@ -212,7 +215,8 @@ Cdecl16CallingConvention::Cdecl16CallingConvention(const X86Architecture *archit
 
     addEnterStatement(std::make_unique<core::ir::Assignment>(
         std::make_unique<core::ir::MemoryLocationAccess>(core::ir::MemoryLocation(core::ir::MemoryDomain::STACK, 0, architecture->bitness())),
-        std::make_unique<core::ir::Intrinsic>(core::ir::Intrinsic::RETURN_ADDRESS, architecture->bitness())
+        std::make_unique<core::ir::Intrinsic>(core::ir::Intrinsic::RETURN_ADDRESS, architecture->bitness()),
+        core::ir::Assignment::CONTROL_FLOW_STATE
     ));
     addEnterStatement(std::make_unique<core::ir::Assignment>(
         std::make_unique<core::ir::MemoryLocationAccess>(X86Registers::df()->memoryLocation()),
@@ -237,7 +241,8 @@ Stdcall32CallingConvention::Stdcall32CallingConvention(const X86Architecture *ar
 
     addEnterStatement(std::make_unique<core::ir::Assignment>(
         std::make_unique<core::ir::MemoryLocationAccess>(core::ir::MemoryLocation(core::ir::MemoryDomain::STACK, 0, architecture->bitness())),
-        std::make_unique<core::ir::Intrinsic>(core::ir::Intrinsic::RETURN_ADDRESS, architecture->bitness())
+        std::make_unique<core::ir::Intrinsic>(core::ir::Intrinsic::RETURN_ADDRESS, architecture->bitness()),
+        core::ir::Assignment::CONTROL_FLOW_STATE
     ));
     addEnterStatement(std::make_unique<core::ir::Assignment>(
         std::make_unique<core::ir::MemoryLocationAccess>(X86Registers::df()->memoryLocation()),
@@ -266,7 +271,8 @@ Thiscall32CallingConvention::Thiscall32CallingConvention(const X86Architecture *
 
     addEnterStatement(std::make_unique<core::ir::Assignment>(
         std::make_unique<core::ir::MemoryLocationAccess>(core::ir::MemoryLocation(core::ir::MemoryDomain::STACK, 0, architecture->bitness())),
-        std::make_unique<core::ir::Intrinsic>(core::ir::Intrinsic::RETURN_ADDRESS, architecture->bitness())
+        std::make_unique<core::ir::Intrinsic>(core::ir::Intrinsic::RETURN_ADDRESS, architecture->bitness()),
+        core::ir::Assignment::CONTROL_FLOW_STATE
     ));
     addEnterStatement(std::make_unique<core::ir::Assignment>(
         std::make_unique<core::ir::MemoryLocationAccess>(X86Registers::df()->memoryLocation()),

@@ -200,6 +200,25 @@ void LivenessAnalyzer::computeLiveness(const Statement *statement) {
                         {
                             foreach (const Term *definition,
                                      chunk.definitions()) {
+                                /* CALL/RET control state is represented in
+                                 * the same abstract stack domain as source
+                                 * objects, but it is not a source-level
+                                 * memory effect of the callee. Keeping the
+                                 * synthetic return-address write alive here
+                                 * exposes instruction-lowering plumbing as a
+                                 * local variable and can keep an otherwise
+                                 * dead chain of stack-pointer expressions
+                                 * alive. Low-level call/return analysis may
+                                 * still use the annotated assignment. */
+                                const Assignment *assignment =
+                                    definition->statement() ?
+                                    definition->statement()->asAssignment() :
+                                    nullptr;
+                                if (assignment && assignment->purpose() ==
+                                        Assignment::CONTROL_FLOW_STATE)
+                                {
+                                    continue;
+                                }
                                 makeLive(definition);
                                 /* A snapshot is a semantic memory observation,
                                  * not an ordinary read Term.  Preserve the
@@ -219,6 +238,7 @@ void LivenessAnalyzer::computeLiveness(const Statement *statement) {
                     if (callHook) {
                         const auto &prototype = signature->prototype();
                         const bool completePrototype = prototype &&
+                            !prototype->variadic() &&
                             prototype->memoryEffectsAreComplete() &&
                             prototype->parameters().size() ==
                                 signature->arguments().size();

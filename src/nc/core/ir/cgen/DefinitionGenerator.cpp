@@ -151,6 +151,8 @@ std::unique_ptr<likec::FunctionDefinition> DefinitionGenerator::createDefinition
     if (signature()->prototype() && !signature()->prototype()->preferredName().isEmpty()) {
         nameAndComment.name() = signature()->prototype()->preferredName();
     }
+    nameAndComment.name() = parent().getFunctionIdentifier(
+        signature(), nameAndComment.name());
 
     auto functionDefinition = std::make_unique<likec::FunctionDefinition>(tree(),
         std::move(nameAndComment.name()), makeReturnType(), signature()->variadic());
@@ -196,6 +198,8 @@ likec::VariableDeclaration *DefinitionGenerator::makeLocalVariableDeclaration(co
     likec::VariableDeclaration *&result = variableDeclarations_[variable];
     if (!result) {
         auto nameAndComment = parent().nameGenerator().getLocalVariableName(variable->memoryLocation(), variableDeclarations_.size());
+        nameAndComment.name() = claimLocalIdentifier(
+            nameAndComment.name());
         auto variableDeclaration = std::make_unique<likec::VariableDeclaration>(
             std::move(nameAndComment.name()), parent().makeVariableType(variable));
         variableDeclaration->setComment(std::move(nameAndComment.comment()));
