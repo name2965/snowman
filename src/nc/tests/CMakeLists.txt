@@ -22,6 +22,12 @@ add_executable(nc-symbol-prototype-registry-regression-tests
 
 target_link_libraries(nc-symbol-prototype-registry-regression-tests nc)
 
+add_executable(nc-definition-generator-regression-tests
+    DefinitionGeneratorRegressionTests.cpp
+)
+
+target_link_libraries(nc-definition-generator-regression-tests nc)
+
 add_test(
     NAME nc-analysis-regression
     COMMAND nc-analysis-regression-tests
@@ -40,6 +46,11 @@ add_test(
 add_test(
     NAME nc-symbol-prototype-registry-regression
     COMMAND nc-symbol-prototype-registry-regression-tests
+)
+
+add_test(
+    NAME nc-definition-generator-regression
+    COMMAND nc-definition-generator-regression-tests
 )
 
 # vim:set et sts=4 sw=4 nospell:

@@ -201,6 +201,12 @@ void LivenessAnalyzer::computeLiveness(const Statement *statement) {
                             foreach (const Term *definition,
                                      chunk.definitions()) {
                                 makeLive(definition);
+                                /* A snapshot is a semantic memory observation,
+                                 * not an ordinary read Term.  Preserve the
+                                 * reaching definition at this program point;
+                                 * its source dependencies remain ordinary live
+                                 * terms and are propagated by makeLive(). */
+                                liveness_.requireMaterialization(definition);
                             }
                         }
                     }

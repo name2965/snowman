@@ -209,6 +209,8 @@ enum CallContractKind {
 struct CallEffectResult {
     bool stackStoreLive;
     bool otherMemoryStoreLive;
+    bool stackStoreMustBeMaterialized;
+    bool otherMemoryStoreMustBeMaterialized;
     bool postCallReadIsConcrete;
     bool postCallReadHasUnknownDefinition;
     bool postOtherMemoryReadIsConcrete;
@@ -426,6 +428,8 @@ CallEffectResult analyzeCallEffect(bool passStackAddress,
     return CallEffectResult{
         liveness.isLive(stackDefinition),
         liveness.isLive(otherMemoryDefinition),
+        liveness.mustBeMaterialized(stackDefinition),
+        liveness.mustBeMaterialized(otherMemoryDefinition),
         postCallReadIsConcrete,
         postCallReadHasUnknownDefinition,
         postOtherMemoryReadIsConcrete,
@@ -438,11 +442,17 @@ void testCallPointeeReadLiveness() {
         analyzeCallEffect(true, true, false);
     check(stackRead.stackStoreLive && !stackRead.otherMemoryStoreLive,
           "a stack-address call argument must keep pre-call stack stores live");
+    check(stackRead.stackStoreMustBeMaterialized &&
+              !stackRead.otherMemoryStoreMustBeMaterialized,
+          "a call snapshot must materialize exactly the stack definition it observes");
     const CallEffectResult otherMemoryRead =
         analyzeCallEffect(false, true, false);
     check(!otherMemoryRead.stackStoreLive &&
               otherMemoryRead.otherMemoryStoreLive,
           "a definite non-stack call argument must preserve only non-register memory it may read");
+    check(!otherMemoryRead.stackStoreMustBeMaterialized &&
+              otherMemoryRead.otherMemoryStoreMustBeMaterialized,
+          "a call snapshot must materialize exactly the non-stack definition it observes");
     check(!analyzeCallEffect(true, false, true).stackStoreLive,
           "a call's write-only effect alone must not keep its incoming value live");
     check(analyzeCallEffect(true, true, true).stackStoreLive,
@@ -452,6 +462,9 @@ void testCallPointeeReadLiveness() {
     check(defaultIncomplete.stackStoreLive &&
               defaultIncomplete.otherMemoryStoreLive,
           "a prototype without complete effects must preserve every memory definition the callee may read");
+    check(defaultIncomplete.stackStoreMustBeMaterialized &&
+              defaultIncomplete.otherMemoryStoreMustBeMaterialized,
+          "an incomplete contract's snapshot must materialize every memory definition it may observe");
 }
 
 void testCallPointeeWriteInvalidation() {

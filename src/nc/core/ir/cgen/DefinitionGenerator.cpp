@@ -1526,6 +1526,14 @@ bool DefinitionGenerator::computeIsSubstituted(const Term *write) {
         return false;
     }
 
+    /* Some definitions are observed by semantic consumers which do not have
+     * a read Term (for example, a pre-call memory snapshot).  Even when such a
+     * definition also has ordinary reads, substituting those reads must not
+     * remove the write at its original program point. */
+    if (liveness_.mustBeMaterialized(write)) {
+        return false;
+    }
+
     auto source = write->source();
     if (!source) {
         return false;
@@ -1572,7 +1580,12 @@ bool DefinitionGenerator::computeIsSubstituted(const Term *write) {
         }
     }
 
-    assert(nuses >= 1 && "Live write must have at least one live read.");
+    /* Liveness roots are not necessarily represented by Uses.  Without an
+     * explicit live read there is no legal expression site into which this
+     * definition can be substituted, so preserve the original assignment. */
+    if (nuses == 0) {
+        return false;
+    }
 
     if (nuses > 1) {
         auto sourceSubstitute = getSubstitute(source);

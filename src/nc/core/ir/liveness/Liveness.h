@@ -24,6 +24,14 @@ class Liveness {
     boost::unordered_set<const Term *> liveTermSet_; ///< The set of live terms.
     std::vector<const Term *> liveTermList_; ///< The list of live terms.
 
+    /**
+     * Live definitions which have a semantic consumer that is not represented
+     * by an ordinary read Term.  Such definitions must remain materialized at
+     * their original program point and cannot be replaced solely at their
+     * term uses.
+     */
+    boost::unordered_set<const Term *> materializedTermSet_;
+
 public:
     /**
      * \param[in] term Term.
@@ -46,6 +54,26 @@ public:
         if (liveTermSet_.insert(term).second) {
             liveTermList_.push_back(term);
         };
+    }
+
+    /**
+     * Requires a live term to remain materialized at its original program
+     * point.  This records non-Term observations without changing ordinary
+     * liveness propagation.
+     */
+    void requireMaterialization(const Term *term) {
+        assert(term != nullptr);
+        assert(isLive(term));
+        materializedTermSet_.insert(term);
+    }
+
+    /**
+     * \return True if the term has a semantic consumer which requires it to
+     *         remain materialized at its original program point.
+     */
+    bool mustBeMaterialized(const Term *term) const {
+        assert(term != nullptr);
+        return nc::contains(materializedTermSet_, term);
     }
 
     /**
