@@ -134,8 +134,9 @@ void RememberReachingDefinitions::print(QTextStream &out) const {
     out << "remember_reaching_definitions" << endl;
 }
 
-StackMemoryInvalidation::StackMemoryInvalidation(std::vector<std::unique_ptr<Term>> pointerCandidates):
-    Statement(STACK_MEMORY_INVALIDATION), pointerCandidates_(std::move(pointerCandidates))
+TrackedMemoryInvalidation::TrackedMemoryInvalidation(std::vector<std::unique_ptr<Term>> pointerCandidates):
+    Statement(TRACKED_MEMORY_INVALIDATION), mode_(POINTER_CANDIDATES),
+    pointerCandidates_(std::move(pointerCandidates))
 {
     foreach (auto &term, pointerCandidates_) {
         assert(term != nullptr);
@@ -143,7 +144,13 @@ StackMemoryInvalidation::StackMemoryInvalidation(std::vector<std::unique_ptr<Ter
     }
 }
 
-std::unique_ptr<Statement> StackMemoryInvalidation::doClone() const {
+TrackedMemoryInvalidation::TrackedMemoryInvalidation(Mode mode):
+    Statement(TRACKED_MEMORY_INVALIDATION), mode_(mode)
+{
+    assert(mode_ == ALL_TRACKED_MEMORY);
+}
+
+std::unique_ptr<Statement> TrackedMemoryInvalidation::doClone() const {
     std::vector<std::unique_ptr<Term>> pointerCandidates;
     pointerCandidates.reserve(pointerCandidates_.size());
 
@@ -151,11 +158,17 @@ std::unique_ptr<Statement> StackMemoryInvalidation::doClone() const {
         pointerCandidates.push_back(term->clone());
     }
 
-    return std::make_unique<StackMemoryInvalidation>(std::move(pointerCandidates));
+    if (invalidateAllTrackedMemory()) {
+        return std::make_unique<TrackedMemoryInvalidation>(mode_);
+    }
+    return std::make_unique<TrackedMemoryInvalidation>(
+        std::move(pointerCandidates));
 }
 
-void StackMemoryInvalidation::print(QTextStream &out) const {
-    out << "invalidate_stack_memory" << endl;
+void TrackedMemoryInvalidation::print(QTextStream &out) const {
+    out << (invalidateAllTrackedMemory() ?
+        "invalidate_all_tracked_memory" :
+        "invalidate_memory_for_pointer_candidates") << endl;
 }
 
 } // namespace ir

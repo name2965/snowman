@@ -76,6 +76,9 @@ public:
      */
     Patch &patch() { return patch_; }
 
+    /** \return Patch currently owned by this hook. */
+    const Patch &patch() const { return patch_; }
+
     /**
      * \param term Valid pointer to a term representing the return value
      *             in the signature.

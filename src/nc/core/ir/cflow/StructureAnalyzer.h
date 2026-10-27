@@ -31,8 +31,13 @@ namespace nc {
 namespace core {
 namespace ir {
 
+class PostDominators;
+
 namespace dflow {
     class Dataflow;
+    class DefUseGraph;
+    class ExpressionIdentity;
+    class ValueProvenance;
 }
 
 namespace cflow {
@@ -52,6 +57,18 @@ class StructureAnalyzer {
     /** Dataflow information. */
     const dflow::Dataflow &dataflow_;
 
+    /** Exact definition/use information for dispatch temporaries. */
+    const dflow::DefUseGraph &defUse_;
+
+    /** Path-completeness proof used while expanding comparison flags. */
+    const dflow::ValueProvenance &provenance_;
+
+    /** Semantic identity proof for selectors in distinct comparisons. */
+    const dflow::ExpressionIdentity &expressionIdentity_;
+
+    /** Common-merge proof on the original basic-block CFG. */
+    const PostDominators &postdominators_;
+
 public:
     /**
      * Class constructor.
@@ -59,8 +76,14 @@ public:
      * \param graph Graph to analyze.
      * \param dataflow Dataflow information.
      */
-    StructureAnalyzer(Graph &graph, const dflow::Dataflow &dataflow):
-        graph_(graph), dataflow_(dataflow)
+    StructureAnalyzer(Graph &graph, const dflow::Dataflow &dataflow,
+                      const dflow::DefUseGraph &defUse,
+                      const dflow::ValueProvenance &provenance,
+                      const dflow::ExpressionIdentity &expressionIdentity,
+                      const PostDominators &postdominators):
+        graph_(graph), dataflow_(dataflow), defUse_(defUse),
+        provenance_(provenance), expressionIdentity_(expressionIdentity),
+        postdominators_(postdominators)
     {}
 
     /**
@@ -123,6 +146,12 @@ private:
      * \return True if the region was reduced.
      */
     bool reduceCyclic(Node *entry, const Dfs &dfs);
+
+    /**
+     * Tries to reduce a side-effect-free chain of constant equality tests to
+     * a switch with explicit case destinations.
+     */
+    bool reduceComparisonSwitch(Node *entry);
 
     /**
      * Tries to reduce a switch using a jump table.

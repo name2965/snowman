@@ -219,6 +219,16 @@ void Convention::addReturnValueLocation(const MemoryLocation &memoryLocation) {
     returnValueLocations_.push_back(memoryLocation);
 }
 
+void Convention::addClobberedLocations(
+        std::vector<MemoryLocation> locations) {
+    foreach (const MemoryLocation &location, locations) {
+        assert(location);
+        if (!nc::contains(clobberedLocations_, location)) {
+            clobberedLocations_.push_back(location);
+        }
+    }
+}
+
 void Convention::addEnterStatement(std::unique_ptr<Statement> statement) {
     assert(statement != nullptr);
     entryStatements_.push_back(std::move(statement));

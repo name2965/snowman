@@ -26,6 +26,7 @@ void Patch::remove() {
     foreach (auto statement, insertedStatements_) {
         statements_.push_front(statement->basicBlock()->erase(statement));
     }
+    insertedStatements_.clear();
 }
 
 } // namespace calling

@@ -24,6 +24,11 @@
 
 #include "Dataflow.h"
 
+#include <vector>
+
+#include <nc/common/Foreach.h>
+#include <nc/core/ir/Statement.h>
+
 #include "Value.h"
 
 namespace nc {
@@ -31,7 +36,10 @@ namespace core {
 namespace ir {
 namespace dflow {
 
-Dataflow::Dataflow(): memoryLocationRevision_(0) {}
+Dataflow::Dataflow():
+    memoryLocationRevision_(0), valueRevision_(0),
+    analysisStatus_(DataflowStatus::INCOMPLETE)
+{}
 
 Dataflow::~Dataflow() {}
 
@@ -44,13 +52,78 @@ Value *Dataflow::getValue(const Term *term) {
 
     auto &result = term2value_[term];
     if (!result) {
-        result.reset(new Value(term->size()));
+        result.reset(new Value(term->size(), &valueRevision_, &analysisStatus_));
+        ++valueRevision_;
+        invalidateAnalysis();
     }
     return result.get();
 }
 
 const Value *Dataflow::getValue(const Term *term) const {
-    return const_cast<Dataflow *>(this)->getValue(term);
+    return findValue(term);
+}
+
+const Value *Dataflow::findValue(const Term *term) const {
+    assert(term != nullptr);
+
+    if (const Term *source = term->source()) {
+        term = source;
+    }
+
+    const auto position = term2value_.find(term);
+    return position == term2value_.end() ? nullptr : position->second.get();
+}
+
+void Dataflow::discardDetachedFacts() {
+    const auto isDetachedTerm = [](const Term *term) {
+        return term->statement() && !term->statement()->basicBlock();
+    };
+
+    std::vector<const Term *> detachedLocations;
+    foreach (const auto &termAndLocation, term2location_) {
+        if (isDetachedTerm(termAndLocation.first)) {
+            detachedLocations.push_back(termAndLocation.first);
+        }
+    }
+
+    foreach (auto &termAndDefinitions, term2definitions_) {
+        termAndDefinitions.second.filterOut(
+            [isDetachedTerm](const MemoryLocation &, const Term *definition) {
+                return isDetachedTerm(definition);
+            });
+    }
+
+    for (auto iterator = term2value_.begin(); iterator != term2value_.end();) {
+        if (isDetachedTerm(iterator->first)) {
+            const auto position = iterator++;
+            term2value_.erase(position);
+        } else {
+            ++iterator;
+        }
+    }
+    foreach (const Term *term, detachedLocations) {
+        eraseMemoryLocation(term);
+    }
+    for (auto iterator = term2definitions_.begin();
+         iterator != term2definitions_.end();)
+    {
+        if (isDetachedTerm(iterator->first)) {
+            const auto position = iterator++;
+            term2definitions_.erase(position);
+        } else {
+            ++iterator;
+        }
+    }
+    for (auto iterator = statement2definitions_.begin();
+         iterator != statement2definitions_.end();)
+    {
+        if (!iterator->first->basicBlock()) {
+            const auto position = iterator++;
+            statement2definitions_.erase(position);
+        } else {
+            ++iterator;
+        }
+    }
 }
 
 } // namespace dflow

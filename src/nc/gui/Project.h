@@ -48,6 +48,10 @@ namespace core {
         class ByteSource;
         class Image;
     }
+
+    namespace ir { namespace calling {
+        class SymbolPrototypeProvider;
+    }}
 }
 
 namespace gui {
@@ -72,6 +76,11 @@ class Project: public QObject {
 
     /** Current context. */
     std::shared_ptr<const core::Context> context_;
+
+    /** External symbol metadata sources copied into each decompilation. */
+    std::vector<std::shared_ptr<const
+        core::ir::calling::SymbolPrototypeProvider>>
+        symbolPrototypeProviders_;
 
     /** Log token. */
     LogToken logToken_;
@@ -140,6 +149,23 @@ class Project: public QObject {
      * \param context Valid pointer to the new context.
      */
     void setContext(const std::shared_ptr<const core::Context> &context);
+
+    /**
+     * Adds a target-aware external symbol metadata source.
+     *
+     * Project owns this configuration because each decompilation creates a
+     * fresh Context. Keeping providers here makes the extension point usable
+     * by GUI frontends and debugger modules without a built-in API-name list.
+     */
+    void addSymbolPrototypeProvider(
+        std::shared_ptr<const
+            core::ir::calling::SymbolPrototypeProvider> provider);
+
+    const std::vector<std::shared_ptr<const
+        core::ir::calling::SymbolPrototypeProvider>> &
+    symbolPrototypeProviders() const {
+        return symbolPrototypeProviders_;
+    }
 
     /**
      * Sets the log token.

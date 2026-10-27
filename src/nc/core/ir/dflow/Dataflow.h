@@ -36,6 +36,7 @@
 #include <nc/core/ir/MemoryLocation.h>
 #include <nc/core/ir/Term.h>
 
+#include "DataflowStatus.h"
 #include "ReachingDefinitions.h"
 
 namespace nc {
@@ -66,6 +67,12 @@ class Dataflow {
     /** Monotonic counter for changes to the memory-location lattice. */
     std::size_t memoryLocationRevision_;
 
+    /** Monotonic counter for changes to abstract values and provenance. */
+    std::size_t valueRevision_;
+
+    /** Lifecycle state of the abstract-interpretation result. */
+    DataflowStatus analysisStatus_;
+
     /** Mapping from a term to the reaching definitions. */
     boost::unordered_map<const Term *, ReachingDefinitions> term2definitions_;
 
@@ -95,11 +102,22 @@ public:
     /**
      * \param[in] term Valid pointer to a term.
      *
-     * \return Valid pointer to the value description for this term.
+     * \return Pointer to the value description for this term, or nullptr if
+     *         the term was not evaluated by the analyzer.
      *         If the term is being assigned to, the value description
      *         for the right hand side of the assignment is returned.
+     *
+     * This overload never creates a lattice element or changes analysis
+     * status. New code should prefer findValue() to make that explicit.
      */
     const Value *getValue(const Term *term) const;
+
+    /**
+     * Read-only lookup which never creates a lattice element and therefore
+     * never invalidates a completed fixpoint.  Semantic transforms should
+     * use this method when absence of a fact means "cannot prove".
+     */
+    const Value *findValue(const Term *term) const;
 
     /**
      * \return Mapping from a term to the description of its value.
@@ -149,10 +167,12 @@ public:
             ambiguousLocations_.insert(term);
             stored = MemoryLocation();
             ++memoryLocationRevision_;
+            invalidateAnalysis();
         } else if (memoryLocation) {
             if (stored != memoryLocation) {
                 stored = memoryLocation;
                 ++memoryLocationRevision_;
+                invalidateAnalysis();
             }
         }
         return stored;
@@ -172,8 +192,16 @@ public:
      */
     void eraseMemoryLocation(const Term *term) {
         assert(term != nullptr);
-        term2location_.erase(term);
-        ambiguousLocations_.erase(term);
+        /* Do not combine these erases with ||.  Both containers can contain
+         * the same term after a location becomes ambiguous, and short-circuit
+         * evaluation would leave a stale pointer in ambiguousLocations_. */
+        const bool hadLocation = term2location_.erase(term) != 0;
+        const bool hadAmbiguity = ambiguousLocations_.erase(term) != 0;
+        const bool changed = hadLocation || hadAmbiguity;
+        if (changed) {
+            ++memoryLocationRevision_;
+            invalidateAnalysis();
+        }
     }
 
     /**
@@ -184,6 +212,58 @@ public:
     std::size_t memoryLocationRevision() const {
         return memoryLocationRevision_;
     }
+
+    /**
+     * A revision changes whenever an abstract value or one of its provenance
+     * classifications changes.  It participates in fixpoint detection.
+     */
+    std::size_t valueRevision() const { return valueRevision_; }
+
+    /**
+     * \return True only when the analysis which produced these facts reached
+     *         its fixpoint.  Transformations must not consume partial facts.
+     */
+    bool converged() const {
+        return analysisStatus_ == DataflowStatus::CONVERGED;
+    }
+
+    /** Returns true while the analyzer is producing provisional facts. */
+    bool running() const {
+        return analysisStatus_ == DataflowStatus::RUNNING;
+    }
+
+    /** Returns true when the last analysis stopped without a fixpoint. */
+    bool incomplete() const {
+        return analysisStatus_ == DataflowStatus::INCOMPLETE;
+    }
+
+    /** Returns the lifecycle state of the abstract-interpretation result. */
+    DataflowStatus analysisStatus() const { return analysisStatus_; }
+
+    /** Changes the lifecycle state of the abstract-interpretation result. */
+    void setAnalysisStatus(DataflowStatus status) { analysisStatus_ = status; }
+
+    /**
+     * Backwards-compatible completion setter. False denotes an analysis result
+     * which is no longer running but did not reach a fixpoint.
+     */
+    void setConverged(bool converged) {
+        analysisStatus_ = converged ?
+            DataflowStatus::CONVERGED : DataflowStatus::INCOMPLETE;
+    }
+
+    /**
+     * Invalidates a completed result while preserving the RUNNING state used
+     * by instrumentation callbacks during fixpoint iteration.
+     */
+    void invalidateAnalysis() {
+        if (analysisStatus_ == DataflowStatus::CONVERGED) {
+            analysisStatus_ = DataflowStatus::INCOMPLETE;
+        }
+    }
+
+    /** Drops facts belonging to IR statements removed after analysis. */
+    void discardDetachedFacts();
 
     /**
      * \return Mapping from a term to its memory location.

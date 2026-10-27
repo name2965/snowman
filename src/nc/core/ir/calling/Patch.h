@@ -33,6 +33,11 @@ public:
      */
     nc::ilist<Statement> &statements() { return statements_; }
 
+    /** \return Statements currently inserted in an IR basic block. */
+    const std::vector<Statement *> &insertedStatements() const {
+        return insertedStatements_;
+    }
+
     /**
      * Inserts all statements of the patch in the basic block
      * of the given statement after the given statement.

@@ -75,6 +75,10 @@ namespace dflow {
     class Dataflows;
 }
 
+namespace idiom {
+    class Idioms;
+}
+
 namespace liveness {
     class Livenesses;
 }
@@ -104,6 +108,7 @@ class CodeGenerator: boost::noncopyable {
     const vars::Variables &variables_;
     const cflow::Graphs &graphs_;
     const liveness::Livenesses &livenesses_;
+    const idiom::Idioms &idioms_;
     const types::Types &types_;
     const CancellationToken &cancellationToken_;
     const NameGenerator nameGenerator_;
@@ -134,17 +139,19 @@ public:
      * \param[in] variables Information about reconstructed variables.
      * \param[in] graphs Reduced control-flow graphs.
      * \param[in] livenesses Liveness information for all functions.
+     * \param[in] idioms Recovered semantic idioms.
      * \param[in] types Information about types.
      * \param[in] cancellationToken Cancellation token.
      */
     CodeGenerator(likec::Tree &tree, const image::Image &image, const Functions &functions, const calling::Hooks &hooks,
         const calling::Signatures &signatures, const dflow::Dataflows &dataflows, const vars::Variables &variables,
-        const cflow::Graphs &graphs, const liveness::Livenesses &livenesses, const types::Types &types,
+        const cflow::Graphs &graphs, const liveness::Livenesses &livenesses,
+        const idiom::Idioms &idioms, const types::Types &types,
         const CancellationToken &cancellationToken
     ):
         tree_(tree), image_(image), functions_(functions), hooks_(hooks), signatures_(signatures),
         dataflows_(dataflows), variables_(variables), graphs_(graphs), livenesses_(livenesses),
-        types_(types), cancellationToken_(cancellationToken), nameGenerator_(image)
+        idioms_(idioms), types_(types), cancellationToken_(cancellationToken), nameGenerator_(image)
     {}
 
     /**
@@ -191,6 +198,11 @@ public:
      * \return Liveness information for all functions.
      */
     const liveness::Livenesses &livenesses() const { return livenesses_; }
+
+    /**
+     * \return Recovered semantic idioms.
+     */
+    const idiom::Idioms &idioms() const { return idioms_; }
 
     /**
      * \return Information about types.

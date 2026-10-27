@@ -113,6 +113,9 @@ void TypeAnalyzer::uniteVariableTypes() {
 void TypeAnalyzer::uniteArgumentTypes() {
     foreach (auto function, functions_.list()) {
         const auto &dataflow = *dataflows_.at(function);
+        if (!dataflow.converged()) {
+            continue;
+        }
 
         if (auto entryHook = hooks_.getEntryHook(function)) {
             if (auto signature = signatures_.getSignature(function)) {
@@ -154,8 +157,12 @@ void TypeAnalyzer::uniteArgumentTypes() {
 void TypeAnalyzer::markStackPointersAsPointers() {
     foreach (const auto &functionAndLiveness, livenesses_) {
         const auto &dataflow = *dataflows_.at(functionAndLiveness.first);
+        if (!dataflow.converged()) {
+            continue;
+        }
         foreach (const auto term, functionAndLiveness.second->liveTerms()) {
-            if (dataflow.getValue(term)->isStackOffset()) {
+            const dflow::Value *value = dataflow.findValue(term);
+            if (value && value->isStackOffset()) {
                 types_.getType(term)->makePointer();
             }
         }
@@ -246,9 +253,20 @@ void TypeAnalyzer::analyze(const BinaryOperator *binary) {
     Type *rightType = types_.getType(binary->right());
 
     const auto &dataflow = *dataflows_.at(binary->statement()->basicBlock()->function());
-    const dflow::Value *value = dataflow.getValue(binary->left());
-    const dflow::Value *leftValue = dataflow.getValue(binary->left());
-    const dflow::Value *rightValue = dataflow.getValue(binary->right());
+    /* Operator shape remains useful when value analysis is incomplete, but
+     * provisional constants, products, and frame offsets do not.  Feed the
+     * structural type rules fresh top values in that case. */
+    dflow::Value unknownLeft(binary->left()->size());
+    dflow::Value unknownRight(binary->right()->size());
+    const dflow::Value *leftValue = dataflow.converged() ?
+        dataflow.findValue(binary->left()) : nullptr;
+    const dflow::Value *rightValue = dataflow.converged() ?
+        dataflow.findValue(binary->right()) : nullptr;
+    leftValue = leftValue ? leftValue : &unknownLeft;
+    rightValue = rightValue ? rightValue : &unknownRight;
+#ifdef NC_STRUCT_RECOVERY
+    const dflow::Value *value = leftValue;
+#endif
 
     switch (binary->operatorKind()) {
         case BinaryOperator::AND: /* FALLTHROUGH */

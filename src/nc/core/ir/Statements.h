@@ -204,21 +204,45 @@ protected:
 };
 
 /**
- * Invalidates stack memory which can be reached through pointer-valued call
- * arguments. The candidate terms are evaluated by DataflowAnalyzer before any
- * reaching definitions are removed.
+ * Invalidates tracked non-register memory affected by a call. Prototypes with
+ * an explicit, complete memory-effect contract use POINTER_CANDIDATES so an
+ * exact stack pointer does not clobber unrelated global facts (and vice
+ * versa). Calls whose signature or effects are incomplete use
+ * ALL_TRACKED_MEMORY: retaining any such fact would otherwise assume that no
+ * hidden or escaped pointer can reach it.
  *
  * This is a dataflow-only statement. It produces no source-level code.
  */
-class StackMemoryInvalidation: public Statement {
+class TrackedMemoryInvalidation: public Statement {
+public:
+    enum Mode {
+        POINTER_CANDIDATES,
+        ALL_TRACKED_MEMORY
+    };
+
+private:
+    Mode mode_;
     std::vector<std::unique_ptr<Term>> pointerCandidates_;
 
 public:
     /**
-     * \param pointerCandidates Terms whose runtime values may point into the
-     *        current stack frame.
+     * \param pointerCandidates Terms whose runtime values identify the broad
+     *        tracked-memory domains which a call may modify.
      */
-    explicit StackMemoryInvalidation(std::vector<std::unique_ptr<Term>> pointerCandidates);
+    explicit TrackedMemoryInvalidation(std::vector<std::unique_ptr<Term>> pointerCandidates);
+
+    /**
+     * Creates an invalidation with no pointer candidates. This constructor is
+     * intended for ALL_TRACKED_MEMORY, the conservative effect of a call whose
+     * complete memory-effect contract is unavailable.
+     */
+    explicit TrackedMemoryInvalidation(Mode mode);
+
+    Mode mode() const { return mode_; }
+
+    bool invalidateAllTrackedMemory() const {
+        return mode_ == ALL_TRACKED_MEMORY;
+    }
 
     /**
      * \return Terms whose values must be checked for stack offsets.

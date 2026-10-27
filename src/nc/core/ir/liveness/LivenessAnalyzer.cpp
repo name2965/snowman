@@ -25,6 +25,7 @@
 #include "LivenessAnalyzer.h"
 
 #include <cassert>
+#include <functional>
 
 #include <nc/common/Foreach.h>
 
@@ -32,6 +33,7 @@
 #include <nc/core/ir/BasicBlock.h>
 #include <nc/core/ir/Function.h>
 #include <nc/core/ir/Jump.h>
+#include <nc/core/ir/MemoryDomain.h>
 #include <nc/core/ir/Statements.h>
 #include <nc/core/ir/Terms.h>
 #include <nc/core/ir/calling/CallHook.h>
@@ -63,6 +65,44 @@ LivenessAnalyzer::LivenessAnalyzer(Liveness &liveness, const Function *function,
 {}
 
 void LivenessAnalyzer::analyze() {
+    if (!dataflow_.converged()) {
+        /* Fail closed.  Definition elimination and expression substitution
+         * consume this liveness result, so a bounded intermediate dataflow
+         * state must not make any IR value disappear. */
+        std::function<void(const Term *)> makeTreeLive =
+            [&](const Term *term) {
+                if (!term) {
+                    return;
+                }
+                makeLive(term);
+                term->callOnChildren(makeTreeLive);
+            };
+
+        foreach (const BasicBlock *basicBlock, function_->basicBlocks()) {
+            foreach (const Statement *statement, basicBlock->statements()) {
+                if (const Assignment *assignment = statement->asAssignment()) {
+                    makeTreeLive(assignment->left());
+                    makeTreeLive(assignment->right());
+                } else if (const Jump *jump = statement->asJump()) {
+                    makeTreeLive(jump->condition());
+                    makeTreeLive(jump->thenTarget().address());
+                    makeTreeLive(jump->elseTarget().address());
+                } else if (const Call *call = statement->asCall()) {
+                    makeTreeLive(call->target());
+                } else if (const Touch *touch = statement->asTouch()) {
+                    makeTreeLive(touch->term());
+                } else if (const TrackedMemoryInvalidation *invalidation =
+                               statement->as<TrackedMemoryInvalidation>()) {
+                    foreach (const auto &candidate,
+                             invalidation->pointerCandidates()) {
+                        makeTreeLive(candidate.get());
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     computeInvisibleJumps();
 
     foreach (const BasicBlock *basicBlock, function_->basicBlocks()) {
@@ -85,7 +125,11 @@ void LivenessAnalyzer::computeInvisibleJumps() {
                 if (witch->boundsCheckNode()) {
                     invisibleJumps_.push_back(witch->boundsCheckNode()->basicBlock()->getJump());
                 }
-                invisibleJumps_.push_back(witch->switchNode()->basicBlock()->getJump());
+                foreach (const cflow::BasicNode *dispatch,
+                         witch->dispatchNodes()) {
+                    invisibleJumps_.push_back(
+                        dispatch->basicBlock()->getJump());
+                }
                 makeLive(witch->switchTerm());
             }
         }
@@ -138,14 +182,93 @@ void LivenessAnalyzer::computeLiveness(const Statement *statement) {
 
             makeLive(call->target());
 
+            const calling::CallHook *callHook = hooks_.getCallHook(call);
+            auto makeSnapshotMemoryDefinitionsLive =
+                [&](const Statement *snapshot, bool includeStack,
+                    bool includeOtherMemory) {
+                    assert(snapshot != nullptr);
+                    foreach (const auto &chunk,
+                             dataflow_.getDefinitions(snapshot).chunks()) {
+                        const Domain domain = chunk.location().domain();
+                        const bool isRegister =
+                            domain >= MemoryDomain::FIRST_REGISTER &&
+                            domain <= MemoryDomain::LAST_REGISTER;
+                        if (!isRegister &&
+                            ((domain == MemoryDomain::STACK && includeStack) ||
+                             (domain != MemoryDomain::STACK &&
+                              includeOtherMemory)))
+                        {
+                            foreach (const Term *definition,
+                                     chunk.definitions()) {
+                                makeLive(definition);
+                            }
+                        }
+                    }
+                };
+
+            bool hasSignature = false;
             if (signatures_) {
                 if (auto signature = signatures_->getSignature(call)) {
-                    if (auto callHook = hooks_.getCallHook(call)) {
+                    hasSignature = true;
+                    if (callHook) {
+                        const auto &prototype = signature->prototype();
+                        const bool completePrototype = prototype &&
+                            prototype->memoryEffectsAreComplete() &&
+                            prototype->parameters().size() ==
+                                signature->arguments().size();
+
+                        /* An inferred prototype is not a complete effect
+                         * contract. Preserve all pre-effect non-register
+                         * memory;
+                         * A declaration without an explicit complete-effect
+                         * promise and a parameter-count mismatch are
+                         * incomplete too.
+                         * Exact prototypes can retain the per-argument test. */
+                        bool mayReadStackPointee = !completePrototype;
+                        bool mayReadOtherPointee = !completePrototype;
+                        std::size_t argumentIndex = 0;
                         foreach (const auto &argument, signature->arguments()) {
-                            makeLive(callHook->getArgumentTerm(argument.get()));
+                            const Term *argumentTerm =
+                                callHook->getArgumentTerm(argument.get());
+                            assert(argumentTerm != nullptr);
+                            makeLive(argumentTerm);
+
+                            const bool mayReadPointee =
+                                !completePrototype ||
+                                prototype->parameters()[argumentIndex]
+                                    .mayReadMemory();
+                            if (mayReadPointee) {
+                                const dflow::Value *value =
+                                    dataflow_.findValue(argumentTerm);
+                                if (!value || value->mayBeStackOffset()) {
+                                    mayReadStackPointee = true;
+                                }
+                                if (!value || !value->isStackOffset()) {
+                                    mayReadOtherPointee = true;
+                                }
+                            }
+                            ++argumentIndex;
+                        }
+
+                        if (mayReadStackPointee || mayReadOtherPointee) {
+                            const Statement *snapshot =
+                                callHook->pointeeReadSnapshotStatement();
+                            assert(snapshot != nullptr);
+                            makeSnapshotMemoryDefinitionsLive(
+                                snapshot, mayReadStackPointee,
+                                mayReadOtherPointee);
                         }
                     }
                 }
+            }
+
+            /* The first analysis pass has no reconstructed signature yet.
+             * Its inference snapshot is the only sound pre-call boundary, so
+             * do not eliminate any tracked non-register definition reaching
+             * it. */
+            if (!hasSignature && callHook && callHook->snapshotStatement()) {
+                makeSnapshotMemoryDefinitionsLive(
+                    callHook->snapshotStatement(), true, true);
             }
 
             break;
@@ -158,7 +281,7 @@ void LivenessAnalyzer::computeLiveness(const Statement *statement) {
             break;
         case Statement::REMEMBER_REACHING_DEFINITIONS:
             break;
-        case Statement::STACK_MEMORY_INVALIDATION:
+        case Statement::TRACKED_MEMORY_INVALIDATION:
             break;
         default:
             log_.warning(tr("%1: Unknown statement kind: %2.").arg(Q_FUNC_INFO).arg(statement->kind()));
@@ -170,7 +293,9 @@ void LivenessAnalyzer::propagateLiveness(const Term *term) {
     assert(term != nullptr);
 
 #ifdef NC_PREFER_CONSTANTS_TO_EXPRESSIONS
-    if (term->isRead() && dataflow_.getValue(term)->abstractValue().isConcrete()) {
+    const dflow::Value *value = dataflow_.findValue(term);
+    if (dataflow_.converged() && term->isRead() && value &&
+        value->abstractValue().isConcrete()) {
         return;
     }
 #endif

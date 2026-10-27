@@ -54,19 +54,24 @@ public:
         MemoryLocation location_; ///< Memory location.
         std::vector<const Term *> definitions_; ///< Terms defining this memory location.
         bool hasUnknownDefinition_; ///< Whether an unmodelled write may define this location.
+        bool hasIncomingDefinition_; ///< Whether the function-entry value may reach this location.
 
         public:
 
         /*
          * Constructor.
          *
-         * \param location      Valid memory location.
-         * \param definitions   List of terms defining this memory location.
+         * \param location               Valid memory location.
+         * \param definitions            Terms defining this location.
+         * \param hasUnknownDefinition   Whether a value-less write reaches it.
+         * \param hasIncomingDefinition  Whether its entry value reaches it.
          */
         Chunk(const MemoryLocation &location, std::vector<const Term *> definitions,
-              bool hasUnknownDefinition = false):
+              bool hasUnknownDefinition = false,
+              bool hasIncomingDefinition = false):
             location_(location), definitions_(std::move(definitions)),
-            hasUnknownDefinition_(hasUnknownDefinition)
+            hasUnknownDefinition_(hasUnknownDefinition),
+            hasIncomingDefinition_(hasIncomingDefinition)
         {
             assert(location);
         }
@@ -93,6 +98,18 @@ public:
         bool hasUnknownDefinition() const { return hasUnknownDefinition_; }
 
         /**
+         * \return True when a control-flow alternative reaches this location
+         *         without a definition produced inside the function.
+         *
+         * This is distinct from hasUnknownDefinition(): an incoming value is
+         * the value present at function entry, whereas an unknown definition
+         * denotes an explicitly modelled but value-less write.
+         */
+        bool hasIncomingDefinition() const {
+            return hasIncomingDefinition_;
+        }
+
+        /**
          * \param that Another object of the same type.
          *
          * \return True if *this and that have the same memory location and list of terms,
@@ -100,7 +117,8 @@ public:
          */
         bool operator==(const Chunk &that) const {
             return location_ == that.location_ && definitions_ == that.definitions_ &&
-                   hasUnknownDefinition_ == that.hasUnknownDefinition_;
+                   hasUnknownDefinition_ == that.hasUnknownDefinition_ &&
+                   hasIncomingDefinition_ == that.hasIncomingDefinition_;
         }
     };
 
@@ -192,6 +210,19 @@ public:
     void merge(const ReachingDefinitions &those);
 
     /**
+     * Joins definitions from another mutually exclusive control-flow path.
+     *
+     * In contrast with merge(), a bit range represented on only one side is
+     * marked as also having an incoming definition.  This records that the
+     * other path preserves the value which existed before any definition in
+     * the current function.  Overlapping and partially overlapping chunks
+     * are split so the marker applies only to the one-sided subranges.
+     *
+     * \param[in] those Reaching definitions from another CFG alternative.
+     */
+    void joinAlternative(const ReachingDefinitions &those);
+
+    /**
      * \return True, if these and given reaching definitions are the same.
      *
      * \param[in] those Reaching definitions.
@@ -224,7 +255,9 @@ public:
         chunks_.erase(
             std::remove_if(chunks_.begin(), chunks_.end(),
                 [](const Chunk &chunk) -> bool {
-                    return chunk.definitions().empty() && !chunk.hasUnknownDefinition();
+                    return chunk.definitions().empty() &&
+                        !chunk.hasUnknownDefinition() &&
+                        !chunk.hasIncomingDefinition();
                 }),
             chunks_.end());
         selfTest();
@@ -241,9 +274,19 @@ private:
 #ifndef NDEBUG
         for (std::size_t i = 1; i < chunks_.size(); ++i) {
             assert(chunks_[i-1].location() < chunks_[i].location());
+            if (chunks_[i-1].location().domain() ==
+                chunks_[i].location().domain())
+            {
+                assert(chunks_[i-1].location().endAddr() <=
+                       chunks_[i].location().addr());
+            }
         }
 #endif
     }
+
+    /** Combines another definition set, optionally treating it as a mutually
+     * exclusive CFG alternative rather than a may-write overlay. */
+    void mergeImpl(const ReachingDefinitions &those, bool alternative);
 };
 
 } // namespace dflow

@@ -32,6 +32,7 @@
 
 #include <nc/core/arch/Architecture.h>
 #include <nc/core/ir/Term.h>
+#include <nc/core/ir/Terms.h>
 #include <nc/core/ir/dflow/Dataflow.h>
 #include <nc/core/ir/dflow/Dataflows.h>
 
@@ -57,6 +58,7 @@ void VariableAnalyzer::analyze() {
      */
     foreach (const auto &functionAndDataflow, dataflows_) {
         const auto &dataflow = *functionAndDataflow.second;
+        const bool factsUsable = dataflow.converged();
 
         boost::unordered_map<const Term *, std::unique_ptr<TermSet>> term2set;
 
@@ -65,7 +67,11 @@ void VariableAnalyzer::analyze() {
          */
         foreach (const auto &termAndLocation, dataflow.term2location()) {
             const auto &term = termAndLocation.first;
-            const auto &location = termAndLocation.second;
+            const MemoryLocation location = factsUsable ?
+                termAndLocation.second :
+                (term->is<MemoryLocationAccess>() ?
+                    term->asMemoryLocationAccess()->memoryLocation() :
+                    MemoryLocation());
 
             if ((term->isRead() || term->isWrite()) && location) {
                 if (architecture_->isGlobalMemory(location)) {
@@ -79,16 +85,18 @@ void VariableAnalyzer::analyze() {
         /*
          * Join sets of definitions and uses.
          */
-        foreach (auto &pair, term2set) {
-            auto term = pair.first;
+        if (factsUsable) {
+            foreach (auto &pair, term2set) {
+                auto term = pair.first;
 
-            if (term->isRead()) {
-                auto termSet = pair.second.get();
+                if (term->isRead()) {
+                    auto termSet = pair.second.get();
 
-                foreach (const auto &chunk, dataflow.getDefinitions(term).chunks()) {
-                    foreach (const Term *def, chunk.definitions()) {
-                        assert(dataflow.getMemoryLocation(term).overlaps(dataflow.getMemoryLocation(def)));
-                        termSet->unionSet(term2set[def].get());
+                    foreach (const auto &chunk, dataflow.getDefinitions(term).chunks()) {
+                        foreach (const Term *def, chunk.definitions()) {
+                            assert(dataflow.getMemoryLocation(term).overlaps(dataflow.getMemoryLocation(def)));
+                            termSet->unionSet(term2set[def].get());
+                        }
                     }
                 }
             }
@@ -102,7 +110,11 @@ void VariableAnalyzer::analyze() {
             const Term *term = termAndSet.first;
             TermSet *set = termAndSet.second->findSet();
 
-            set2termsAndLocations[set].push_back(Variable::TermAndLocation(term, dataflow.getMemoryLocation(term)));
+            const MemoryLocation location = factsUsable ?
+                dataflow.getMemoryLocation(term) :
+                term->asMemoryLocationAccess()->memoryLocation();
+            set2termsAndLocations[set].push_back(
+                Variable::TermAndLocation(term, location));
         }
 
         /*

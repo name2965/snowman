@@ -60,7 +60,11 @@ EntryHook::EntryHook(const Convention *convention, const FunctionSignature *sign
 
         statements.push_back(std::make_unique<Assignment>(
             std::move(clone),
-            std::make_unique<Intrinsic>(Intrinsic::UNDEFINED, term->size())
+            /* An ABI argument has an unknown value, but it is defined on
+             * every function-entry path.  Distinguish it from a genuinely
+             * undefined/clobbered register so provenance-based transforms
+             * can safely recognize repeated reads of the same argument. */
+            std::make_unique<Intrinsic>(Intrinsic::UNKNOWN, term->size())
         ));
     };
 

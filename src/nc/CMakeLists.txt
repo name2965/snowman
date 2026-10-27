@@ -108,6 +108,8 @@ set(SOURCES
     core/ir/CFG.h
     core/ir/Dominators.cpp
     core/ir/Dominators.h
+    core/ir/PostDominators.cpp
+    core/ir/PostDominators.h
     core/ir/Function.cpp
     core/ir/Function.h
     core/ir/Functions.cpp
@@ -148,6 +150,8 @@ set(SOURCES
     core/ir/calling/ReturnHook.h
     core/ir/calling/SignatureAnalyzer.cpp
     core/ir/calling/SignatureAnalyzer.h
+    core/ir/calling/SymbolPrototypeRegistry.cpp
+    core/ir/calling/SymbolPrototypeRegistry.h
     core/ir/cflow/BasicNode.cpp
     core/ir/cflow/BasicNode.h
     core/ir/cflow/Dfs.cpp
@@ -158,6 +162,8 @@ set(SOURCES
     core/ir/cflow/Graph.h
     core/ir/cflow/GraphBuilder.cpp
     core/ir/cflow/GraphBuilder.h
+    core/ir/cflow/LoopAnalysis.cpp
+    core/ir/cflow/LoopAnalysis.h
     core/ir/cflow/LoopExplorer.cpp
     core/ir/cflow/LoopExplorer.h
     core/ir/cflow/Node.cpp
@@ -180,8 +186,13 @@ set(SOURCES
     core/ir/cgen/Utils.h
     core/ir/dflow/Dataflow.cpp
     core/ir/dflow/Dataflow.h
+    core/ir/dflow/DataflowStatus.h
     core/ir/dflow/DataflowAnalyzer.cpp
     core/ir/dflow/DataflowAnalyzer.h
+    core/ir/dflow/DefUseGraph.cpp
+    core/ir/dflow/DefUseGraph.h
+    core/ir/dflow/ExpressionIdentity.cpp
+    core/ir/dflow/ExpressionIdentity.h
     core/ir/dflow/ReachingDefinitions.cpp
     core/ir/dflow/ReachingDefinitions.h
     core/ir/dflow/Uses.cpp
@@ -190,6 +201,16 @@ set(SOURCES
     core/ir/dflow/Utils.h
     core/ir/dflow/Value.cpp
     core/ir/dflow/Value.h
+    core/ir/dflow/ValueProvenance.cpp
+    core/ir/dflow/ValueProvenance.h
+    core/ir/effects/ExpressionEffects.cpp
+    core/ir/effects/ExpressionEffects.h
+    core/ir/idiom/IdiomAnalyzer.cpp
+    core/ir/idiom/IdiomAnalyzer.h
+    core/ir/idiom/Idioms.h
+    core/ir/idiom/MemoryFill.h
+    core/ir/idiom/MemoryFillLoweringPolicy.cpp
+    core/ir/idiom/MemoryFillLoweringPolicy.h
     core/ir/misc/ArrayAccess.h
     core/ir/misc/BoundsCheck.h
     core/ir/misc/PatternRecognition.cpp
@@ -334,6 +355,10 @@ qt4_wrap_cpp(SOURCES ${MOC_HEADERS} OPTIONS -DQ_MOC_RUN)
 
 add_library(nc ${SOURCES})
 target_link_libraries(nc capstone-static udis86 iberty undname ${Boost_LIBRARIES} ${NC_QT_CORE})
+
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()
 
 add_subdirectory(gui)
 

@@ -22,7 +22,6 @@
 #include <QApplication>
 #include <climits>
 #include <cstdint>
-#include <cstring>
 #include <limits>
 #include <vector>
 #include <_scriptapi_module.h>
@@ -208,32 +207,113 @@ const nc::core::image::Symbol* getFunctionSymbol(nc::core::image::Image* image, 
     return nullptr;
 }
 
-bool hasNameAtAddress(const nc::core::image::Image* image, duint address)
+int externalNameOriginRank(nc::core::image::ExternalNameOrigin origin)
 {
-    const auto relocation = image->getRelocation(address);
-    if (relocation && !relocation->symbol()->name().isEmpty())
-        return true;
-
-    const auto symbol = image->getSymbol(address);
-    return symbol && !symbol->name().isEmpty();
+    switch (origin)
+    {
+    case nc::core::image::ExternalNameOrigin::OBJECT_FILE:
+        return 2;
+    case nc::core::image::ExternalNameOrigin::DEBUGGER:
+        return 1;
+    case nc::core::image::ExternalNameOrigin::UNKNOWN:
+        return 0;
+    }
+    return 0;
 }
 
 void addImportRelocation(nc::core::image::Image* image, duint slotAddress, duint pointerSize,
-                         QString name, const nc::core::image::Symbol* resolvedSymbol = nullptr)
+                         QString moduleName, QString name,
+                         nc::core::image::ExternalNameOrigin nameOrigin,
+                         const nc::core::image::Symbol* resolvedSymbol = nullptr)
 {
-    /* Keep a usable name already supplied by x64dbg. */
-    if (hasNameAtAddress(image, slotAddress))
+    const auto existingRelocation = image->getRelocation(slotAddress);
+
+    /* A PE import descriptor is stronger identity evidence than a debugger's
+     * unqualified display name. Preserve the latter while attaching the DLL
+     * name to a separate external symbol used by the relocation. */
+    if (name.isEmpty() && existingRelocation)
+    {
+        name = existingRelocation->symbol()->name();
+        nameOrigin = existingRelocation->symbol()->externalNameOrigin();
+    }
+    if (name.isEmpty())
+    {
+        const auto slotSymbol = getFunctionSymbol(image, slotAddress);
+        if (slotSymbol)
+        {
+            name = slotSymbol->name();
+            nameOrigin = slotSymbol->externalNameOrigin();
+        }
+    }
+    if (name.isEmpty() && resolvedSymbol)
+    {
+        name = resolvedSymbol->name();
+        nameOrigin = resolvedSymbol->externalNameOrigin();
+    }
+    if (name.isEmpty())
         return;
 
-    const nc::core::image::Symbol* symbol = resolvedSymbol;
-    if (!symbol)
+    if (resolvedSymbol &&
+        nameOrigin != nc::core::image::ExternalNameOrigin::OBJECT_FILE &&
+        name == resolvedSymbol->name())
     {
-        if (name.isEmpty())
-            return;
-        symbol = image->addSymbol(std::make_unique<nc::core::image::Symbol>(
-            nc::core::image::SymbolType::FUNCTION, std::move(name), boost::none));
+        const QString resolvedModule = resolvedSymbol->moduleName();
+        if (!moduleName.isEmpty() && !resolvedModule.isEmpty() &&
+            moduleName.compare(resolvedModule, Qt::CaseInsensitive) != 0)
+        {
+            /* The descriptor and debugger disagree about the identity behind
+             * this slot.  Retain a display name, but never attach API
+             * semantics to the mixed evidence. */
+            nameOrigin = nc::core::image::ExternalNameOrigin::UNKNOWN;
+        }
+        else if (moduleName.isEmpty())
+            moduleName = resolvedModule;
     }
 
+    if (existingRelocation && !existingRelocation->symbol()->name().isEmpty())
+    {
+        const auto existing = existingRelocation->symbol();
+        const QString existingModule = existing->moduleName();
+        const bool modulesConflict = !moduleName.isEmpty() &&
+            !existingModule.isEmpty() &&
+            existingModule.compare(moduleName, Qt::CaseInsensitive) != 0;
+        const int incomingRank = externalNameOriginRank(nameOrigin);
+        const int existingRank =
+            externalNameOriginRank(existing->externalNameOrigin());
+
+        if (modulesConflict ||
+            (incomingRank == existingRank && existing->name() != name))
+        {
+            /* Contradictory evidence for one IAT slot must not retain either
+             * candidate's semantic authority. Keep a display name, but make
+             * prototype lookup reject it through UNKNOWN provenance. */
+            nameOrigin = nc::core::image::ExternalNameOrigin::UNKNOWN;
+        }
+        else if (existingRank > incomingRank)
+        {
+            if (existingModule.isEmpty() && !moduleName.isEmpty())
+            {
+                name = existing->name();
+                nameOrigin = existing->externalNameOrigin();
+            }
+            else
+                return;
+        }
+        else if (existingRank == incomingRank && existing->name() == name)
+        {
+            if (moduleName.isEmpty())
+                moduleName = existingModule;
+            if (moduleName == existingModule)
+                return;
+        }
+
+        if (moduleName.isEmpty())
+            moduleName = existingModule;
+    }
+
+    const auto symbol = image->addSymbol(std::make_unique<nc::core::image::Symbol>(
+        nc::core::image::SymbolType::FUNCTION, std::move(name), boost::none,
+        nullptr, std::move(moduleName), nameOrigin));
     image->addRelocation(std::make_unique<nc::core::image::Relocation>(
         slotAddress, symbol, pointerSize));
 }
@@ -272,8 +352,6 @@ void addImportThunks(nc::core::image::Image* image, duint moduleBase, duint modu
             break;
 
         const duint slotAddress = moduleBase + slotOffset;
-        if (hasNameAtAddress(image, slotAddress))
-            continue;
 
         Thunk resolvedAddress = 0;
         const nc::core::image::Symbol* resolvedSymbol = nullptr;
@@ -285,12 +363,16 @@ void addImportThunks(nc::core::image::Image* image, duint moduleBase, duint modu
             /* The loader normally overwrites FT when OFT is absent. */
             if (resolvedSymbol)
             {
-                addImportRelocation(image, slotAddress, sizeof(Thunk), QString(), resolvedSymbol);
+                addImportRelocation(image, slotAddress, sizeof(Thunk), dllName,
+                                    QString(),
+                                    nc::core::image::ExternalNameOrigin::UNKNOWN,
+                                    resolvedSymbol);
                 continue;
             }
 
             /* Accept only a valid ordinal encoding or a module-bounded name RVA. */
             QString name;
+            auto nameOrigin = nc::core::image::ExternalNameOrigin::UNKNOWN;
             if ((lookupValue & ordinalFlag) && !(lookupValue & ~ordinalEncodingMask))
             {
                 const auto ordinal = static_cast<qulonglong>(lookupValue & ordinalMask);
@@ -303,18 +385,27 @@ void addImportThunks(nc::core::image::Image* image, duint moduleBase, duint modu
             {
                 const auto nameRva = static_cast<duint>(lookupValue & nameMask);
                 if (isRangeInsideModule(nameRva, sizeof(std::uint16_t) + 1, moduleSize))
+                {
                     name = readModuleString(moduleBase, moduleSize, nameRva + sizeof(std::uint16_t));
+                    if (!name.isEmpty())
+                        nameOrigin = nc::core::image::ExternalNameOrigin::OBJECT_FILE;
+                }
             }
-            addImportRelocation(image, slotAddress, sizeof(Thunk), std::move(name));
+            addImportRelocation(image, slotAddress, sizeof(Thunk), dllName,
+                                std::move(name), nameOrigin);
             continue;
         }
 
         QString name;
+        auto nameOrigin = nc::core::image::ExternalNameOrigin::UNKNOWN;
         if (lookupValue & ordinalFlag)
         {
             const auto ordinal = static_cast<qulonglong>(lookupValue & ordinalMask);
             if (resolvedSymbol)
+            {
                 name = resolvedSymbol->name();
+                nameOrigin = resolvedSymbol->externalNameOrigin();
+            }
             else if (!dllName.isEmpty())
                 name = QString("%1:%2").arg(dllName).arg(ordinal);
             else
@@ -324,12 +415,20 @@ void addImportThunks(nc::core::image::Image* image, duint moduleBase, duint modu
         {
             const auto nameRva = static_cast<duint>(lookupValue & nameMask);
             if (isRangeInsideModule(nameRva, sizeof(std::uint16_t) + 1, moduleSize))
+            {
                 name = readModuleString(moduleBase, moduleSize, nameRva + sizeof(std::uint16_t));
+                if (!name.isEmpty())
+                    nameOrigin = nc::core::image::ExternalNameOrigin::OBJECT_FILE;
+            }
             if (name.isEmpty() && resolvedSymbol)
+            {
                 name = resolvedSymbol->name();
+                nameOrigin = resolvedSymbol->externalNameOrigin();
+            }
         }
 
-        addImportRelocation(image, slotAddress, sizeof(Thunk), std::move(name));
+        addImportRelocation(image, slotAddress, sizeof(Thunk), dllName,
+                            std::move(name), nameOrigin, resolvedSymbol);
     }
 }
 
@@ -432,131 +531,6 @@ void addPeImportRelocations(nc::core::image::Image* image, duint moduleBase, dui
 
         if (!remainingThunkEntries)
             break;
-    }
-}
-
-bool getImportThunkSlot(const unsigned char* instruction, duint instructionAddress,
-                        duint& slotAddress)
-{
-    /*
-     * Linkers commonly emit one of these six-byte import jump thunks:
-     *
-     *   x86:    ff 25 <absolute IAT address>
-     *   x86-64: ff 25 <RIP-relative displacement>
-     */
-    if (instruction[0] != 0xff || instruction[1] != 0x25)
-        return false;
-
-#ifdef _WIN64
-    std::int32_t displacement = 0;
-    std::memcpy(&displacement, instruction + 2, sizeof(displacement));
-
-    const duint instructionSize = 6;
-    const duint maxAddress = (std::numeric_limits<duint>::max)();
-    if (instructionAddress > maxAddress - instructionSize)
-        return false;
-    const duint nextInstruction = instructionAddress + instructionSize;
-
-    if (displacement < 0)
-    {
-        const duint distance = static_cast<duint>(-
-            static_cast<std::int64_t>(displacement));
-        if (distance > nextInstruction)
-            return false;
-        slotAddress = nextInstruction - distance;
-    }
-    else
-    {
-        const duint distance = static_cast<duint>(displacement);
-        if (nextInstruction > maxAddress - distance)
-            return false;
-        slotAddress = nextInstruction + distance;
-    }
-#else
-    std::uint32_t absoluteAddress = 0;
-    std::memcpy(&absoluteAddress, instruction + 2, sizeof(absoluteAddress));
-    slotAddress = static_cast<duint>(absoluteAddress);
-#endif
-
-    return true;
-}
-
-void addImportThunkSymbols(nc::core::image::Image* image, duint moduleBase, duint moduleSize)
-{
-    const duint instructionSize = 6;
-    const duint chunkSize = 64 * 1024;
-    const duint maxThunkSymbols = 65536;
-    const duint maxAddress = (std::numeric_limits<duint>::max)();
-    if (!moduleSize || moduleBase > maxAddress - moduleSize)
-        return;
-    const duint moduleEnd = moduleBase + moduleSize;
-    std::vector<unsigned char> bytes(chunkSize + instructionSize - 1);
-    duint thunkSymbols = 0;
-
-    for (const auto section : image->sections())
-    {
-        if (!section->isExecutable() || section->addr() < 0 || section->size() <= 0)
-            continue;
-
-        const auto sectionAddress64 = static_cast<std::uint64_t>(section->addr());
-        const auto sectionSize64 = static_cast<std::uint64_t>(section->size());
-        if (sectionAddress64 > maxAddress)
-            continue;
-        const duint sectionAddress = static_cast<duint>(sectionAddress64);
-        if (sectionAddress >= moduleEnd || sectionSize64 >
-            static_cast<std::uint64_t>(maxAddress - sectionAddress))
-            continue;
-
-        const duint sectionEnd = sectionAddress + static_cast<duint>(sectionSize64);
-        duint current = sectionAddress > moduleBase ? sectionAddress : moduleBase;
-        const duint end = sectionEnd < moduleEnd ? sectionEnd : moduleEnd;
-
-        while (current < end)
-        {
-            const duint remaining = end - current;
-            const duint candidates = chunkSize < remaining ? chunkSize : remaining;
-            const duint requestedSize = candidates + instructionSize - 1;
-            const duint bytesToRead = remaining < requestedSize ? remaining : requestedSize;
-            duint sizeRead = 0;
-            Memory::Read(current, bytes.data(), bytesToRead, &sizeRead);
-            if (sizeRead > bytesToRead)
-                sizeRead = bytesToRead;
-
-            const duint readableCandidates = sizeRead >= instructionSize ?
-                sizeRead - instructionSize + 1 : 0;
-            const duint candidateCount = candidates < readableCandidates ?
-                candidates : readableCandidates;
-            for (duint offset = 0; offset < candidateCount; ++offset)
-            {
-                duint slotAddress = 0;
-                if (!getImportThunkSlot(bytes.data() + offset, current + offset, slotAddress) ||
-                    slotAddress < moduleBase || slotAddress >= moduleEnd)
-                    continue;
-
-                const auto relocation = image->getRelocation(slotAddress);
-                const nc::core::image::Symbol* importSymbol = nullptr;
-                if (relocation &&
-                    relocation->symbol()->type() == nc::core::image::SymbolType::FUNCTION &&
-                    !relocation->symbol()->name().isEmpty())
-                    importSymbol = relocation->symbol();
-                else
-                    importSymbol = getFunctionSymbol(image, slotAddress);
-                if (!importSymbol)
-                    continue;
-
-                const duint thunkAddress = current + offset;
-                if (hasNameAtAddress(image, thunkAddress))
-                    continue;
-
-                image->addSymbol(std::make_unique<nc::core::image::Symbol>(
-                    nc::core::image::SymbolType::FUNCTION,
-                    importSymbol->name(), thunkAddress));
-                if (++thunkSymbols >= maxThunkSymbols)
-                    return;
-            }
-
-            current += candidates;
-        }
     }
 }
 
@@ -734,11 +708,20 @@ static std::unique_ptr<nc::gui::Project> MakeProject(duint base, duint size)
                         std::make_unique<nc::core::image::Relocation>(
                             va,
                             image->addSymbol(std::make_unique<nc::core::image::Symbol>(
-                                nc::core::image::SymbolType::FUNCTION, name, boost::none)),
+                                nc::core::image::SymbolType::FUNCTION, name,
+                                boost::none, nullptr,
+                                /* symbol.mod owns the IAT slot; it is not the
+                                 * target DLL identity.  The PE descriptor or
+                                 * resolved target supplies that separately. */
+                                QString(),
+                                nc::core::image::ExternalNameOrigin::DEBUGGER)),
                             image->platform().architecture()->bitness() / CHAR_BIT));
             }
             else //Function or Export
-                image->addSymbol(std::make_unique<nc::core::image::Symbol>(nc::core::image::SymbolType::FUNCTION, name, va));
+                image->addSymbol(std::make_unique<nc::core::image::Symbol>(
+                    nc::core::image::SymbolType::FUNCTION, name, va, nullptr,
+                    QString::fromUtf8(symbol.mod),
+                    nc::core::image::ExternalNameOrigin::DEBUGGER));
         }
     }
 
@@ -747,9 +730,6 @@ static std::unique_ptr<nc::gui::Project> MakeProject(duint base, duint size)
 
     /* Fill gaps left by Symbol::GetList from the mapped module's PE imports. */
     addPeImportRelocations(image, base, size);
-
-    /* Give direct calls to linker-generated import jump thunks the IAT name. */
-    addImportThunkSymbols(image, base, size);
 
     return project;
 }

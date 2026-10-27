@@ -33,10 +33,12 @@
 #include <nc/core/image/Image.h>
 #include <nc/core/ir/BasicBlock.h>
 #include <nc/core/ir/CFG.h>
+#include <nc/core/ir/Dominators.h>
 #include <nc/core/ir/Function.h>
 #include <nc/core/ir/Functions.h>
 #include <nc/core/ir/FunctionsGenerator.h>
 #include <nc/core/ir/Program.h>
+#include <nc/core/ir/PostDominators.h>
 #include <nc/core/ir/calling/Conventions.h>
 #include <nc/core/ir/calling/Hooks.h>
 #include <nc/core/ir/calling/SignatureAnalyzer.h>
@@ -48,6 +50,11 @@
 #include <nc/core/ir/cgen/NameGenerator.h>
 #include <nc/core/ir/dflow/Dataflows.h>
 #include <nc/core/ir/dflow/DataflowAnalyzer.h>
+#include <nc/core/ir/dflow/DefUseGraph.h>
+#include <nc/core/ir/dflow/ExpressionIdentity.h>
+#include <nc/core/ir/dflow/ValueProvenance.h>
+#include <nc/core/ir/idiom/IdiomAnalyzer.h>
+#include <nc/core/ir/idiom/Idioms.h>
 #include <nc/core/ir/liveness/Livenesses.h>
 #include <nc/core/ir/liveness/LivenessAnalyzer.h>
 #include <nc/core/ir/types/TypeAnalyzer.h>
@@ -148,6 +155,8 @@ void MasterAnalyzer::dataflowAnalysis(Context &context, ir::Function *function) 
     ir::dflow::DataflowAnalyzer(*dataflow, context.image()->platform().architecture(), context.cancellationToken(),
                                 context.logToken()).analyze(ir::CFG(function->basicBlocks()));
 
+    context.hooks()->finalizeInstrumentation(function, *dataflow);
+
     context.dataflows()->emplace(function, std::move(dataflow));
 }
 
@@ -194,6 +203,24 @@ void MasterAnalyzer::livenessAnalysis(Context &context, const ir::Function *func
     context.livenesses()->emplace(function, std::move(liveness));
 }
 
+void MasterAnalyzer::analyzeIdioms(Context &context) const {
+    context.logToken().info(tr("Recovering semantic idioms."));
+
+    auto idioms = std::make_unique<ir::idiom::Idioms>();
+    foreach (const ir::Function *function, context.functions()->list()) {
+        auto functionIdioms = std::make_unique<ir::idiom::FunctionIdioms>();
+        ir::idiom::IdiomAnalyzer(
+            *functionIdioms, function, *context.graphs()->at(function),
+            *context.dataflows()->at(function),
+            *context.livenesses()->at(function), context.cancellationToken())
+            .analyze();
+        idioms->emplace(function, std::move(functionIdioms));
+        context.cancellationToken().poll();
+    }
+
+    context.setIdioms(std::move(idioms));
+}
+
 void MasterAnalyzer::reconstructTypes(Context &context) const {
     context.logToken().info(tr("Reconstructing types."));
 
@@ -225,7 +252,21 @@ void MasterAnalyzer::structuralAnalysis(Context &context, const ir::Function *fu
     std::unique_ptr<ir::cflow::Graph> graph(new ir::cflow::Graph());
 
     ir::cflow::GraphBuilder()(*graph, function);
-    ir::cflow::StructureAnalyzer(*graph, *context.dataflows()->at(function)).analyze();
+    const ir::dflow::Dataflow &dataflow =
+        *context.dataflows()->at(function);
+    ir::CFG cfg(function->basicBlocks());
+    ir::Dominators dominators(
+        cfg, context.cancellationToken(), function->entry());
+    ir::PostDominators postdominators(
+        cfg, context.cancellationToken());
+    ir::dflow::DefUseGraph defUse(dataflow);
+    ir::dflow::ValueProvenance provenance(
+        dataflow, defUse, dominators, cfg);
+    ir::dflow::ExpressionIdentity expressionIdentity(
+        dataflow, defUse, provenance);
+    ir::cflow::StructureAnalyzer(
+        *graph, dataflow, defUse, provenance, expressionIdentity,
+        postdominators).analyze();
 
     context.graphs()->emplace(function, std::move(graph));
 }
@@ -237,7 +278,8 @@ void MasterAnalyzer::generateTree(Context &context) const {
 
     ir::cgen::CodeGenerator(*tree, *context.image(), *context.functions(), *context.hooks(),
         *context.signatures(), *context.dataflows(), *context.variables(), *context.graphs(),
-        *context.livenesses(), *context.types(), context.cancellationToken())
+        *context.livenesses(), *context.idioms(), *context.types(),
+        context.cancellationToken())
         .makeCompilationUnit();
 
     context.setTree(std::move(tree));
@@ -277,6 +319,9 @@ void MasterAnalyzer::decompile(Context &context) const {
     context.cancellationToken().poll();
 
     livenessAnalysis(context);
+    context.cancellationToken().poll();
+
+    analyzeIdioms(context);
     context.cancellationToken().poll();
 
     reconstructTypes(context);

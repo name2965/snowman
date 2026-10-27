@@ -26,10 +26,12 @@
 #include <nc/config.h>
 
 #include <cassert>
+#include <cstddef>
 
 #include <nc/common/Types.h>
 
 #include "AbstractValue.h"
+#include "DataflowStatus.h"
 
 namespace nc {
 namespace core {
@@ -40,10 +42,13 @@ namespace dflow {
  * Dataflow information about a term.
  */
 class Value {
+    std::size_t *revision_; ///< Revision of the owning dataflow, if any.
+    DataflowStatus *analysisStatus_; ///< Lifecycle state of the owning dataflow, if any.
+
     AbstractValue abstractValue_; ///< Abstract value of the term, in the host byte order.
 
-    bool isStackOffset_; ///< Value is a stack pointer with a known offset from the frame base.
-    bool isNotStackOffset_; ///< Value is not a stack pointer with a known offset from the frame base.
+    bool isStackOffset_; ///< Stack-derived evidence is present.
+    bool isNotStackOffset_; ///< Non-stack-derived or conflicting evidence is present.
 
     SignedConstantValue stackOffset_; ///< Offset to stack frame base (in bytes), if the value is a stack pointer.
 
@@ -59,7 +64,8 @@ public:
      *
      * \param size Size of the term.
      */
-    Value(SmallBitSize size);
+    explicit Value(SmallBitSize size, std::size_t *revision = nullptr,
+                   DataflowStatus *analysisStatus = nullptr);
 
     /**
      * \return Abstract value of the term.
@@ -73,7 +79,7 @@ public:
      *
      * The value is resized to the size given to constructor of this class.
      */
-    void setAbstractValue(AbstractValue value) { abstractValue_ = value.resize(abstractValue_.size()); }
+    void setAbstractValue(AbstractValue value);
 
     /**
      * \return True if the value is stack pointer with a known offset
@@ -82,8 +88,18 @@ public:
     bool isStackOffset() const { return isStackOffset_ && !isNotStackOffset_; }
 
     /**
-     * \return True if the value is not a stack pointer with a known offset
-     *         from the frame base, false otherwise.
+     * \return False only when the value is proved to be exclusively
+     *         non-stack-derived. Unknown values and conflicting reaching
+     *         values must conservatively be treated as possible frame
+     *         pointers by alias-sensitive clients.
+     */
+    bool mayBeStackOffset() const {
+        return isStackOffset_ || !isNotStackOffset_;
+    }
+
+    /**
+     * \return True if non-stack-derived or conflicting evidence is present.
+     *         Use mayBeStackOffset() when making alias-safety decisions.
      */
     bool isNotStackOffset() const { return isNotStackOffset_; }
 
@@ -94,10 +110,13 @@ public:
      */
     void makeStackOffset(SignedConstantValue offset);
 
+    /** Marks the value as stack-derived while discarding an exact offset. */
+    void makeAmbiguousStackOffset();
+
     /**
      * Marks the value as not a stack pointer.
      */
-    void makeNotStackOffset() { isNotStackOffset_ = true; }
+    void makeNotStackOffset();
 
     /**
      * \return Offset to stack frame base (in bytes), if the value is a stack pointer.
@@ -117,12 +136,12 @@ public:
     /**
      * Marks the value as being computed via multiplication.
      */
-    void makeProduct() { isProduct_ = true; }
+    void makeProduct();
 
     /**
      * Marks the value as being computed not via multiplication.
      */
-    void makeNotProduct() { isNotProduct_ = true; }
+    void makeNotProduct();
 
     /**
      * \return True if the value is a return address.
@@ -137,12 +156,25 @@ public:
     /**
      * Marks the value as being a return address.
      */
-    void makeReturnAddress() { isReturnAddress_ = true; }
+    void makeReturnAddress();
 
     /**
      * Marks the value as being not a return address.
      */
-    void makeNotReturnAddress() { isNotReturnAddress_ = true; }
+    void makeNotReturnAddress();
+
+private:
+    /** Records a semantic state transition in the owning dataflow. */
+    void changed() {
+        if (revision_) {
+            ++*revision_;
+        }
+        if (analysisStatus_ &&
+            *analysisStatus_ == DataflowStatus::CONVERGED)
+        {
+            *analysisStatus_ = DataflowStatus::INCOMPLETE;
+        }
+    }
 };
 
 } // namespace dflow

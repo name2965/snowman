@@ -24,6 +24,8 @@
 
 #include "PatternRecognition.h"
 
+#include <climits>
+
 #include <nc/core/ir/Jump.h>
 #include <nc/core/ir/Terms.h>
 #include <nc/core/ir/dflow/Dataflow.h>
@@ -41,24 +43,41 @@ namespace misc {
 namespace {
 
 ArrayAccess recognizeArrayAccess(const Term *base, const Term *multiplication, const dflow::Dataflow &dataflow) {
-    const dflow::Value *baseValue = dataflow.getValue(base);
+    const dflow::Value *baseValue = dataflow.findValue(base);
 
-    if (baseValue->abstractValue().isConcrete()) {
+    if (baseValue && baseValue->abstractValue().isConcrete()) {
         if (const BinaryOperator *binary = multiplication->asBinaryOperator()) {
             if (binary->operatorKind() == BinaryOperator::SHL) {
-                const dflow::Value *shiftValue = dataflow.getValue(binary->right());
+                const dflow::Value *shiftValue =
+                    dataflow.findValue(binary->right());
 
-                if (shiftValue->abstractValue().isConcrete()) {
-                    return ArrayAccess(baseValue->abstractValue().asConcrete().value(), 1 << shiftValue->abstractValue().asConcrete().value(), binary->left());
+                if (shiftValue &&
+                    shiftValue->abstractValue().isConcrete()) {
+                    const ConstantValue shift =
+                        shiftValue->abstractValue().asConcrete().value();
+                    /* The coefficient must describe the modular IR
+                     * operation, not merely be safe for the host-language
+                     * shift.  A shift by the result width (or more) produces
+                     * no representable index scale in that result. */
+                    if (shift < sizeof(ConstantValue) * CHAR_BIT &&
+                        shift < static_cast<ConstantValue>(binary->size())) {
+                        return ArrayAccess(
+                            baseValue->abstractValue().asConcrete().value(),
+                            ConstantValue(1) << shift, binary->left());
+                    }
                 }
             } else if (binary->operatorKind() == BinaryOperator::MUL) {
-                const dflow::Value *leftValue = dataflow.getValue(binary->left());
-                if (leftValue->abstractValue().isConcrete()) {
+                const dflow::Value *leftValue =
+                    dataflow.findValue(binary->left());
+                if (leftValue && leftValue->abstractValue().isConcrete() &&
+                    leftValue->abstractValue().asConcrete().value() != 0) {
                     return ArrayAccess(baseValue->abstractValue().asConcrete().value(), leftValue->abstractValue().asConcrete().value(), binary->right());
                 }
 
-                const dflow::Value *rightValue = dataflow.getValue(binary->right());
-                if (rightValue->abstractValue().isConcrete()) {
+                const dflow::Value *rightValue =
+                    dataflow.findValue(binary->right());
+                if (rightValue && rightValue->abstractValue().isConcrete() &&
+                    rightValue->abstractValue().asConcrete().value() != 0) {
                     return ArrayAccess(baseValue->abstractValue().asConcrete().value(), rightValue->abstractValue().asConcrete().value(), binary->left());
                 }
             }
@@ -72,6 +91,10 @@ ArrayAccess recognizeArrayAccess(const Term *base, const Term *multiplication, c
 
 ArrayAccess recognizeArrayAccess(const Term *term, const dflow::Dataflow &dataflow) {
     assert(term != nullptr);
+
+    if (!dataflow.converged()) {
+        return ArrayAccess();
+    }
 
     term = dflow::getFirstCopy(term, dataflow);
 
@@ -97,6 +120,10 @@ ArrayAccess recognizeArrayAccess(const Term *term, const dflow::Dataflow &datafl
 }
 
 BoundsCheck recognizeBoundsCheck(const Jump *jump, const BasicBlock *ifPassed, const dflow::Dataflow &dataflow) {
+    if (!dataflow.converged()) {
+        return BoundsCheck();
+    }
+
     if (jump->isUnconditional()) {
         return BoundsCheck();
     }
@@ -129,15 +156,18 @@ BoundsCheck recognizeBoundsCheck(const Jump *jump, const BasicBlock *ifPassed, c
         if (!inverse) {
             switch (binary->operatorKind()) {
                 case BinaryOperator::UNSIGNED_LESS_OR_EQUAL: {
-                    const dflow::Value *rightValue = dataflow.getValue(binary->right());
-                    if (rightValue->abstractValue().isConcrete()) {
+                    const dflow::Value *rightValue =
+                        dataflow.findValue(binary->right());
+                    if (rightValue && rightValue->abstractValue().isConcrete()) {
                         return BoundsCheck(binary->left(), rightValue->abstractValue().asConcrete().value(), jump->elseTarget().basicBlock());
                     }
                     break;
                 }
                 case BinaryOperator::UNSIGNED_LESS: {
-                    const dflow::Value *rightValue = dataflow.getValue(binary->right());
-                    if (rightValue->abstractValue().isConcrete()) {
+                    const dflow::Value *rightValue =
+                        dataflow.findValue(binary->right());
+                    if (rightValue && rightValue->abstractValue().isConcrete() &&
+                        rightValue->abstractValue().asConcrete().value() != 0) {
                         return BoundsCheck(binary->left(), rightValue->abstractValue().asConcrete().value() - 1, jump->elseTarget().basicBlock());
                     }
                     break;
@@ -146,15 +176,18 @@ BoundsCheck recognizeBoundsCheck(const Jump *jump, const BasicBlock *ifPassed, c
         } else {
             switch (binary->operatorKind()) {
                 case BinaryOperator::UNSIGNED_LESS: {
-                    const dflow::Value *leftValue = dataflow.getValue(binary->left());
-                    if (leftValue->abstractValue().isConcrete()) {
+                    const dflow::Value *leftValue =
+                        dataflow.findValue(binary->left());
+                    if (leftValue && leftValue->abstractValue().isConcrete()) {
                         return BoundsCheck(binary->right(), leftValue->abstractValue().asConcrete().value(), jump->thenTarget().basicBlock());
                     }
                     break;
                 }
                 case BinaryOperator::UNSIGNED_LESS_OR_EQUAL: {
-                    const dflow::Value *leftValue = dataflow.getValue(binary->left());
-                    if (leftValue->abstractValue().isConcrete()) {
+                    const dflow::Value *leftValue =
+                        dataflow.findValue(binary->left());
+                    if (leftValue && leftValue->abstractValue().isConcrete() &&
+                        leftValue->abstractValue().asConcrete().value() != 0) {
                         return BoundsCheck(binary->right(), leftValue->abstractValue().asConcrete().value() - 1, jump->thenTarget().basicBlock());
                     }
                     break;

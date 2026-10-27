@@ -35,23 +35,33 @@ namespace likec {
 }
 
 namespace ir {
+
+class BasicBlock;
+
 namespace cgen {
 
 /**
- * This class remembers which case labels must be generated for which addresses.
+ * This class remembers which case labels must be generated for which basic
+ * blocks.  Unresolved jump-table entries are retained separately by address.
  */
 class SwitchContext {
 public:
-    typedef boost::unordered_map<ByteAddr, std::vector<ConstantValue>> CaseValuesMap;
+    typedef boost::unordered_map<const BasicBlock *,
+                                 std::vector<ConstantValue>> CaseValuesMap;
+    typedef boost::unordered_map<ByteAddr,
+                                 std::vector<ConstantValue>> AddressCaseValuesMap;
 
 private:
     /** Type of the value switch upon. */
     const likec::IntegerType *valueType_;
 
-    /** Mapping from an address to the list of corresponding case values. */
+    /** Mapping from a basic block to the corresponding case values. */
     CaseValuesMap caseValuesMap_;
 
-    /** Address corresponding to default case label. */
+    /** Cases whose jump-table destination could not be resolved to a block. */
+    AddressCaseValuesMap addressCaseValuesMap_;
+
+    /** Basic block corresponding to the default case label. */
     const BasicBlock *defaultBasicBlock_;
 
 public:
@@ -85,36 +95,49 @@ public:
     void setDefaultBasicBlock(const BasicBlock *basicBlock) { defaultBasicBlock_ = basicBlock; }
 
     /**
-     * \return Mapping from an address to the list of corresponding case values.
+     * \return Mapping from a basic block to its corresponding case values.
      */
     const CaseValuesMap &caseValuesMap() { return caseValuesMap_; }
 
     /**
      * Adds a case value.
      *
-     * \param[in] address Address the value corresponds to.
-     * \param[in] value   Case value.
+     * \param[in] basicBlock Basic block the value corresponds to.
+     * \param[in] value      Case value.
      */
-    void addCaseValue(ByteAddr address, ConstantValue value) {
-        caseValuesMap_[address].push_back(value);
+    void addCaseValue(const BasicBlock *basicBlock, ConstantValue value) {
+        assert(basicBlock != nullptr);
+        caseValuesMap_[basicBlock].push_back(value);
+    }
+
+    /** Records a case whose destination has no BasicBlock. */
+    void addAddressCaseValue(ByteAddr address, ConstantValue value) {
+        addressCaseValuesMap_[address].push_back(value);
     }
 
     /**
-     * \param[in] address An address.
+     * \param[in] basicBlock A basic block.
      *
-     * \return Vector of case values for this address.
+     * \return Vector of case values for this basic block.
      */
-    const std::vector<ConstantValue> getCaseValues(ByteAddr address) {
-        return nc::find(caseValuesMap_, address);
+    const std::vector<ConstantValue> getCaseValues(
+            const BasicBlock *basicBlock) {
+        assert(basicBlock != nullptr);
+        return nc::find(caseValuesMap_, basicBlock);
     }
 
     /**
-     * Forgets the case values for the given address.
+     * Forgets the case values for the given basic block.
      *
-     * \param[in] address An address.
+     * \param[in] basicBlock A basic block.
      */
-    void eraseCaseValues(ByteAddr address) {
-        caseValuesMap_.erase(address);
+    void eraseCaseValues(const BasicBlock *basicBlock) {
+        assert(basicBlock != nullptr);
+        caseValuesMap_.erase(basicBlock);
+    }
+
+    const AddressCaseValuesMap &addressCaseValuesMap() const {
+        return addressCaseValuesMap_;
     }
 };
 

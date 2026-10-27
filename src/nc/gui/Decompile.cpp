@@ -52,6 +52,9 @@ void Decompile::work() {
     context->setInstructions(instructions_);
     context->setCancellationToken(cancellationToken());
     context->setLogToken(project_->logToken());
+    for (const auto &provider : project_->symbolPrototypeProviders()) {
+        context->addSymbolPrototypeProvider(provider);
+    }
 
     project_->setContext(context);
 

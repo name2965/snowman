@@ -45,6 +45,10 @@ namespace dflow {
 const Term *getFirstCopy(const Term *term, const Dataflow &dataflow) {
     assert(term != nullptr);
 
+    if (!dataflow.converged()) {
+        return term;
+    }
+
     /* Terms that were already seen. */
     boost::unordered_set<const Term *> visited;
 
@@ -63,6 +67,7 @@ const Term *getFirstCopy(const Term *term, const Dataflow &dataflow) {
             if (definitions.chunks().size() == 1 &&
                 definitions.chunks().front().location() == dataflow.getMemoryLocation(term) &&
                 !definitions.chunks().front().hasUnknownDefinition() &&
+                !definitions.chunks().front().hasIncomingDefinition() &&
                 definitions.chunks().front().definitions().size() == 1 &&
                 dataflow.getMemoryLocation(
                     definitions.chunks().front().definitions().front()) ==
@@ -93,7 +98,9 @@ bool isReturnAddress(const JumpTarget &target, const Dataflow &dataflow) {
 bool isReturnAddress(const Term *term, const Dataflow &dataflow) {
     assert(term != nullptr);
 
-    return dataflow.getValue(term)->isReturnAddress();
+    const Value *value = dataflow.converged() ?
+        dataflow.findValue(term) : nullptr;
+    return value && value->isReturnAddress();
 }
 
 } // namespace dflow

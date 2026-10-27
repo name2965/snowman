@@ -26,6 +26,8 @@
 #include <nc/config.h>
 
 #include <memory> /* For std::unique_ptr. */
+#include <utility>
+#include <vector>
 
 #include <QObject>
 
@@ -52,12 +54,16 @@ namespace ir {
         class Conventions;
         class Hooks;
         class Signatures;
+        class SymbolPrototypeProvider;
     }
     namespace cflow {
         class Graphs;
     }
     namespace dflow {
         class Dataflows;
+    }
+    namespace idiom {
+        class Idioms;
     }
     namespace types {
         class Types;
@@ -87,10 +93,13 @@ class Context: public QObject {
     std::unique_ptr<ir::calling::Conventions> conventions_; ///< Assigned calling conventions.
     std::unique_ptr<ir::calling::Hooks> hooks_; ///< Hooks manager.
     std::unique_ptr<ir::calling::Signatures> signatures_; ///< Signatures.
+    std::vector<std::shared_ptr<const ir::calling::SymbolPrototypeProvider>>
+        symbolPrototypeProviders_; ///< User/plugin external symbol metadata.
     std::unique_ptr<ir::dflow::Dataflows> dataflows_; ///< Dataflows.
     std::unique_ptr<ir::vars::Variables> variables_; ///< Reconstructed variables.
     std::unique_ptr<ir::cflow::Graphs> graphs_; ///< Structured graphs.
     std::unique_ptr<ir::liveness::Livenesses> livenesses_; ///< Liveness information.
+    std::unique_ptr<ir::idiom::Idioms> idioms_; ///< Recovered semantic idioms.
     std::unique_ptr<ir::types::Types> types_; ///< Information about types.
     std::unique_ptr<likec::Tree> tree_; ///< Abstract syntax tree of the LikeC program.
     LogToken logToken_; ///< Log token.
@@ -207,6 +216,26 @@ public:
     const ir::calling::Signatures *signatures() const { return signatures_.get(); }
 
     /**
+     * Adds an external symbol prototype provider for this decompilation.
+     *
+     * A generated SDK database, debug-information reader, or debugger plugin
+     * can use this extension point. Snowman intentionally does not infer API
+     * contracts from a short built-in name list.
+     */
+    void addSymbolPrototypeProvider(
+        std::shared_ptr<const ir::calling::SymbolPrototypeProvider> provider) {
+        if (provider) {
+            symbolPrototypeProviders_.push_back(std::move(provider));
+        }
+    }
+
+    const std::vector<std::shared_ptr<
+        const ir::calling::SymbolPrototypeProvider>> &
+    symbolPrototypeProviders() const {
+        return symbolPrototypeProviders_;
+    }
+
+    /**
      * Sets the dataflow information for all functions.
      *
      * \param[in] dataflows Pointer to the dataflow information. Can be nullptr.
@@ -268,6 +297,18 @@ public:
      * \return Pointer to the liveness information for all functions. Can be nullptr.
      */
     const ir::liveness::Livenesses *livenesses() const { return livenesses_.get(); }
+
+    /**
+     * Sets the semantic idioms recovered for all functions.
+     *
+     * \param[in] idioms Pointer to the idiom information. Can be nullptr.
+     */
+    void setIdioms(std::unique_ptr<ir::idiom::Idioms> idioms);
+
+    /**
+     * \return Pointer to the recovered semantic idioms. Can be nullptr.
+     */
+    const ir::idiom::Idioms *idioms() const { return idioms_.get(); }
 
     /**
      * Sets the information about types.

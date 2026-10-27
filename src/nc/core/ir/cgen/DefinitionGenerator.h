@@ -71,6 +71,11 @@ namespace dflow {
     class Uses;
 }
 
+namespace idiom {
+    class FunctionIdioms;
+    class MemoryFill;
+}
+
 namespace vars {
     class Variable;
 }
@@ -91,6 +96,7 @@ class DefinitionGenerator: public DeclarationGenerator {
     const dflow::Dataflow &dataflow_;
     const cflow::Graph &graph_;
     const liveness::Liveness &liveness_;
+    const idiom::FunctionIdioms &idioms_;
     std::unique_ptr<dflow::Uses> uses_;
     std::unique_ptr<CFG> cfg_;
     std::unique_ptr<Dominators> dominators_;
@@ -101,15 +107,6 @@ class DefinitionGenerator: public DeclarationGenerator {
     boost::unordered_map<const ir::vars::Variable *, likec::VariableDeclaration *> variableDeclarations_;
     boost::unordered_map<const BasicBlock *, likec::LabelDeclaration *> labels_;
     boost::unordered_map<const Term *, boost::optional<bool>> isSubstituted_;
-
-    /** A byte-array view proven by a fixed-size REP STOS over the local frame. */
-    struct StackBuffer {
-        SignedConstantValue offset;
-        ByteSize size;
-        likec::VariableDeclaration *declaration;
-    };
-    std::vector<StackBuffer> stackBuffers_;
-    bool suppressStackBufferExpressions_;
 
 public:
     /**
@@ -150,12 +147,6 @@ private:
      * \return Valid pointer to the local variable declaration.
      */
     likec::VariableDeclaration *makeLocalVariableDeclaration(const vars::Variable *variable);
-
-    /**
-     * Returns source-level type metadata when a local variable is the result
-     * of calls whose recovered prototypes agree on that type.
-     */
-    const calling::TypeDescription *getCallResultType(const vars::Variable *variable) const;
 
     /**
      * \param[in] variable Valid pointer to a variable.
@@ -247,63 +238,20 @@ private:
      */
     std::unique_ptr<likec::Statement> doMakeStatement(const Statement *statement, const BasicBlock *nextBB, const BasicBlock *breakBB, const BasicBlock *continueBB);
 
-    /**
-     * Tries to replace a compiler-generated REP STOS loop with an equivalent
-     * memset call. The rewrite is deliberately limited to operations whose
-     * initial destination, fill byte and iteration count can be recovered and
-     * whose final index/count register values are not observed.
-     *
-     * \param region Structured loop region to inspect.
-     *
-     * \return The memset statement, or nullptr when the loop is not safe to
-     *         rewrite.
-     */
-    std::unique_ptr<likec::Statement> makeRepStos(const cflow::Region *region);
+    /** Lowers a proven operation attached to a structured region. */
+    std::unique_ptr<likec::Statement> makeSemanticOperation(
+        const cflow::Region *region);
+
+    /** Returns whether a semantic memory fill has an exact memset lowering. */
+    bool canLowerMemoryFill(const idiom::MemoryFill &memoryFill) const;
 
     /**
-     * Tries to replace the canonical strlen sequence
-     *
-     *     xor eax, eax
-     *     mov ecx, -1
-     *     repne scasb
-     *     not ecx
-     *     dec ecx
-     *
-     * with an assignment from strlen. The rewrite is only performed when the
-     * complete post-SCAS use chain is present and the resulting index and flag
-     * values are not observed.
-     *
-     * \param region Structured REPNE SCASB loop to inspect.
-     *
-     * \return The strlen assignment, or nullptr when the sequence is not safe
-     *         to rewrite.
+     * Lowers an already proven memory fill to the target AST. At present this
+     * is restricted to mapped writable image objects; stack objects require a
+     * separate frame/object/lifetime proof.
      */
-    std::unique_ptr<likec::Statement> makeRepneScasLength(const cflow::Region *region);
-
-    /**
-     * Recovers an exact stack-frame offset from ZERO_STACK_OFFSET, constant
-     * pointer arithmetic and unambiguous copy definitions. Unlike the general
-     * dataflow stack-offset flag, this deliberately rejects loop-carried
-     * pointer values.
-     */
-    boost::optional<SignedConstantValue> getProvenStackOffset(const Term *term) const;
-
-    /**
-     * Registers a non-overlapping local byte array initialized by REP STOS.
-     * Returns the declaration, or nullptr when the address is not a proven
-     * local-frame offset or the range cannot be represented safely.
-     */
-    likec::VariableDeclaration *registerStackBuffer(const Term *address,
-                                                    ConstantValue byteCount);
-
-    /**
-     * Converts a proven pointer into a previously registered local byte-array
-     * expression. Returns nullptr when no such array covers the pointer.
-     */
-    std::unique_ptr<likec::Expression> makeStackBufferAddress(const Term *term);
-
-    /** Generates an expression without applying a registered stack-array view. */
-    std::unique_ptr<likec::Expression> makeExpressionWithoutStackBuffers(const Term *term);
+    std::unique_ptr<likec::Statement> lowerMemoryFill(
+        const idiom::MemoryFill &memoryFill);
 
     /**
      * Creates a goto statement to the given target.

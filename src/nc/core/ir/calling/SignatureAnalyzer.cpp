@@ -13,7 +13,6 @@
 #include <nc/common/Foreach.h>
 #include <nc/common/make_unique.h>
 
-#include <nc/core/arch/Instruction.h>
 #include <nc/core/ir/BasicBlock.h>
 #include <nc/core/ir/Function.h>
 #include <nc/core/ir/Functions.h>
@@ -59,6 +58,13 @@ void SignatureAnalyzer::computeMappings() {
     foreach (const auto &functionAndDataflow, dataflows_) {
         auto function = functionAndDataflow.first;
         auto &dataflow = *functionAndDataflow.second;
+
+        /* Signature reconstruction turns dataflow facts into an ABI contract
+         * used by a later analysis run.  Never promote a bounded,
+         * non-converged intermediate state into that persistent contract. */
+        if (!dataflow.converged()) {
+            continue;
+        }
 
         id2referrers_[getCalleeId(function)].functions.push_back(function);
 
@@ -295,15 +301,50 @@ bool SignatureAnalyzer::computeReturnValue(const CalleeId &calleeId) {
 
 namespace {
 
+bool checkedScaleByteOffset(SignedConstantValue offset, BitAddr &result) {
+    if (offset < (std::numeric_limits<BitAddr>::min)() / CHAR_BIT ||
+        offset > (std::numeric_limits<BitAddr>::max)() / CHAR_BIT)
+    {
+        return false;
+    }
+    result = offset * CHAR_BIT;
+    return true;
+}
+
+bool checkedShiftLocation(const MemoryLocation &location, BitSize offset,
+                          MemoryLocation &result) {
+    if (!location) {
+        return false;
+    }
+    const BitAddr minimum = (std::numeric_limits<BitAddr>::min)();
+    const BitAddr maximumStart =
+        (std::numeric_limits<BitAddr>::max)() - location.size();
+    if ((offset > 0 && location.addr() > maximumStart - offset) ||
+        (offset < 0 && (offset == minimum ||
+                        location.addr() < minimum - offset)))
+    {
+        return false;
+    }
+    const BitAddr address = location.addr() + offset;
+    if (address < minimum || address > maximumStart) {
+        return false;
+    }
+    result = MemoryLocation(location.domain(), address, location.size());
+    return true;
+}
+
 class StackOffsetFixer {
     boost::optional<BitSize> stackOffset_;
 
 public:
     StackOffsetFixer(const Term *stackPointer, const dflow::Dataflow &dataflow) {
         if (stackPointer) {
-            auto value = dataflow.getValue(stackPointer);
-            if (value->isStackOffset()) {
-                stackOffset_ = value->stackOffset() * CHAR_BIT;
+            const dflow::Value *value = dataflow.findValue(stackPointer);
+            BitAddr offset;
+            if (value && value->isStackOffset() &&
+                checkedScaleByteOffset(value->stackOffset(), offset))
+            {
+                stackOffset_ = offset;
             }
         }
     }
@@ -311,7 +352,10 @@ public:
     MemoryLocation addStackOffset(const MemoryLocation &memoryLocation) {
         if (memoryLocation.domain() == MemoryDomain::STACK) {
             if (stackOffset_) {
-                return memoryLocation.shifted(*stackOffset_);
+                MemoryLocation result;
+                return checkedShiftLocation(
+                    memoryLocation, *stackOffset_, result) ?
+                    result : MemoryLocation();
             } else {
                 return MemoryLocation();
             }
@@ -323,7 +367,15 @@ public:
     MemoryLocation removeStackOffset(const MemoryLocation &memoryLocation) {
         if (memoryLocation.domain() == MemoryDomain::STACK) {
             if (stackOffset_) {
-                return memoryLocation.shifted(-*stackOffset_);
+                if (*stackOffset_ ==
+                    (std::numeric_limits<BitSize>::min)())
+                {
+                    return MemoryLocation();
+                }
+                MemoryLocation result;
+                return checkedShiftLocation(
+                    memoryLocation, -*stackOffset_, result) ?
+                    result : MemoryLocation();
             } else {
                 return MemoryLocation();
             }
@@ -334,143 +386,50 @@ public:
 };
 
 /**
- * Matches the expression produced for a caller-side stack cleanup. In
- * particular, x86 ADD is represented as a temporary assignment followed by
- * an assignment of that temporary to the stack pointer.
+ * Appends the parts of a read whose value can come from the function's
+ * incoming machine state.
+ *
+ * Reaching-definition chunks describe bit coverage.  A gap means that no
+ * definition in the function reaches that part, while an explicit incoming
+ * marker means that only some CFG alternatives define it.  An unknown-write
+ * marker is deliberately not treated as a formal argument: it represents an
+ * operation inside the function whose value merely is not modelled.
  */
-boost::optional<ByteSize> getCallerCleanupSize(const Call *call, const Convention *convention) {
-    assert(call != nullptr);
-    assert(convention != nullptr);
-
-    const auto &stackPointer = convention->stackPointer();
-    if (convention->name() != QLatin1String("cdecl32") ||
-        convention->calleeCleanup() ||
-        !stackPointer ||
-        stackPointer.size() != 32 ||
-        convention->argumentAlignment() <= 0 ||
-        convention->argumentAlignment() % CHAR_BIT != 0)
-    {
-        return boost::none;
+void appendIncomingParts(
+        const MemoryLocation &location,
+        const dflow::ReachingDefinitions &definitions,
+        std::vector<MemoryLocation> &result) {
+    if (!location) {
+        return;
     }
 
-    auto basicBlock = call->basicBlock();
-    auto callInstruction = call->instruction();
-    if (!basicBlock || !callInstruction) {
-        return boost::none;
-    }
-
-    /*
-     * Hooks and the implicit restoration of the return-address slot can occur
-     * after the Call statement. Skip those, but do not skip a real machine
-     * instruction: the cleanup must immediately follow the call.
-     */
-    const arch::Instruction *cleanupInstruction = nullptr;
-    auto statement = basicBlock->statements().get_iterator(call);
-    for (++statement; statement != basicBlock->statements().end(); ++statement) {
-        if ((*statement)->instruction() && (*statement)->instruction() != callInstruction) {
-            cleanupInstruction = (*statement)->instruction();
-            break;
-        }
-    }
-
-    if (!cleanupInstruction || cleanupInstruction->addr() != callInstruction->endAddr()) {
-        return boost::none;
-    }
-
-    std::vector<const Assignment *> assignments;
-    const Assignment *stackPointerWrite = nullptr;
-
-    foreach (const auto candidate, basicBlock->statements()) {
-        if (candidate->instruction() != cleanupInstruction) {
+    BitAddr coveredUntil = location.addr();
+    foreach (const dflow::ReachingDefinitions::Chunk &chunk,
+             definitions.chunks()) {
+        const MemoryLocation overlap =
+            MemoryLocation::intersect(location, chunk.location());
+        if (!overlap) {
             continue;
         }
 
-        auto assignment = candidate->asAssignment();
-        if (!assignment) {
-            continue;
+        if (coveredUntil < overlap.addr()) {
+            result.push_back(MemoryLocation(
+                location.domain(), coveredUntil,
+                overlap.addr() - coveredUntil));
         }
-        assignments.push_back(assignment);
-
-        if (auto access = assignment->left()->asMemoryLocationAccess()) {
-            if (MemoryLocation::intersect(access->memoryLocation(), stackPointer)) {
-                /* A partial or second write would make the update ambiguous. */
-                if (access->memoryLocation() != stackPointer || stackPointerWrite) {
-                    return boost::none;
-                }
-                stackPointerWrite = assignment;
-            }
+        if (chunk.hasIncomingDefinition()) {
+            result.push_back(overlap);
+        }
+        if (overlap.endAddr() > coveredUntil) {
+            coveredUntil = overlap.endAddr();
         }
     }
 
-    if (!stackPointerWrite) {
-        return boost::none;
+    if (coveredUntil < location.endAddr()) {
+        result.push_back(MemoryLocation(
+            location.domain(), coveredUntil,
+            location.endAddr() - coveredUntil));
     }
-
-    auto matchAddition = [&](const Term *term) -> boost::optional<ByteSize> {
-        auto addition = term ? term->asBinaryOperator() : nullptr;
-        if (!addition || addition->operatorKind() != BinaryOperator::ADD ||
-            addition->size() != stackPointer.size())
-        {
-            return boost::none;
-        }
-
-        const Constant *constant = nullptr;
-        const MemoryLocationAccess *access = nullptr;
-        if ((access = addition->left()->asMemoryLocationAccess()) != nullptr) {
-            constant = addition->right()->asConstant();
-        } else if ((access = addition->right()->asMemoryLocationAccess()) != nullptr) {
-            constant = addition->left()->asConstant();
-        }
-
-        if (!access || access->memoryLocation() != stackPointer || !constant ||
-            constant->size() != stackPointer.size())
-        {
-            return boost::none;
-        }
-
-        const SignedConstantValue amount = constant->value().signedValue();
-        const ByteSize alignment = convention->argumentAlignment() / CHAR_BIT;
-        const BitAddr firstArgumentOffset = convention->firstArgumentOffset();
-        if (amount <= 0 || amount % alignment != 0 ||
-            firstArgumentOffset < 0 ||
-            amount > ((std::numeric_limits<BitAddr>::max)() - firstArgumentOffset) / CHAR_BIT)
-        {
-            return boost::none;
-        }
-        return static_cast<ByteSize>(amount);
-    };
-
-    if (auto amount = matchAddition(stackPointerWrite->right())) {
-        return amount;
-    }
-
-    /* Accept the canonical x86 IR form: tmp = oldSP + imm; SP = tmp. */
-    auto temporary = stackPointerWrite->right()->asMemoryLocationAccess();
-    if (!temporary || temporary->memoryLocation() == stackPointer) {
-        return boost::none;
-    }
-
-    const Assignment *temporaryWrite = nullptr;
-    bool reachedStackPointerWrite = false;
-    foreach (const auto assignment, assignments) {
-        if (assignment == stackPointerWrite) {
-            reachedStackPointerWrite = true;
-            continue;
-        }
-        if (auto access = assignment->left()->asMemoryLocationAccess()) {
-            if (MemoryLocation::intersect(access->memoryLocation(), temporary->memoryLocation())) {
-                if (reachedStackPointerWrite ||
-                    access->memoryLocation() != temporary->memoryLocation() ||
-                    temporaryWrite)
-                {
-                    return boost::none;
-                }
-                temporaryWrite = assignment;
-            }
-        }
-    }
-
-    return temporaryWrite ? matchAddition(temporaryWrite->right()) : boost::none;
 }
 
 } // anonymous namespace
@@ -481,6 +440,12 @@ std::vector<MemoryLocation> SignatureAnalyzer::getUndefinedUses(const Function *
     auto &dataflow = *dataflows_.at(function);
 
     std::vector<MemoryLocation> result;
+    if (!dataflow.converged()) {
+        /* Partial fixpoint facts can manufacture both missing and concrete
+         * definitions depending on block order.  Neither is signature
+         * evidence. */
+        return result;
+    }
 
     /*
      * If a term reads a memory location through which an argument
@@ -491,8 +456,14 @@ std::vector<MemoryLocation> SignatureAnalyzer::getUndefinedUses(const Function *
         auto term = termAndLocation.first;
         const auto &memoryLocation = termAndLocation.second;
 
-        if (memoryLocation && term->isRead() && dataflow.getDefinitions(term).empty() && intersect(term, memoryLocation)) {
-            result.push_back(memoryLocation);
+        if (memoryLocation && term->isRead()) {
+            const MemoryLocation usedPart = intersect(term, memoryLocation);
+            if (usedPart) {
+                appendIncomingParts(
+                    usedPart,
+                    dataflow.getDefinitions(term).projected(usedPart),
+                    result);
+            }
         }
     }
 
@@ -509,14 +480,19 @@ std::vector<MemoryLocation> SignatureAnalyzer::getUndefinedUses(const Function *
         }
 
         auto callHook = hooks_.getCallHook(call);
+        if (!callHook || !callHook->snapshotStatement()) {
+            continue;
+        }
         auto fixer = StackOffsetFixer(callHook->stackPointer(), dataflow);
         auto &reachingDefinitions = dataflow.getDefinitions(callHook->snapshotStatement());
 
         foreach (auto memoryLocation, callArguments) {
             memoryLocation = fixer.addStackOffset(memoryLocation);
 
-            if (memoryLocation && reachingDefinitions.projected(memoryLocation).empty()) {
-                result.push_back(memoryLocation);
+            if (memoryLocation) {
+                appendIncomingParts(
+                    memoryLocation,
+                    reachingDefinitions.projected(memoryLocation), result);
             }
         }
     }
@@ -533,11 +509,40 @@ std::vector<MemoryLocation> SignatureAnalyzer::getUnusedDefines(
     std::vector<MemoryLocation> result;
 
     auto callHook = hooks_.getCallHook(call);
+    if (!callHook || !callHook->snapshotStatement()) {
+        return result;
+    }
     auto function = call->basicBlock()->function();
     auto &dataflow = *dataflows_.at(function);
+    if (!dataflow.converged()) {
+        return result;
+    }
     auto &uses = *function2uses_.at(function);
     auto fixer = StackOffsetFixer(callHook->stackPointer(), dataflow);
 
+    const CalleeId calleeId = getCalleeId(call, dataflow);
+    boost::optional<ByteSize> stackArgumentsSize =
+        hooks_.conventions().getStackArgumentsSize(calleeId);
+
+    const ReturnStackCleanup returnCleanup =
+        hooks_.conventions().getReturnStackCleanup(calleeId);
+    if (returnCleanup.isExact() && convention->stackPointer() &&
+        convention->firstArgumentOffset() ==
+            convention->stackPointer().size())
+    {
+        const ByteSize cleanupSize = returnCleanup.size();
+        const bool cleanupDefinesExtent =
+            cleanupSize > 0 || convention->calleeCleanup();
+        if (cleanupDefinesExtent) {
+            if (stackArgumentsSize && *stackArgumentsSize != cleanupSize) {
+                /* Provider/decorated-name metadata and the executable body
+                 * disagree. Neither is a sound argument bound on its own. */
+                stackArgumentsSize = boost::none;
+            } else {
+                stackArgumentsSize = cleanupSize;
+            }
+        }
+    }
     foreach (const auto &chunk, dataflow.getDefinitions(callHook->snapshotStatement()).chunks()) {
         foreach (const Term *term, chunk.definitions()) {
             /* Do not mistake the caller's own return-address slot for a trailing argument. */
@@ -563,21 +568,46 @@ std::vector<MemoryLocation> SignatureAnalyzer::getUnusedDefines(
     }
 
     /*
-     * A direct cdecl cleanup is stronger evidence than the speculative
-     * reaching-definition heuristic. Keep only the stack words that the
-     * caller demonstrably removes for this particular call.
+     * Dead stores alone do not prove that a stack slot is an argument: a
+     * caller local can occupy the same relative offset. Keep stack candidates
+     * only inside an extent proved by ABI metadata or a uniform callee return
+     * effect. A caller-side SP discard is merely an upper bound: compilers can
+     * fold local-frame teardown into the instruction following a call, so it
+     * must not be reinterpreted as a callee argument count.
      */
-    if (auto cleanupSize = getCallerCleanupSize(call, convention)) {
-        const BitAddr begin = convention->firstArgumentOffset();
-        const BitAddr end = begin + *cleanupSize * CHAR_BIT;
-        result.erase(
-            std::remove_if(result.begin(), result.end(),
-                [&](const MemoryLocation &location) {
-                    return location.domain() != MemoryDomain::STACK ||
-                           location.addr() < begin || location.endAddr() > end;
-                }),
-            result.end());
+    BitAddr stackArgumentsEnd = 0;
+    bool validStackExtent = false;
+    if (stackArgumentsSize && *stackArgumentsSize >= 0 &&
+        convention->firstArgumentOffset() >= 0 &&
+        convention->firstArgumentOffset() % CHAR_BIT == 0 &&
+        convention->argumentAlignment() > 0 &&
+        convention->argumentAlignment() % CHAR_BIT == 0 &&
+        *stackArgumentsSize <=
+            ((std::numeric_limits<BitAddr>::max)() -
+             convention->firstArgumentOffset()) / CHAR_BIT)
+    {
+        stackArgumentsEnd = convention->firstArgumentOffset() +
+            *stackArgumentsSize * CHAR_BIT;
+        validStackExtent = true;
     }
+    result.erase(
+        std::remove_if(result.begin(), result.end(),
+            [&](const MemoryLocation &location) {
+                if (location.domain() != MemoryDomain::STACK) {
+                    return false;
+                }
+                if (!validStackExtent ||
+                    location.addr() < convention->firstArgumentOffset() ||
+                    location.addr() > stackArgumentsEnd)
+                {
+                    return true;
+                }
+                /* Avoid MemoryLocation::endAddr(): malformed/extreme input
+                 * must not turn a signed overflow into an accepted extent. */
+                return location.size() >
+                    stackArgumentsEnd - location.addr();
+            }),
+        result.end());
 
     return result;
 }
@@ -587,8 +617,13 @@ std::vector<MemoryLocation> SignatureAnalyzer::getUsedReturnValueLocations(const
 
     std::vector<MemoryLocation> result;
 
+    const Function *function = call->basicBlock()->function();
+    const dflow::Dataflow &dataflow = *dataflows_.at(function);
+    if (!dataflow.converged()) {
+        return result;
+    }
+
     auto callHook = hooks_.getCallHook(call);
-    auto function = call->basicBlock()->function();
     auto &uses = *function2uses_.at(function);
 
     foreach (const auto &locationAndTerm, callHook->speculativeReturnValueTerms()) {
@@ -614,6 +649,9 @@ std::vector<MemoryLocation> SignatureAnalyzer::getUnusedReturnValueLocations(con
     auto returnHook = hooks_.getReturnHook(jump);
     auto function = jump->basicBlock()->function();
     auto &dataflow = *dataflows_.at(function);
+    if (!dataflow.converged()) {
+        return result;
+    }
     auto &uses = *function2uses_.at(function);
     auto &liveness = *livenesses_.at(function);
 

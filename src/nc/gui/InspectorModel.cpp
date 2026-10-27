@@ -150,9 +150,9 @@ void expand(InspectorItem *item, const core::ir::Statement *statement) {
             item->addComment("Callback");
             break;
         }
-        case core::ir::Statement::STACK_MEMORY_INVALIDATION: {
-            auto *invalidation = statement->as<core::ir::StackMemoryInvalidation>();
-            item->addComment("Stack Memory Invalidation");
+        case core::ir::Statement::TRACKED_MEMORY_INVALIDATION: {
+            auto *invalidation = statement->as<core::ir::TrackedMemoryInvalidation>();
+            item->addComment("Tracked Memory Invalidation");
             foreach (const auto &candidate, invalidation->pointerCandidates()) {
                 item->addChild(tr("pointer candidate"), candidate.get());
             }
@@ -175,7 +175,7 @@ void expand(InspectorItem *item, const core::ir::Term *term, const core::Context
     if (term->statement() && term->statement()->basicBlock() && term->statement()->basicBlock()->function()) {
         auto &dataflow = *context->dataflows()->at(term->statement()->basicBlock()->function());
 
-        if (const core::ir::dflow::Value *value = dataflow.getValue(term)) {
+        if (const core::ir::dflow::Value *value = dataflow.findValue(term)) {
             InspectorItem *valueItem = item->addChild(tr("value properties"));
             if (value->abstractValue().isConcrete()) {
                 valueItem->addChild(tr("constant value = %1").arg(value->abstractValue().asConcrete().value()));

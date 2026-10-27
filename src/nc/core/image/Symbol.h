@@ -19,6 +19,19 @@ namespace image {
 class Section;
 
 /**
+ * Provenance of an external symbol's spelling.
+ *
+ * Object-format names participate in linking exactly as stored and therefore
+ * must never have debugger decorations stripped from them. Debugger display
+ * names may contain presentation-only wrappers such as "<JMP.&...>".
+ */
+enum class ExternalNameOrigin {
+    UNKNOWN,
+    OBJECT_FILE,
+    DEBUGGER
+};
+
+/**
  * Symbol type.
  */
 class SymbolType {
@@ -69,6 +82,8 @@ private:
     QString name_; ///< Name of the symbol.
     boost::optional<ConstantValue> value_; ///< Value of the symbol.
     const Section *section_; ///< Section referenced by the symbol.
+    QString moduleName_; ///< Source module for an imported symbol, if known.
+    ExternalNameOrigin externalNameOrigin_; ///< Provenance of an external name.
 
 public:
     /**
@@ -78,9 +93,16 @@ public:
      * \param name Name of the symbol.
      * \param value Value of the symbol.
      * \param section Pointer to the section referenced by the symbol.
+     * \param moduleName Source module for an imported symbol, if known.
+     * \param externalNameOrigin Provenance of the external symbol spelling.
      */
-    Symbol(SymbolType type, QString name, const boost::optional<ConstantValue> &value, const Section *section = nullptr):
-        type_(type), name_(std::move(name)), value_(value), section_(section)
+    Symbol(SymbolType type, QString name,
+           const boost::optional<ConstantValue> &value,
+           const Section *section = nullptr, QString moduleName = QString(),
+           ExternalNameOrigin externalNameOrigin = ExternalNameOrigin::UNKNOWN):
+        type_(type), name_(std::move(name)), value_(value), section_(section),
+        moduleName_(std::move(moduleName)),
+        externalNameOrigin_(externalNameOrigin)
     {}
 
     /**
@@ -102,6 +124,20 @@ public:
      * \return Pointer to the section references by the symbol. Can be nullptr.
      */
     const Section *section() const { return section_; }
+
+    /**
+     * \return Source module for an imported symbol, or an empty string when
+     *         the object format/debugger did not preserve that identity.
+     */
+    const QString &moduleName() const { return moduleName_; }
+
+    /**
+     * \return Provenance used to decide whether presentation decorations may
+     *         be removed during an external prototype lookup.
+     */
+    ExternalNameOrigin externalNameOrigin() const {
+        return externalNameOrigin_;
+    }
 };
 
 } // namespace image

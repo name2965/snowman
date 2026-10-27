@@ -36,6 +36,7 @@
 #include <nc/core/ir/calling/Signatures.h>
 #include <nc/core/ir/cflow/Graphs.h>
 #include <nc/core/ir/dflow/Dataflows.h>
+#include <nc/core/ir/idiom/Idioms.h>
 #include <nc/core/ir/liveness/Livenesses.h>
 #include <nc/core/ir/types/Types.h>
 #include <nc/core/ir/vars/Variables.h>
@@ -94,6 +95,10 @@ void Context::setLivenesses(std::unique_ptr<ir::liveness::Livenesses> livenesses
 
 void Context::setGraphs(std::unique_ptr<ir::cflow::Graphs> graphs) {
     graphs_ = std::move(graphs);
+}
+
+void Context::setIdioms(std::unique_ptr<ir::idiom::Idioms> idioms) {
+    idioms_ = std::move(idioms);
 }
 
 void Context::setTypes(std::unique_ptr<ir::types::Types> types) {

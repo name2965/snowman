@@ -40,8 +40,10 @@ namespace ir {
 namespace calling {
 
 CallHook::CallHook(const Convention *convention, const CallSignature *signature,
-    const boost::optional<ByteSize> &stackArgumentsSize):
-    stackPointer_(nullptr), snapshotStatement_(nullptr)
+    const boost::optional<ByteSize> &stackCleanupSize,
+    bool unknownStackCleanup):
+    stackPointer_(nullptr), snapshotStatement_(nullptr),
+    pointeeReadSnapshotStatement_(nullptr)
 {
     assert(convention != nullptr);
 
@@ -72,17 +74,40 @@ CallHook::CallHook(const Convention *convention, const CallSignature *signature,
         ));
     };
 
+    auto addCallClobbers = [&]() {
+        foreach (const MemoryLocation &location,
+                 convention->clobberedLocations()) {
+            addReturnValueWrite(
+                std::make_unique<MemoryLocationAccess>(location));
+        }
+    };
+
     if (signature) {
         std::vector<std::unique_ptr<Term>> pointerCandidates;
         pointerCandidates.reserve(signature->arguments().size());
+        const auto &prototype = signature->prototype();
+        const bool completePrototype = prototype &&
+            prototype->memoryEffectsAreComplete() &&
+            prototype->parameters().size() == signature->arguments().size();
+
+        /* An inferred signature identifies observed argument locations, but it
+         * is not a complete memory-effect contract. Hidden arguments and
+         * previously escaped pointers therefore require a conservative
+         * pre-effect snapshot and whole-memory barrier. A parameter-count
+         * declaration without an explicit complete-effect promise and a
+         * parameter-count mismatch are incomplete as well: treating either
+         * as exact could silently miss pointee effects. */
+        bool hasPointeeReadEffect = !completePrototype;
 
         std::size_t argumentIndex = 0;
         foreach (const auto &term, signature->arguments()) {
             auto clone = term->clone();
-            const auto &prototype = signature->prototype();
-            const bool mayWriteMemory =
-                !prototype || argumentIndex >= prototype->parameters().size() ||
+            const bool mayReadMemory = !completePrototype ||
+                prototype->parameters()[argumentIndex].mayReadMemory();
+            const bool mayWriteMemory = completePrototype &&
                 prototype->parameters()[argumentIndex].mayWriteMemory();
+            hasPointeeReadEffect =
+                hasPointeeReadEffect || mayReadMemory;
             if (mayWriteMemory) {
                 pointerCandidates.push_back(clone->clone());
             }
@@ -92,13 +117,33 @@ CallHook::CallHook(const Convention *convention, const CallSignature *signature,
         }
 
         /*
+         * Keep a pre-effect snapshot separate from the snapshot used for
+         * signature inference below. Calls may read stack objects through any
+         * pointer-valued argument, including parameters which are not marked
+         * as writable by the prototype.
+         */
+        if (hasPointeeReadEffect) {
+            auto pointeeReadSnapshot =
+                std::make_unique<RememberReachingDefinitions>();
+            pointeeReadSnapshotStatement_ = pointeeReadSnapshot.get();
+            statements.push_back(std::move(pointeeReadSnapshot));
+        }
+
+        /*
          * This statement follows all argument reads so invalidating a local
          * buffer cannot erase another argument before its value is captured.
          */
-        if (!pointerCandidates.empty()) {
-            statements.push_back(std::make_unique<StackMemoryInvalidation>(
+        if (!completePrototype) {
+            statements.push_back(std::make_unique<TrackedMemoryInvalidation>(
+                TrackedMemoryInvalidation::ALL_TRACKED_MEMORY));
+        } else if (!pointerCandidates.empty()) {
+            statements.push_back(std::make_unique<TrackedMemoryInvalidation>(
                 std::move(pointerCandidates)));
         }
+
+        /* Argument values and pointee candidates have been captured. Kill
+         * every ABI caller-saved register before defining the return value. */
+        addCallClobbers();
 
         if (signature->returnValue()) {
             auto clone = signature->returnValue()->clone();
@@ -110,6 +155,14 @@ CallHook::CallHook(const Convention *convention, const CallSignature *signature,
         snapshotStatement_ = snapshotStatement.get();
         statements.push_back(std::move(snapshotStatement));
 
+        /* Signature inference consumes the pre-call snapshot. Until it has
+         * produced a complete contract, any tracked caller-memory location may
+         * also be observed or changed through a hidden or escaped pointer. */
+        statements.push_back(std::make_unique<TrackedMemoryInvalidation>(
+            TrackedMemoryInvalidation::ALL_TRACKED_MEMORY));
+
+        addCallClobbers();
+
         foreach (const auto &memoryLocation, convention->returnValueLocations()) {
             auto term = std::make_unique<MemoryLocationAccess>(memoryLocation);
             speculativeReturnValueTerms_.push_back(std::make_pair(memoryLocation, term.get()));
@@ -117,7 +170,15 @@ CallHook::CallHook(const Convention *convention, const CallSignature *signature,
         }
     }
 
-    if (convention->calleeCleanup() && stackArgumentsSize) {
+    if (unknownStackCleanup) {
+        if (convention->stackPointer()) {
+            statements.push_back(std::make_unique<Assignment>(
+                std::make_unique<MemoryLocationAccess>(convention->stackPointer()),
+                std::make_unique<Intrinsic>(
+                    Intrinsic::UNDEFINED,
+                    convention->stackPointer().size<SmallBitSize>())));
+        }
+    } else if (stackCleanupSize && *stackCleanupSize != 0) {
         assert(convention->stackPointer());
 
         statements.push_back(std::make_unique<Assignment>(
@@ -125,7 +186,7 @@ CallHook::CallHook(const Convention *convention, const CallSignature *signature,
             std::make_unique<BinaryOperator>(
                 BinaryOperator::ADD,
                 std::make_unique<MemoryLocationAccess>(convention->stackPointer()),
-                std::make_unique<Constant>(SizedValue(convention->stackPointer().size(), *stackArgumentsSize)),
+                std::make_unique<Constant>(SizedValue(convention->stackPointer().size(), *stackCleanupSize)),
                 convention->stackPointer().size<SmallBitSize>())));
     }
 }

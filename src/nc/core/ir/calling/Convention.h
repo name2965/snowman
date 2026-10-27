@@ -60,6 +60,7 @@ private:
 
     std::vector<std::vector<MemoryLocation>> argumentGroups_; ///< Groups of locations through which arguments of different kinds can be passed.
     std::vector<MemoryLocation> returnValueLocations_; ///< List of memory locations that can be used for passing return values.
+    std::vector<MemoryLocation> clobberedLocations_; ///< Register locations not preserved by a call.
 
     bool calleeCleanup_; ///< Callee cleans up arguments.
 
@@ -141,6 +142,14 @@ public:
     const std::vector<MemoryLocation> &returnValueLocations() const { return returnValueLocations_; }
 
     /**
+     * \return Register locations whose incoming values are not preserved by
+     *         a call using this convention.
+     */
+    const std::vector<MemoryLocation> &clobberedLocations() const {
+        return clobberedLocations_;
+    }
+
+    /**
      * \param memoryLocation A memory location.
      *
      * \return Possible return value location covering given memory location.
@@ -190,6 +199,9 @@ protected:
      * \param location Valid memory location.
      */
     void addReturnValueLocation(const MemoryLocation &location);
+
+    /** Adds ABI-defined caller-saved register locations. */
+    void addClobberedLocations(std::vector<MemoryLocation> locations);
 
     /**
      * Sets whether callee cleans up arguments.

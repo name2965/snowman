@@ -25,6 +25,8 @@
 #include "IRGenerator.h"
 
 #include <cassert>
+#include <climits>
+#include <limits>
 #include <queue>
 
 #include <boost/range/algorithm_ext/is_sorted.hpp>
@@ -116,7 +118,18 @@ void IRGenerator::computeJumpTargets(ir::BasicBlock *basicBlock) {
     ir::dflow::ReachingDefinitions definitions;
 
     foreach (auto statement, basicBlock->statements()) {
+        /* Do not expose the previous prefix as a completed result while the
+         * next transfer function is still updating it. */
+        dataflow.setAnalysisStatus(ir::dflow::DataflowStatus::RUNNING);
         analyzer.execute(statement, definitions);
+
+        /* This is a straight-line abstract interpretation of the current
+         * block prefix, rather than a bounded global CFG iteration.  The
+         * facts are complete for that local domain once execute() returns.
+         * Mark that explicitly so semantic pattern recognizers can reject
+         * genuinely unfinished global analyses without disabling the jump
+         * table discovery for which this local analyzer exists. */
+        dataflow.setConverged(true);
 
         switch (statement->kind()) {
             case ir::Statement::INLINE_ASSEMBLY: {
@@ -129,10 +142,12 @@ void IRGenerator::computeJumpTargets(ir::BasicBlock *basicBlock) {
             }
             case ir::Statement::CALL: {
                 auto call = statement->asCall();
-                auto addressValue = dataflow.getValue(call->target());
+                const ir::dflow::Value *addressValue =
+                    dataflow.findValue(call->target());
 
                 /* Record information about the function entry. */
-                if (addressValue->abstractValue().isConcrete()) {
+                if (addressValue &&
+                    addressValue->abstractValue().isConcrete()) {
                     ByteAddr address = addressValue->abstractValue().asConcrete().value();
 
                     program_->addCalledAddress(address);
@@ -170,9 +185,10 @@ void IRGenerator::computeJumpTargets(ir::BasicBlock *basicBlock) {
 
 void IRGenerator::computeJumpTarget(ir::JumpTarget &target, const ir::dflow::Dataflow &dataflow) {
     if (target.address() && !target.basicBlock() && !target.table()) {
-        const ir::dflow::Value *addressValue = dataflow.getValue(target.address());
+        const ir::dflow::Value *addressValue =
+            dataflow.findValue(target.address());
 
-        if (addressValue->abstractValue().isConcrete()) {
+        if (addressValue && addressValue->abstractValue().isConcrete()) {
             target.setBasicBlock(program_->createBasicBlock(addressValue->abstractValue().asConcrete().value()));
         } else {
             auto entries = getJumpTableEntries(target.address(), dataflow);
@@ -197,26 +213,60 @@ std::vector<ByteAddr> IRGenerator::getJumpTableEntries(const ir::Term *target, c
         return result;
     }
 
+    const SmallBitSize targetSize = target->size();
+    if (targetSize <= 0 || targetSize % CHAR_BIT != 0 ||
+        targetSize > static_cast<SmallBitSize>(sizeof(ByteAddr) * CHAR_BIT))
+    {
+        return result;
+    }
+
+    ConstantValue maximumAddress = static_cast<ConstantValue>(
+        (std::numeric_limits<ByteAddr>::max)());
+    if (targetSize < static_cast<SmallBitSize>(
+            sizeof(ConstantValue) * CHAR_BIT))
+    {
+        const ConstantValue targetAddressMask =
+            (ConstantValue(1) << targetSize) - 1;
+        if (targetAddressMask < maximumAddress) {
+            maximumAddress = targetAddressMask;
+        }
+    }
+    if (arrayAccess.base() > maximumAddress ||
+        arrayAccess.stride() == 0 ||
+        arrayAccess.stride() > maximumAddress)
+    {
+        return result;
+    }
+
     /* Safety net. */
     const std::size_t maxTableEntries = 65536;
-    const ByteSize entrySize = target->size() / CHAR_BIT;
+    const ByteSize entrySize = targetSize / CHAR_BIT;
 
     image::Reader reader(image_);
 
     auto byteOrder = image_->platform().architecture()->getByteOrder(ir::MemoryDomain::MEMORY);
 
-    ByteAddr address = arrayAccess.base();
-    while (auto entry = reader.readInt<ByteAddr>(address, entrySize, byteOrder)) {
+    ByteAddr address = static_cast<ByteAddr>(arrayAccess.base());
+    const ByteAddr stride = static_cast<ByteAddr>(arrayAccess.stride());
+    const ByteAddr maximumEntryStart =
+        static_cast<ByteAddr>(maximumAddress) - (entrySize - 1);
+    while (address <= maximumEntryStart) {
+        auto entry = reader.readInt<ByteAddr>(address, entrySize, byteOrder);
+        if (!entry) {
+            break;
+        }
         if (!isInstructionAddress(*entry)) {
             break;
         }
-        result.push_back(*entry);
-        address += arrayAccess.stride();
-
-        if (result.size() > maxTableEntries) {
-            log_.warning(tr("Jump table at address %1 seems to have more than %2 entries.").arg(address).arg(maxTableEntries));
+        if (result.size() >= maxTableEntries) {
+            log_.warning(tr("Jump table at address %1 has more than %2 entries.").arg(address).arg(maxTableEntries));
             break;
         }
+        result.push_back(*entry);
+        if (address > static_cast<ByteAddr>(maximumAddress) - stride) {
+            break;
+        }
+        address += stride;
     }
 
     return result;

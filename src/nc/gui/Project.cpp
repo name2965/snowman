@@ -25,6 +25,7 @@
 #include "Project.h"
 
 #include <cassert>
+#include <utility>
 
 #include <nc/common/make_unique.h>
 #include <nc/common/Foreach.h>
@@ -92,6 +93,14 @@ void Project::setContext(const std::shared_ptr<const core::Context> &context) {
 
         connect(context_.get(), SIGNAL(instructionsChanged()), this, SLOT(updateInstructions()));
         connect(context_.get(), SIGNAL(treeChanged()), this, SIGNAL(treeChanged()));
+    }
+}
+
+void Project::addSymbolPrototypeProvider(
+        std::shared_ptr<const
+            core::ir::calling::SymbolPrototypeProvider> provider) {
+    if (provider) {
+        symbolPrototypeProviders_.push_back(std::move(provider));
     }
 }
 

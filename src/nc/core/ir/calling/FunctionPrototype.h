@@ -5,6 +5,7 @@
 
 #include <nc/config.h>
 
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -17,8 +18,10 @@ namespace core {
 namespace ir {
 namespace calling {
 
+class FunctionPrototype;
+
 /**
- * Presentation-oriented type information attached to a recovered signature.
+ * Source-level type information attached to a recovered signature.
  *
  * The IR type analyzer deliberately keeps using structural integer and pointer
  * types. This description only supplies a more useful source-level spelling,
@@ -58,48 +61,125 @@ public:
 
 /** Source-level name and type for a formal argument. */
 class ParameterDescription {
+public:
+    /** Conservative effects on memory reachable through one argument. */
+    enum class PointeeAccess {
+        NONE,
+        READ,
+        WRITE,
+        READ_WRITE
+    };
+
+private:
     QString name_;
     TypeDescription type_;
-    bool mayWriteMemory_;
+    PointeeAccess pointeeAccess_;
+    std::shared_ptr<const FunctionPrototype> callbackPrototype_;
 
 public:
-    ParameterDescription(QString name, TypeDescription type, bool mayWriteMemory = true):
-        name_(std::move(name)), type_(std::move(type)), mayWriteMemory_(mayWriteMemory)
+    /**
+     * Backward-compatible constructor. Historical metadata described only
+     * writes, so a non-writable parameter remains conservatively readable.
+     */
+    ParameterDescription(
+            QString name, TypeDescription type, bool mayWriteMemory = true,
+            std::shared_ptr<const FunctionPrototype> callbackPrototype =
+                std::shared_ptr<const FunctionPrototype>()):
+        name_(std::move(name)), type_(std::move(type)),
+        pointeeAccess_(mayWriteMemory ? PointeeAccess::READ_WRITE :
+                                       PointeeAccess::READ),
+        callbackPrototype_(std::move(callbackPrototype))
+    {}
+
+    ParameterDescription(
+            QString name, TypeDescription type, PointeeAccess pointeeAccess,
+            std::shared_ptr<const FunctionPrototype> callbackPrototype =
+                std::shared_ptr<const FunctionPrototype>()):
+        name_(std::move(name)), type_(std::move(type)),
+        pointeeAccess_(pointeeAccess),
+        callbackPrototype_(std::move(callbackPrototype))
     {}
 
     const QString &name() const { return name_; }
     const TypeDescription &type() const { return type_; }
 
     /**
+     * \return True if the callee may observe memory reachable through this
+     *         argument. This effect is independent of whether that memory can
+     *         also be modified.
+     */
+    bool mayReadMemory() const {
+        return pointeeAccess_ == PointeeAccess::READ ||
+               pointeeAccess_ == PointeeAccess::READ_WRITE;
+    }
+
+    /**
      * \return True if the callee may modify memory reachable through this
      *         argument. This is conservative by default for prototypes which
      *         do not provide const/output metadata.
      */
-    bool mayWriteMemory() const { return mayWriteMemory_; }
+    bool mayWriteMemory() const {
+        return pointeeAccess_ == PointeeAccess::WRITE ||
+               pointeeAccess_ == PointeeAccess::READ_WRITE;
+    }
+
+    PointeeAccess pointeeAccess() const { return pointeeAccess_; }
+
+    /**
+     * \return Prototype of the function accepted by this parameter, or an
+     *         empty pointer when the parameter is not a known callback.
+     *
+     * This metadata is independent of the parameter's source-level typedef
+     * spelling. For example, two different callback typedef names may share
+     * the same nested function prototype.
+     */
+    const std::shared_ptr<const FunctionPrototype> &callbackPrototype() const {
+        return callbackPrototype_;
+    }
 };
 
-/** Optional source-level metadata for a recovered function signature. */
+/**
+ * Optional source-level and semantic metadata for a recovered function
+ * signature. In addition to presentation names, parameter descriptions carry
+ * memory-effect and nested callback information used by analysis passes.
+ */
 class FunctionPrototype {
     TypeDescription returnType_;
     std::vector<ParameterDescription> parameters_;
     QString callingConvention_;
     QString preferredName_;
+    bool memoryEffectsAreComplete_;
 
 public:
+    /**
+     * \param memoryEffectsAreComplete True only when the per-parameter
+     *        PointeeAccess values are a complete summary of memory reachable
+     *        from the caller, including the absence of accesses through
+     *        globals, captured callbacks, or previously escaped pointers.
+     *        The conservative default is false: a declaration alone does not
+     *        prove that unmentioned memory is untouched.
+     */
     FunctionPrototype(TypeDescription returnType,
                       std::vector<ParameterDescription> parameters = std::vector<ParameterDescription>(),
                       QString callingConvention = QString(),
-                      QString preferredName = QString()):
+                      QString preferredName = QString(),
+                      bool memoryEffectsAreComplete = false):
         returnType_(std::move(returnType)),
         parameters_(std::move(parameters)),
         callingConvention_(std::move(callingConvention)),
-        preferredName_(std::move(preferredName))
+        preferredName_(std::move(preferredName)),
+        memoryEffectsAreComplete_(memoryEffectsAreComplete)
     {}
 
     const TypeDescription &returnType() const { return returnType_; }
     const std::vector<ParameterDescription> &parameters() const { return parameters_; }
     const QString &callingConvention() const { return callingConvention_; }
     const QString &preferredName() const { return preferredName_; }
+
+    /** Whether parameter effects exclude all other caller-memory accesses. */
+    bool memoryEffectsAreComplete() const {
+        return memoryEffectsAreComplete_;
+    }
 };
 
 } // namespace calling

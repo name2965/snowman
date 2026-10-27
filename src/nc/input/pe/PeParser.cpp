@@ -422,7 +422,10 @@ private:
                 image_->addRelocation(std::make_unique<core::image::Relocation>(
                     importEntryAddress,
                     image_->addSymbol(std::make_unique<core::image::Symbol>(
-                        core::image::SymbolType::FUNCTION, tr("%1:%2").arg(dllName).arg(ordinal), boost::none)),
+                        core::image::SymbolType::FUNCTION,
+                        tr("%1:%2").arg(dllName).arg(ordinal), boost::none,
+                        nullptr, dllName,
+                        core::image::ExternalNameOrigin::UNKNOWN)),
                     entrySize));
             } else {
                 auto name = reader.readAsciizString(
@@ -438,7 +441,9 @@ private:
                 image_->addRelocation(std::make_unique<core::image::Relocation>(
                     importEntryAddress,
                     image_->addSymbol(std::make_unique<core::image::Symbol>(core::image::SymbolType::FUNCTION,
-                                                                            std::move(name), boost::none)),
+                                                                            std::move(name), boost::none,
+                                                                            nullptr, dllName,
+                                                                            core::image::ExternalNameOrigin::OBJECT_FILE)),
                     entrySize));
             }
         }

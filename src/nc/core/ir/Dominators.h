@@ -5,6 +5,7 @@
 
 #include <nc/config.h>
 
+#include <functional>
 #include <vector>
 
 #include <boost/unordered_map.hpp>
@@ -25,6 +26,9 @@ class CFG;
  * Dominator sets.
  */
 class Dominators {
+    /** Entry used to compute reachable blocks. */
+    const BasicBlock *entry_;
+
     /** Mapping from a basic block to the set of its dominators. */
     boost::unordered_map<const BasicBlock *, std::vector<const BasicBlock *>> dominators_;
 
@@ -37,6 +41,22 @@ public:
      * \param canceled Cancellation token.
      */
     Dominators(const CFG &cfg, const CancellationToken &canceled);
+
+    /**
+     * Constructs dominator sets for the subgraph reachable from a specified
+     * entry block. Detached blocks are treated conservatively as being
+     * dominated only by themselves.
+     *
+     * \param cfg Control flow graph.
+     * \param canceled Cancellation token.
+     * \param entry Entry block. If null or outside \p cfg, every block is
+     * conservatively treated as dominated only by itself.
+     */
+    Dominators(const CFG &cfg, const CancellationToken &canceled,
+               const BasicBlock *entry);
+
+    /** \return Entry used for this analysis, or nullptr if none was valid. */
+    const BasicBlock *entry() const { return entry_; }
 
     /**
      * \param basicBlock Valid pointer to a basic block.
@@ -62,7 +82,8 @@ public:
         assert(nc::contains(dominators_, dominated));
 
         const auto &dominators = getDominators(dominated);
-        return std::binary_search(dominators.begin(), dominators.end(), dominating);
+        return std::binary_search(dominators.begin(), dominators.end(), dominating,
+                                  std::less<const BasicBlock *>());
     }
 };
 

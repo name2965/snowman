@@ -3,8 +3,11 @@
 
 #include "CallingConventions.h"
 
+#include <initializer_list>
+
 #include <nc/common/make_unique.h>
 
+#include <nc/core/arch/Register.h>
 #include <nc/core/ir/Statements.h>
 #include <nc/core/ir/Terms.h>
 
@@ -14,6 +17,69 @@
 namespace nc {
 namespace arch {
 namespace x86 {
+
+namespace {
+
+typedef core::arch::Register Register;
+typedef core::ir::MemoryLocation MemoryLocation;
+
+void appendLocations(std::vector<MemoryLocation> &result,
+                     std::initializer_list<const Register *> registers) {
+    for (const Register *reg : registers) {
+        assert(reg != nullptr);
+        result.push_back(reg->memoryLocation());
+    }
+}
+
+std::vector<MemoryLocation> volatileCallState(
+        std::initializer_list<const Register *> generalPurpose,
+        std::size_t xmmCount) {
+    std::vector<MemoryLocation> result;
+    appendLocations(result, generalPurpose);
+
+    /* Arithmetic flags are caller state. DF is deliberately excluded: all
+     * supported x86 ABIs require it to be clear across calls. */
+    appendLocations(result, {
+        X86Registers::cf(), X86Registers::pf(), X86Registers::af(),
+        X86Registers::zf(), X86Registers::sf(), X86Registers::of(),
+        X86Registers::less(), X86Registers::less_or_equal(),
+        X86Registers::below_or_equal(), X86Registers::fpu_status_word()
+    });
+
+    const Register *const floatingStack[] = {
+        X86Registers::st0(), X86Registers::st1(), X86Registers::st2(),
+        X86Registers::st3(), X86Registers::st4(), X86Registers::st5(),
+        X86Registers::st6(), X86Registers::st7()
+    };
+    const Register *const multimedia[] = {
+        X86Registers::mm0(), X86Registers::mm1(), X86Registers::mm2(),
+        X86Registers::mm3(), X86Registers::mm4(), X86Registers::mm5(),
+        X86Registers::mm6(), X86Registers::mm7()
+    };
+    const Register *const vectors[] = {
+        X86Registers::xmm0(), X86Registers::xmm1(), X86Registers::xmm2(),
+        X86Registers::xmm3(), X86Registers::xmm4(), X86Registers::xmm5(),
+        X86Registers::xmm6(), X86Registers::xmm7(), X86Registers::xmm8(),
+        X86Registers::xmm9(), X86Registers::xmm10(), X86Registers::xmm11(),
+        X86Registers::xmm12(), X86Registers::xmm13(), X86Registers::xmm14(),
+        X86Registers::xmm15()
+    };
+    for (const Register *reg : floatingStack) {
+        result.push_back(reg->memoryLocation());
+    }
+    for (const Register *reg : multimedia) {
+        result.push_back(reg->memoryLocation());
+    }
+    const std::size_t availableVectors =
+        sizeof(vectors) / sizeof(vectors[0]);
+    assert(xmmCount <= availableVectors);
+    for (std::size_t index = 0; index < xmmCount; ++index) {
+        result.push_back(vectors[index]->memoryLocation());
+    }
+    return result;
+}
+
+} // anonymous namespace
 
 AMD64CallingConvention::AMD64CallingConvention(const X86Architecture *architecture):
     Convention(QLatin1String("amd64"))
@@ -47,6 +113,11 @@ AMD64CallingConvention::AMD64CallingConvention(const X86Architecture *architectu
 
     addReturnValueLocation(X86Registers::rax()->memoryLocation());
     addReturnValueLocation(X86Registers::xmm0()->memoryLocation());
+    addClobberedLocations(volatileCallState({
+        X86Registers::rax(), X86Registers::rcx(), X86Registers::rdx(),
+        X86Registers::rsi(), X86Registers::rdi(), X86Registers::r8(),
+        X86Registers::r9(), X86Registers::r10(), X86Registers::r11()
+    }, 16));
 
     addEnterStatement(std::make_unique<core::ir::Assignment>(
         std::make_unique<core::ir::MemoryLocationAccess>(core::ir::MemoryLocation(core::ir::MemoryDomain::STACK, 0, architecture->bitness())),
@@ -85,6 +156,11 @@ Microsoft64CallingConvention::Microsoft64CallingConvention(const X86Architecture
 
     addReturnValueLocation(X86Registers::rax()->memoryLocation());
     addReturnValueLocation(X86Registers::xmm0()->memoryLocation());
+    addClobberedLocations(volatileCallState({
+        X86Registers::rax(), X86Registers::rcx(), X86Registers::rdx(),
+        X86Registers::r8(), X86Registers::r9(), X86Registers::r10(),
+        X86Registers::r11()
+    }, 6));
 
     addEnterStatement(std::make_unique<core::ir::Assignment>(
         std::make_unique<core::ir::MemoryLocationAccess>(core::ir::MemoryLocation(core::ir::MemoryDomain::STACK, 0, architecture->bitness())),
@@ -106,6 +182,9 @@ Cdecl32CallingConvention::Cdecl32CallingConvention(const X86Architecture *archit
 
     addReturnValueLocation(X86Registers::eax()->memoryLocation());
     addReturnValueLocation(X86Registers::st0()->memoryLocation());
+    addClobberedLocations(volatileCallState({
+        X86Registers::eax(), X86Registers::ecx(), X86Registers::edx()
+    }, 8));
 
     addEnterStatement(std::make_unique<core::ir::Assignment>(
         std::make_unique<core::ir::MemoryLocationAccess>(core::ir::MemoryLocation(core::ir::MemoryDomain::STACK, 0, architecture->bitness())),
@@ -127,6 +206,9 @@ Cdecl16CallingConvention::Cdecl16CallingConvention(const X86Architecture *archit
 
     addReturnValueLocation(X86Registers::ax()->memoryLocation());
     addReturnValueLocation(X86Registers::st0()->memoryLocation());
+    addClobberedLocations(volatileCallState({
+        X86Registers::ax(), X86Registers::cx(), X86Registers::dx()
+    }, 0));
 
     addEnterStatement(std::make_unique<core::ir::Assignment>(
         std::make_unique<core::ir::MemoryLocationAccess>(core::ir::MemoryLocation(core::ir::MemoryDomain::STACK, 0, architecture->bitness())),
@@ -149,6 +231,9 @@ Stdcall32CallingConvention::Stdcall32CallingConvention(const X86Architecture *ar
 
     addReturnValueLocation(X86Registers::eax()->memoryLocation());
     addReturnValueLocation(X86Registers::st0()->memoryLocation());
+    addClobberedLocations(volatileCallState({
+        X86Registers::eax(), X86Registers::ecx(), X86Registers::edx()
+    }, 8));
 
     addEnterStatement(std::make_unique<core::ir::Assignment>(
         std::make_unique<core::ir::MemoryLocationAccess>(core::ir::MemoryLocation(core::ir::MemoryDomain::STACK, 0, architecture->bitness())),
@@ -175,6 +260,9 @@ Thiscall32CallingConvention::Thiscall32CallingConvention(const X86Architecture *
 
     addReturnValueLocation(X86Registers::eax()->memoryLocation());
     addReturnValueLocation(X86Registers::st0()->memoryLocation());
+    addClobberedLocations(volatileCallState({
+        X86Registers::eax(), X86Registers::ecx(), X86Registers::edx()
+    }, 8));
 
     addEnterStatement(std::make_unique<core::ir::Assignment>(
         std::make_unique<core::ir::MemoryLocationAccess>(core::ir::MemoryLocation(core::ir::MemoryDomain::STACK, 0, architecture->bitness())),

@@ -176,11 +176,16 @@ const Term *getTheOnlyDefinition(const Term *term, const dflow::Dataflow &datafl
     assert(term != nullptr);
     assert(term->isRead());
 
+    if (!dataflow.converged()) {
+        return nullptr;
+    }
+
     const auto &definitions = dataflow.getDefinitions(term);
 
     if (definitions.chunks().size() == 1 &&
         definitions.chunks().front().location() == dataflow.getMemoryLocation(term) &&
         !definitions.chunks().front().hasUnknownDefinition() &&
+        !definitions.chunks().front().hasIncomingDefinition() &&
         definitions.chunks().front().definitions().size() == 1)
     {
         const Term *definition = definitions.chunks().front().definitions().front();
@@ -193,31 +198,27 @@ const Term *getTheOnlyDefinition(const Term *term, const dflow::Dataflow &datafl
 
 boost::unordered_set<const Statement *> getHookStatements(const Function *function, const dflow::Dataflow &dataflow, const calling::Hooks &hooks) {
     boost::unordered_set<const Statement *> result;
+    NC_UNUSED(dataflow);
+
+    const auto addPatchStatements = [&result](const calling::Patch &patch) {
+        foreach (const Statement *statement, patch.insertedStatements()) {
+            result.insert(statement);
+        }
+    };
 
     if (auto hook = hooks.getEntryHook(function)) {
-        foreach (const auto &termAndClone, hook->argumentTerms()) {
-            result.insert(termAndClone.second->statement());
-        }
+        addPatchStatements(hook->patch());
     }
 
     foreach (auto basicBlock, function->basicBlocks()) {
         foreach (auto statement, basicBlock->statements()) {
             if (auto call = statement->asCall()) {
                 if (auto hook = hooks.getCallHook(call)) {
-                    foreach (const auto &termAndClone, hook->argumentTerms()) {
-                        result.insert(termAndClone.second->statement());
-                    }
-                    foreach (const auto &termAndClone, hook->returnValueTerms()) {
-                        result.insert(termAndClone.second->statement());
-                    }
+                    addPatchStatements(hook->patch());
                 }
             } else if (auto jump = statement->asJump()) {
-                if (dflow::isReturn(jump, dataflow)) {
-                    if (auto hook = hooks.getReturnHook(jump)) {
-                        foreach (const auto &termAndClone, hook->returnValueTerms()) {
-                            result.insert(termAndClone.second->statement());
-                        }
-                    }
+                if (auto hook = hooks.getReturnHook(jump)) {
+                    addPatchStatements(hook->patch());
                 }
             }
         }

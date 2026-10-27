@@ -136,6 +136,13 @@ public:
     virtual void livenessAnalysis(Context &context, const ir::Function *function) const;
 
     /**
+     * Recovers architecture-neutral semantic idioms from stabilized IR.
+     *
+     * \param context Context.
+     */
+    virtual void analyzeIdioms(Context &context) const;
+
+    /**
      * Performs structural analysis of all functions.
      *
      * \param context Context.

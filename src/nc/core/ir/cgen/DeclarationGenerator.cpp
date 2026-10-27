@@ -63,10 +63,15 @@ const likec::Type *DeclarationGenerator::makePresentationType(
     return tree().makeErroneousType();
 }
 
-DeclarationGenerator::DeclarationGenerator(CodeGenerator &parent, const calling::CalleeId &calleeId, const calling::FunctionSignature *signature):
+DeclarationGenerator::DeclarationGenerator(
+        CodeGenerator &parent,
+        const calling::CalleeId &calleeId,
+        const calling::FunctionSignature *signature,
+        bool usePrototypeTypes):
     parent_(parent),
     calleeId_(calleeId),
     signature_(signature),
+    usePrototypeTypes_(usePrototypeTypes),
     declaration_(nullptr)
 {
     assert(signature != nullptr);
@@ -101,7 +106,7 @@ std::unique_ptr<likec::FunctionDeclaration> DeclarationGenerator::createDeclarat
 }
 
 const likec::Type *DeclarationGenerator::makeReturnType() {
-    if (signature()->prototype()) {
+    if (usePrototypeTypes_ && signature()->prototype()) {
         return makePresentationType(signature()->prototype()->returnType());
     }
     if (signature()->returnValue()) {
@@ -120,7 +125,9 @@ likec::ArgumentDeclaration *DeclarationGenerator::makeArgumentDeclaration(const 
         if (!parameter.name().isEmpty()) {
             nameAndComment.name() = parameter.name();
         }
-        type = makePresentationType(parameter.type());
+        if (usePrototypeTypes_) {
+            type = makePresentationType(parameter.type());
+        }
     }
 
     auto argumentDeclaration = std::make_unique<likec::ArgumentDeclaration>(

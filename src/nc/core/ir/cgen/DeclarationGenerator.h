@@ -58,6 +58,7 @@ class DeclarationGenerator: boost::noncopyable {
     CodeGenerator &parent_;
     calling::CalleeId calleeId_;
     const calling::FunctionSignature *signature_;
+    bool usePrototypeTypes_;
     likec::FunctionDeclaration *declaration_;
 
 public:
@@ -68,7 +69,10 @@ public:
      * \param calleeId Id of the function.
      * \param signature Valid pointer to the function's signature.
      */
-    DeclarationGenerator(CodeGenerator &parent, const calling::CalleeId &calleeId, const calling::FunctionSignature *signature);
+    DeclarationGenerator(CodeGenerator &parent,
+                         const calling::CalleeId &calleeId,
+                         const calling::FunctionSignature *signature,
+                         bool usePrototypeTypes = true);
 
     /**
      * Virtual destructor.

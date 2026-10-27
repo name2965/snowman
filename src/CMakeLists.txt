@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.7)
 project(Decompiler C CXX)
 
-enable_testing()
+include(CTest)
 
 # Show what's going on when running make.
 #set(CMAKE_VERBOSE_MAKEFILE ON)

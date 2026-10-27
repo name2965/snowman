@@ -77,13 +77,13 @@ private:
     std::unique_ptr<ExpressionStatement> simplify(std::unique_ptr<ExpressionStatement> node);
     std::unique_ptr<For> simplify(std::unique_ptr<For> node);
     std::unique_ptr<Goto> simplify(std::unique_ptr<Goto> node);
-    std::unique_ptr<Statement> simplify(std::unique_ptr<If> node);
+    std::unique_ptr<If> simplify(std::unique_ptr<If> node);
     std::unique_ptr<LabelStatement> simplify(std::unique_ptr<LabelStatement> node);
     std::unique_ptr<Return> simplify(std::unique_ptr<Return> node);
     std::unique_ptr<While> simplify(std::unique_ptr<While> node);
     std::unique_ptr<Switch> simplify(std::unique_ptr<Switch> node);
     std::unique_ptr<Expression> simplifyBooleanExpression(
-        std::unique_ptr<Expression> node, bool preserveEqualityComparison = false);
+        std::unique_ptr<Expression> node);
 
     /**
      * Simplifies all the nodes in the given range.

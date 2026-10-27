@@ -103,10 +103,18 @@ private:
     boost::unordered_map<const Function *, EntryHook *> lastEntryHooks_;
 
     /** All call hooks ever created. */
-    std::map<std::tuple<const Call *, const Convention *, const CallSignature *, boost::optional<ByteSize>>, std::unique_ptr<CallHook>> callHooks_;
+    std::map<std::tuple<const Call *, const Convention *, const CallSignature *,
+                        boost::optional<ByteSize>, bool>,
+             std::unique_ptr<CallHook>> callHooks_;
 
     /** Mapping from a call to the last call hook used for instrumenting it. */
     boost::unordered_map<const Call *, CallHook *> lastCallHooks_;
+
+    /**
+     * Whether the active call hook depends on an in-progress resolved target
+     * rather than stable call-site metadata.
+     */
+    boost::unordered_map<const Call *, bool> provisionalCallHooks_;
 
     /** All return hooks ever created. */
     std::map<std::tuple<const Jump *, const Convention *, const FunctionSignature *>, std::unique_ptr<ReturnHook>> returnHooks_;
@@ -189,6 +197,17 @@ public:
     void instrument(Function *function, const dflow::Dataflow *dataflow);
 
     /**
+     * Commits instrumentation after abstract interpretation. If no fixpoint
+     * was reached, hooks selected from provisional callee/return facts are
+     * removed while already analyzed call-site instrumentation is retained.
+     *
+     * \param function Function whose instrumentation must be finalized.
+     * \param dataflow Dataflow result whose lifecycle is no longer RUNNING.
+     */
+    void finalizeInstrumentation(Function *function,
+                                 dflow::Dataflow &dataflow);
+
+    /**
      * Undoes instrumentation of a function.
      *
      * \param function Valid pointer to a function.
@@ -219,7 +238,8 @@ private:
      * \param call Valid pointer to a call.
      * \param dataflow Dataflow information for the function to which the call belongs.
      */
-    void instrumentCall(Call *call, const dflow::Dataflow &dataflow);
+    void instrumentCall(Call *call, const dflow::Dataflow &dataflow,
+                        bool useProvisionalFacts);
 
     /**
      * Undoes the instrumentation of a call, if performed before.

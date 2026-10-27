@@ -311,10 +311,11 @@ public:
             }
             case UD_Icmp: {
                 _[
+                    temporary(operand(0).size()) ^= operand(0) - operand(1),
                     cf ^= unsigned_(operand(0)) < operand(1),
                     pf ^= intrinsic(),
-                    zf ^= operand(0) == operand(1),
-                    sf ^= signed_(operand(0)) < operand(1),
+                    zf ^= temporary(operand(0).size()) == constant(0),
+                    sf ^= signed_(temporary(operand(0).size())) < constant(0),
                     of ^= intrinsic(),
                     af ^= intrinsic(),
 
@@ -328,6 +329,28 @@ public:
             case UD_Imovsb: case UD_Imovsw: case UD_Imovsd: case UD_Imovsq:
             case UD_Iscasb: case UD_Iscasw: case UD_Iscasd: case UD_Iscasq:
             case UD_Istosb: case UD_Istosw: case UD_Istosd: case UD_Istosq: {
+                const bool comparesElements =
+                    ud_obj_.mnemonic == UD_Icmpsb ||
+                    ud_obj_.mnemonic == UD_Icmpsw ||
+                    ud_obj_.mnemonic == UD_Icmpsd ||
+                    ud_obj_.mnemonic == UD_Icmpsq ||
+                    ud_obj_.mnemonic == UD_Iscasb ||
+                    ud_obj_.mnemonic == UD_Iscasw ||
+                    ud_obj_.mnemonic == UD_Iscasd ||
+                    ud_obj_.mnemonic == UD_Iscasq;
+
+                /*
+                 * F2 is the conditional REPNE prefix and is defined for the
+                 * string-comparison instructions handled above.  It is not a
+                 * ZF-controlled form of MOVS or STOS.  Do not invent such a
+                 * dependency for a reserved prefix/instruction combination;
+                 * preserve the instruction when its semantics are unknown.
+                 */
+                if (!comparesElements && ud_obj_.pfx_repne != UD_NONE) {
+                    _(std::make_unique<core::ir::InlineAssembly>());
+                    return;
+                }
+
                 SmallBitSize accessSize;
 
                 switch (ud_obj_.mnemonic) {
@@ -383,7 +406,7 @@ public:
                             cf ^= unsigned_(left) < right,
                             pf ^= intrinsic(),
                             zf ^= left == right,
-                            sf ^= signed_(left) < right,
+                            sf ^= signed_(left - right) < constant(0),
                             of ^= intrinsic(),
                             af ^= intrinsic(),
 
@@ -414,7 +437,7 @@ public:
                             cf ^= unsigned_(left) < right,
                             pf ^= intrinsic(),
                             zf ^= left == right,
-                            sf ^= signed_(left) < right,
+                            sf ^= signed_(left - right) < constant(0),
                             of ^= intrinsic(),
                             af ^= intrinsic(),
 

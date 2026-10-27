@@ -59,6 +59,13 @@ class CallHook {
     /** Statement for snapshotting reaching definitions. */
     const Statement *snapshotStatement_;
 
+    /**
+     * Statement for snapshotting definitions which may be read indirectly
+     * through arguments of a call with a known signature and a pointee-read
+     * effect.
+     */
+    const Statement *pointeeReadSnapshotStatement_;
+
     /** Mapping from argument terms to their clones. */
     boost::unordered_map<const Term *, const Term *> argumentTerms_;
 
@@ -76,9 +83,15 @@ public:
      *
      * \param[in] convention Valid pointer to the calling convention.
      * \param[in] signature Pointer to the call's signature. Can be nullptr.
-     * \param[in] stackArgumentsSize Size of arguments passed on the stack.
+     * \param[in] stackCleanupSize Number of bytes added to the stack pointer
+     *             after the call, or boost::none when the caller must not
+     *             model a callee cleanup.
+     * \param[in] unknownStackCleanup Whether incompatible return effects make
+     *             the post-call stack pointer unknown.
      */
-    CallHook(const Convention *convention, const CallSignature *signature, const boost::optional<ByteSize> &stackArgumentsSize);
+    CallHook(const Convention *convention, const CallSignature *signature,
+             const boost::optional<ByteSize> &stackCleanupSize,
+             bool unknownStackCleanup = false);
 
     /**
      * Destructor.
@@ -90,11 +103,26 @@ public:
      */
     Patch &patch() { return patch_; }
 
+    /** \return Patch currently owned by this hook. */
+    const Patch &patch() const { return patch_; }
+
     /**
      * \return Pointer to the statement used for snapshotting reaching definitions.
      *         Will be nullptr if signature was given to the constructor.
      */
     const Statement *snapshotStatement() const { return snapshotStatement_; }
+
+    /**
+     * \return Pointer to the statement which captures definitions before the
+     *         effects of a call with a known signature. These definitions are
+     *         used to preserve tracked memory stores which the callee may read
+     *         through an argument. Will be nullptr if no signature was given
+     *         or its explicitly complete prototype proves that no argument
+     *         reads pointee memory.
+     */
+    const Statement *pointeeReadSnapshotStatement() const {
+        return pointeeReadSnapshotStatement_;
+    }
 
     /**
      * \param term Valid pointer to a term representing the argument

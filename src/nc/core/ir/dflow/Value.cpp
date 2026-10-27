@@ -74,31 +74,80 @@ bool bitTwiddlingWorks = (NC_UNUSED(bitTwiddlingWorks), testBitTwiddling());
 } // anonymous namespace
 #endif
 
-Value::Value(SmallBitSize size):
+Value::Value(SmallBitSize size, std::size_t *revision,
+             DataflowStatus *analysisStatus):
+    revision_(revision), analysisStatus_(analysisStatus),
     abstractValue_(size, -1, -1),
     isStackOffset_(false), isNotStackOffset_(false),
     isProduct_(false), isNotProduct_(false),
     isReturnAddress_(false), isNotReturnAddress_(false)
 {}
 
+void Value::setAbstractValue(AbstractValue value) {
+    value.resize(abstractValue_.size());
+    if (abstractValue_.size() != value.size() ||
+        abstractValue_.zeroBits() != value.zeroBits() ||
+        abstractValue_.oneBits() != value.oneBits())
+    {
+        abstractValue_ = value;
+        changed();
+    }
+}
+
 void Value::makeStackOffset(SignedConstantValue offset) {
     if (isStackOffset_) {
-        /*
-         * If we get different values of stack pointer from different
-         * branches, most likely we screwed up at detecting a stdcall
-         * function or a function that never returns.
-         *
-         * The heuristic is to choose the bigger stack pointer value,
-         * i.e. the value corresponding to the branch with less pushes.
-         *
-         * Note: this assumes a stack growing down.
-         */
-        if (stackOffset_ < offset) {
-            stackOffset_ = offset;
+        if (isNotStackOffset_ || stackOffset_ != offset) {
+            /* Distinct reaching offsets do not have a sound single-value
+             * representative.  Preserve only stack-derived provenance. */
+            makeAmbiguousStackOffset();
         }
     } else {
         isStackOffset_ = true;
         stackOffset_ = offset;
+        changed();
+    }
+}
+
+void Value::makeAmbiguousStackOffset() {
+    if (!isStackOffset_ || !isNotStackOffset_) {
+        isStackOffset_ = true;
+        isNotStackOffset_ = true;
+        changed();
+    }
+}
+
+void Value::makeNotStackOffset() {
+    if (!isNotStackOffset_) {
+        isNotStackOffset_ = true;
+        changed();
+    }
+}
+
+void Value::makeProduct() {
+    if (!isProduct_) {
+        isProduct_ = true;
+        changed();
+    }
+}
+
+void Value::makeNotProduct() {
+    if (!isNotProduct_) {
+        isNotProduct_ = true;
+        changed();
+    }
+}
+
+void Value::makeReturnAddress() {
+    if (!isReturnAddress_) {
+        isReturnAddress_ = true;
+        changed();
+    }
+}
+
+void Value::makeNotReturnAddress() {
+    if (!isNotReturnAddress_) {
+        isNotReturnAddress_ = true;
+        changed();
     }
 }
 

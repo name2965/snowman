@@ -33,6 +33,7 @@
 #include <nc/core/image/Image.h>
 #include <nc/core/image/Reader.h>
 #include <nc/core/image/Relocation.h>
+#include <nc/core/ir/BasicBlock.h>
 #include <nc/core/ir/Function.h>
 #include <nc/core/ir/Functions.h>
 #include <nc/core/ir/calling/Hooks.h>
@@ -235,7 +236,22 @@ likec::FunctionDeclaration *CodeGenerator::makeFunctionDeclaration(ByteAddr addr
         return declaration;
     }
 
-    DeclarationGenerator generator(*this, calling::EntryAddress(addr), signature);
+    bool hasDefinition = false;
+    foreach (const Function *function, functions().list()) {
+        if (function->entry() && function->entry()->address() &&
+            *function->entry()->address() == addr)
+        {
+            hasDefinition = true;
+            break;
+        }
+    }
+
+    /* Prototype types describe an external source-level interface.  For a
+     * function whose body we decompile, keep the IR-inferred storage types in
+     * both its forward declaration and definition; otherwise a pretty typedef
+     * can silently change the meaning of arithmetic in the body. */
+    DeclarationGenerator generator(
+        *this, calling::EntryAddress(addr), signature, !hasDefinition);
     tree().root()->addDeclaration(generator.createDeclaration());
     return generator.declaration();
 }

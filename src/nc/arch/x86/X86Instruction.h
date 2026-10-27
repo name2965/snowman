@@ -45,6 +45,12 @@ public:
     /** Max size of an instruction. */
     static const SmallByteSize MAX_SIZE = 15;
 
+    /** Kind of indirect control transfer represented by an instruction. */
+    enum class ControlTransferKind {
+        CALL,
+        JUMP
+    };
+
 private:
     /** Binary representation of the instruction. */
     std::array<uint8_t, MAX_SIZE> bytes_;
@@ -74,6 +80,22 @@ public:
      *         representation of the instruction.
      */
     const uint8_t *bytes() const { return &bytes_[0]; }
+
+    /**
+     * Tries to evaluate the address of a statically addressed memory operand
+     * used by an indirect call or jump.
+     *
+     * This intentionally works from decoded operand semantics rather than an
+     * opcode spelling.  Register-dependent operands are not guessed: only an
+     * absolute memory address, or a RIP-relative address in long mode, is
+     * accepted.
+     *
+     * \param kind Expected control-transfer kind.
+     * \param address Receives the byte address of the pointer being read.
+     * \return True if the operand denotes one unambiguous static address.
+     */
+    bool getStaticMemoryControlTransferAddress(ControlTransferKind kind,
+                                               ByteAddr &address) const;
 
     virtual void print(QTextStream &out) const override;
 };

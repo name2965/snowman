@@ -51,6 +51,56 @@ namespace core {
 namespace ir {
 namespace calling {
 
+namespace {
+
+/** Reads in-progress lattice facts for instrumentation callbacks only. */
+CalleeId getProvisionalCalleeId(const Call *call,
+                                const dflow::Dataflow &dataflow) {
+    assert(call != nullptr);
+    assert(dataflow.running());
+
+    const dflow::Value *targetValue = dataflow.findValue(call->target());
+    if (targetValue && targetValue->abstractValue().isConcrete()) {
+        return EntryAddress(
+            targetValue->abstractValue().asConcrete().value());
+    }
+    if (call->instruction()) {
+        return CallAddress(call->instruction()->addr());
+    }
+    return CalleeId();
+}
+
+bool hasProvisionalConcreteCallee(const Call *call,
+                                  const dflow::Dataflow &dataflow) {
+    assert(call != nullptr);
+    assert(dataflow.running());
+
+    const dflow::Value *targetValue = dataflow.findValue(call->target());
+    return targetValue && targetValue->abstractValue().isConcrete();
+}
+
+bool isProvisionalReturnAddress(const Term *term,
+                                const dflow::Dataflow &dataflow) {
+    assert(term != nullptr);
+    assert(dataflow.running());
+
+    const dflow::Value *value = dataflow.findValue(term);
+    return value && value->isReturnAddress();
+}
+
+bool isProvisionalReturn(const Jump *jump,
+                         const dflow::Dataflow &dataflow) {
+    assert(jump != nullptr);
+    const auto isReturnTarget = [&dataflow](const JumpTarget &target) {
+        return target.address() &&
+            isProvisionalReturnAddress(target.address(), dataflow);
+    };
+    return isReturnTarget(jump->thenTarget()) ||
+        isReturnTarget(jump->elseTarget());
+}
+
+} // anonymous namespace
+
 Hooks::Hooks(const Conventions &conventions, const Signatures &signatures):
     conventions_(conventions), signatures_(signatures)
 {}
@@ -103,11 +153,11 @@ void Hooks::instrument(Function *function, const dflow::Dataflow *dataflow) {
         foreach (auto statement, basicBlock->statements()) {
             if (auto call = statement->as<Call>()) {
                 call2callback_[call] = basicBlock->insertAfter(call, std::make_unique<Callback>([=](){
-                    instrumentCall(call, *dataflow);
+                    instrumentCall(call, *dataflow, true);
                 }));
             } else if (auto jump = statement->as<Jump>()) {
                 jump2callback_[jump] = basicBlock->insertBefore(jump, std::make_unique<Callback>([=](){
-                    if (dflow::isReturn(jump, *dataflow)) {
+                    if (isProvisionalReturn(jump, *dataflow)) {
                         instrumentReturn(jump);
                     } else {
                         deinstrumentReturn(jump);
@@ -116,6 +166,49 @@ void Hooks::instrument(Function *function, const dflow::Dataflow *dataflow) {
             }
         }
     }
+}
+
+void Hooks::finalizeInstrumentation(Function *function,
+                                    dflow::Dataflow &dataflow) {
+    assert(function != nullptr);
+    assert(!dataflow.running());
+
+    if (dataflow.incomplete()) {
+        std::vector<Call *> calls;
+        foreach (const auto &callAndCallback, call2callback_) {
+            Call *call = callAndCallback.first;
+            if (call->basicBlock() &&
+                call->basicBlock()->function() == function)
+            {
+                calls.push_back(call);
+            }
+        }
+        foreach (Call *call, calls) {
+            /* A replacement hook would introduce fresh terms after the last
+             * dataflow pass. Retain already analyzed call-site hooks, but
+             * remove hooks whose ABI contract came from an unfinished
+             * resolved-target fact. */
+            if (nc::find(provisionalCallHooks_, call)) {
+                deinstrumentCall(call);
+            }
+        }
+
+        std::vector<Jump *> jumps;
+        foreach (const auto &jumpAndCallback, jump2callback_) {
+            Jump *jump = jumpAndCallback.first;
+            if (jump->basicBlock() &&
+                jump->basicBlock()->function() == function)
+            {
+                jumps.push_back(jump);
+            }
+        }
+        foreach (Jump *jump, jumps) {
+            deinstrumentReturn(jump);
+        }
+    }
+
+    /* Hook replacement happens after DataflowAnalyzer's regular cleanup. */
+    dataflow.discardDetachedFacts();
 }
 
 void Hooks::deinstrument(Function *function) {
@@ -178,15 +271,55 @@ void Hooks::deinstrumentEntry(Function *function) {
     }
 }
 
-void Hooks::instrumentCall(Call *call, const dflow::Dataflow &dataflow) {
-    auto calleeId = getCalleeId(call, dataflow);
-    auto convention = getConvention(calleeId);
+void Hooks::instrumentCall(Call *call, const dflow::Dataflow &dataflow,
+                           bool useProvisionalFacts) {
+    assert(!useProvisionalFacts || dataflow.running());
+    const CalleeId calleeId = useProvisionalFacts ?
+        getProvisionalCalleeId(call, dataflow) :
+        getCalleeId(call, dataflow);
+    const bool hasProvisionalCallee = useProvisionalFacts &&
+        hasProvisionalConcreteCallee(call, dataflow);
+    CalleeId callSiteId;
+    if (call->instruction()) {
+        callSiteId = CalleeId(CallAddress(call->instruction()->addr()));
+    }
+
+    /* A call instruction may carry a stronger contract than its resolved
+     * address (for example, an IAT entry forwarded to a shared implementation
+     * address). Never let that per-call fact leak to another call which
+     * happens to resolve to the same address. */
+    const Convention *convention = callSiteId ?
+        conventions_.getConvention(callSiteId) : nullptr;
+    const bool hasCallSiteConvention = convention != nullptr;
+    if (!convention) {
+        convention = getConvention(calleeId);
+    }
+    if (!convention) {
+        deinstrumentCall(call);
+        return;
+    }
     auto signature = signatures_.getSignature(call).get();
-    auto stackArgumentsSize = conventions_.getStackArgumentsSize(calleeId);
-    auto &callHook = callHooks_[std::make_tuple(call, convention, signature, stackArgumentsSize)];
+    auto stackArgumentsSize = hasCallSiteConvention ?
+        conventions_.getStackArgumentsSize(callSiteId) :
+        conventions_.getStackArgumentsSize(calleeId);
+    boost::optional<ByteSize> stackCleanupSize;
+    bool unknownStackCleanup = false;
+    const auto returnCleanup = hasCallSiteConvention ?
+        conventions_.getReturnStackCleanup(callSiteId) :
+        conventions_.getReturnStackCleanup(calleeId);
+    if (returnCleanup.isExact()) {
+        stackCleanupSize = returnCleanup.size();
+    } else if (returnCleanup.isConflicting()) {
+        unknownStackCleanup = true;
+    } else if (convention->calleeCleanup()) {
+        stackCleanupSize = stackArgumentsSize;
+    }
+    auto &callHook = callHooks_[std::make_tuple(
+        call, convention, signature, stackCleanupSize, unknownStackCleanup)];
 
     if (!callHook) {
-        callHook = std::make_unique<CallHook>(convention, signature, stackArgumentsSize);
+        callHook = std::make_unique<CallHook>(
+            convention, signature, stackCleanupSize, unknownStackCleanup);
     }
 
     auto &lastCallHook = lastCallHooks_[call];
@@ -201,6 +334,8 @@ void Hooks::instrumentCall(Call *call, const dflow::Dataflow &dataflow) {
         }
         lastCallHook = callHook.get();
     }
+    provisionalCallHooks_[call] =
+        hasProvisionalCallee && !hasCallSiteConvention;
 }
 
 void Hooks::deinstrumentCall(Call *call) {
@@ -210,11 +345,16 @@ void Hooks::deinstrumentCall(Call *call) {
         lastCallHook->patch().remove();
         lastCallHook = nullptr;
     }
+    provisionalCallHooks_.erase(call);
 }
 
 void Hooks::instrumentReturn(Jump *jump) {
     auto function = jump->basicBlock()->function();
     auto convention = getConvention(getCalleeId(function));
+    if (!convention) {
+        deinstrumentReturn(jump);
+        return;
+    }
     auto signature = signatures_.getSignature(function).get();
     auto &returnHook = returnHooks_[std::make_tuple(jump, convention, signature)];
 
@@ -258,14 +398,16 @@ CalleeId getCalleeId(const Function *function) {
 CalleeId getCalleeId(const Call *call, const dflow::Dataflow &dataflow) {
     assert(call != nullptr);
 
-    auto targetValue = dataflow.getValue(call->target());
-    if (targetValue->abstractValue().isConcrete()) {
-        return EntryAddress(targetValue->abstractValue().asConcrete().value());
-    } else if (call->instruction()) {
-        return CallAddress(call->instruction()->addr());
-    } else {
-        return CalleeId();
+    const dflow::Value *targetValue = dataflow.converged() ?
+        dataflow.findValue(call->target()) : nullptr;
+    if (targetValue && targetValue->abstractValue().isConcrete()) {
+        return EntryAddress(
+            targetValue->abstractValue().asConcrete().value());
     }
+    if (call->instruction()) {
+        return CallAddress(call->instruction()->addr());
+    }
+    return CalleeId();
 }
 
 } // namespace calling
